@@ -20,7 +20,61 @@ import streamlit.components.v1 as components
 from groq import Groq
 from pydub import AudioSegment
 import gspread  
-import threading  # <--- Added threading import
+import threading
+import zipfile
+import requests
+
+
+# ============================================================
+# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
+# ============================================================
+
+MODEL_DIR = "model"  # Target directory for your model
+ZIP_PATH = "model.zip"
+FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
+
+def download_file_from_google_drive(file_id, destination):
+    URL = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
+    
+    token = get_confirm_token(response)
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, headers=headers, stream=True)
+        
+    save_response_content(response, destination)
+
+def get_confirm_token(response):
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            return value
+    return None
+
+def save_response_content(response, destination):
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+# Check and extract on first boot if missing
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    try:
+        with st.spinner("Downloading model from Google Drive..."):
+            download_file_from_google_drive(FILE_ID, ZIP_PATH)
+        
+        with st.spinner("Extracting model files..."):
+            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
+                zip_ref.extractall(MODEL_DIR)
+                
+        if os.path.exists(ZIP_PATH):
+            os.remove(ZIP_PATH)
+        st.success("Model setup complete!")
+    except Exception as e:
+        st.error(f"Failed to auto-download/extract model: {str(e)}")
 
 
 # ============================================================
@@ -38,7 +92,6 @@ def get_campaign_category(raw_campaign_text):
     elif "dumpster" in text:
         return "Dumpster & Porta Potty Services"
     else:
-        # Returns the raw campaign name as a fallback for new/unmatched campaigns
         return raw_campaign_text.strip() if raw_campaign_text else "General Customer Inquiry"
 
 def format_seconds_to_hms(total_seconds_str):
@@ -54,7 +107,6 @@ def format_seconds_to_hms(total_seconds_str):
 
 def background_sheet_watcher():
     """Continuously watches multiple Google Sheets for new rows in the background."""
-    # List the exact names of all Google Sheets you want the app to watch
     sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
 
     while True:
@@ -67,41 +119,27 @@ def background_sheet_watcher():
                 rows = worksheet.get_all_values()
                 
                 for index, row in enumerate(rows[1:], start=2):
-                    # Column F is index 5 (0-based) for Duration
                     raw_duration = row[5].strip() if len(row) > 5 else ""
-                    
-                    # Column D is index 3 (0-based) for the campaign name
                     raw_campaign = row[3].strip() if len(row) > 3 else ""
-                    
-                    # Column I is index 8 (0-based) for Recording URL
                     recording_url = row[8].strip() if len(row) > 8 else ""
-                    
-                    # Column H is index 7 (0-based) for Main Topic (used to check if already processed)
                     existing_main_topic = row[7].strip() if len(row) > 7 else ""
 
-                    # 1. FORMAT DURATION: If Column F has raw seconds, format it to H:MM:SS directly in Column F
                     if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
                         formatted_dur = format_seconds_to_hms(raw_duration)
-                        worksheet.update_cell(index, 6, formatted_dur)  # Updates Column F (cell 6)
+                        worksheet.update_cell(index, 6, formatted_dur)
                         time.sleep(1)
 
-                    # REQUIRE BOTH Campaign AND Recording URL to be filled before starting
                     if raw_campaign and recording_url and not existing_main_topic:
                         try:
                             campaign_name = get_campaign_category(raw_campaign)
 
-                            # Load and process audio using existing app functions
                             load_audio_url(recording_url)
                             _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                             full_transcript_str = " ".join(raw_text_segments)
                             
-                            # Generate summaries using the mapped or default category
                             main_topic, detailed_summary = generate_summaries_groq(full_transcript_str, campaign_name)
                             
-                            # Write AI Call Summary to Column G (index 7, cell column 7)
                             worksheet.update_cell(index, 7, detailed_summary)
-                            
-                            # Write Main Topic to Column H (index 8, cell column 8)
                             worksheet.update_cell(index, 8, main_topic)
                             time.sleep(5)
                             
@@ -109,15 +147,15 @@ def background_sheet_watcher():
                             worksheet.update_cell(index, 7, f"Error: {str(err)}")
 
             except Exception as e:
-                pass  # Suppress connection errors for individual sheets and move on
+                pass
 
-        time.sleep(30)  # Check all sheets every 30 seconds
+        time.sleep(30)
 
-# Start the background worker safely so it runs automatically when app launches
 if "worker_started" not in st.session_state:
     st.session_state.worker_started = True
     t = threading.Thread(target=background_sheet_watcher, daemon=True)
     t.start()
+
 
 # ============================================================
 # DATABASE & AUTHENTICATION SETUP (SQLite)
@@ -125,14 +163,12 @@ if "worker_started" not in st.session_state:
 
 DB_PATH = Path("users.db")
 
-# SMTP Configuration (Set environment variables or st.secrets for actual email delivery)
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")  # Sender Email
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")  # Sender App Password
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 def init_db():
-    """Create users and reset_tokens tables if they don't exist and run auto-migration."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -154,14 +190,12 @@ def init_db():
     """)
     conn.commit()
 
-    # Migration check: Ensure 'is_admin' column exists if DB existed prior
     c.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in c.fetchall()]
     if "is_admin" not in columns:
         c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
         conn.commit()
 
-    # Make sure at least one default admin exists if user table is fresh
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
         admin_pwd = hash_password("admin123")
@@ -174,11 +208,9 @@ def init_db():
     conn.close()
 
 def hash_password(password: str) -> str:
-    """Hash password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def register_user(name: str, email: str, password: str, is_admin: int = 0):
-    """Register a new public or admin user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -195,7 +227,6 @@ def register_user(name: str, email: str, password: str, is_admin: int = 0):
         conn.close()
 
 def authenticate_user(email: str, password: str):
-    """Authenticate logging in user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     pwd_hash = hash_password(password)
@@ -210,7 +241,6 @@ def authenticate_user(email: str, password: str):
     return None
 
 def update_user_profile(user_id: int, new_name: str, new_email: str, new_password: str = ""):
-    """Update user information in database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -226,12 +256,7 @@ def update_user_profile(user_id: int, new_name: str, new_email: str, new_passwor
     finally:
         conn.close()
 
-# ============================================================
-# ADMIN PANEL DATABASE HELPERS
-# ============================================================
-
 def get_all_users():
-    """Retrieve all registered users for admin panel."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, name, email, is_admin FROM users ORDER BY id ASC")
@@ -240,7 +265,6 @@ def get_all_users():
     return [{"id": u[0], "name": u[1], "email": u[2], "is_admin": bool(u[3])} for u in users]
 
 def admin_toggle_role(user_id: int, make_admin: bool):
-    """Grant or revoke admin access for a user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if make_admin else 0, user_id))
@@ -248,7 +272,6 @@ def admin_toggle_role(user_id: int, make_admin: bool):
     conn.close()
 
 def admin_reset_password(user_id: int, new_password: str):
-    """Force reset a user password from admin panel."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     pwd_hash = hash_password(new_password)
@@ -257,7 +280,6 @@ def admin_reset_password(user_id: int, new_password: str):
     conn.close()
 
 def admin_delete_user(user_id: int):
-    """Delete user from database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -265,9 +287,7 @@ def admin_delete_user(user_id: int):
     conn.close()
 
 def send_reset_code_email(email: str, code: str):
-    """Sends the reset code via SMTP email."""
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print(f"[TESTING MODE] Reset Code for {email}: {code}")
         return True, f"Demo Mode: Credentials not configured. Your code is: {code}"
 
     try:
@@ -300,7 +320,6 @@ def send_reset_code_email(email: str, code: str):
         return False, f"Failed to send email: {str(e)}"
 
 def generate_reset_code(email: str):
-    """Generates a 6-digit reset code, saves it to DB, and emails it."""
     email_clean = email.lower().strip()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -322,7 +341,6 @@ def generate_reset_code(email: str):
     return send_reset_code_email(email_clean, code)
 
 def reset_password_with_code(email: str, code: str, new_password: str):
-    """Verifies reset code and updates password."""
     email_clean = email.lower().strip()
     code_clean = code.strip()
     
@@ -351,12 +369,10 @@ def reset_password_with_code(email: str, code: str, new_password: str):
 
     return True, "Password reset successfully! You can now log in with your new password."
 
-# Initialize DB
 init_db()
 
 
 def render_html(content):
-    """Render HTML/CSS without Markdown's code-block indentation rules."""
     st.html(textwrap.dedent(content))
 
 
@@ -365,7 +381,6 @@ def render_html(content):
 # ============================================================
 
 def render_copy_icon_button(text_to_copy, button_id):
-    """Renders a browser-native Javascript copy button matching standard full-width primary buttons."""
     escaped_text = json.dumps(text_to_copy)
     button_html = f"""
     <div style="display: flex; justify-content: center; width: 100%; margin-top: 6px;">
@@ -513,7 +528,7 @@ Focus only on clearly understood information, such as:
 For treatment, use the exact service that is clearly understood. If only "rehab" or "treatment" is clear, use that instead of guessing a specific treatment.
 For insurance, include it only when the caller clearly provides the insurance type or payment information.
 For appointments, only mention an appointment if the caller clearly requested one or the agent clearly scheduled one. Do not assume an appointment was made or not made.
-For the ending, briefly describe what actually happened, such as the agent providing a phone number, giving a referral, scheduling an appointment, the caller thanking the agent, or the call ending.
+For the ending, briefly describe what actually happened, such as the agent providing a phone number, giving a referral, scheduling an appointment, the caller thanking the agent, or the call ended.
 
 Use natural phrases such as:
 "The caller was looking for..."
@@ -584,12 +599,6 @@ Did the agent properly handle and qualify the caller?
 
 # ============================================================
 # DEFAULT QC QUESTIONS
-# ============================================================
-# Used automatically for any campaign that does not have its
-# own campaign-specific QC question set above.
-#
-# IMPORTANT:
-# Do NOT modify the campaign-specific questions above.
 # ============================================================
 
 DEFAULT_QC_QUESTIONS = """
@@ -739,32 +748,20 @@ SUMMARY:
 # ============================================================
 # QC QUESTION SELECTOR
 # ============================================================
-# Existing campaign questions remain unchanged.
-# If campaign_name exists above, use its existing questions.
-# Otherwise automatically use DEFAULT_QC_QUESTIONS.
-# ============================================================
 
 def get_qc_questions(campaign_name):
-    """
-    Return the existing campaign-specific QC questions.
-    If the campaign is not listed, use the default QC questions.
-    """
-
     if not campaign_name:
         return DEFAULT_QC_QUESTIONS
 
-    # Exact match first
     if campaign_name in CAMPAIGN_QC_QUESTIONS:
         return CAMPAIGN_QC_QUESTIONS[campaign_name]
 
-    # Case-insensitive match
     campaign_name_clean = campaign_name.strip().lower()
 
     for campaign, questions in CAMPAIGN_QC_QUESTIONS.items():
         if campaign.strip().lower() == campaign_name_clean:
             return questions
 
-    # Any campaign not listed above uses the default
     return DEFAULT_QC_QUESTIONS
 
 
@@ -815,16 +812,13 @@ def transcribe_groq_whisper(audio_file_path):
 
     return timeline_data, raw_text_segments
 
-# Groq text model used for summaries.
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 
 def generate_summaries_groq(full_transcript, campaign_name):
-    # Define primary and secondary clients using your respective API keys
     client_primary = Groq(api_key=GROQ_API_KEY)
     client_secondary = Groq(api_key="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")
     
-    # Safely match campaign name or fall back to generic template
     if campaign_name in CAMPAIGN_QC_QUESTIONS:
         qc_questions = CAMPAIGN_QC_QUESTIONS[campaign_name]
     else:
@@ -839,9 +833,7 @@ def generate_summaries_groq(full_transcript, campaign_name):
     detailed_summary = "Failed to generate summary."
     short_topic = "Failed to generate topic."
 
-    # --- STEP 1: DETAILED SUMMARY WITH FAILOVER ---
     try:
-        # Attempt primary client
         response_detailed = client_primary.chat.completions.create(
             model=GROQ_SUMMARY_MODEL,
             messages=[{"role": "user", "content": full_prompt}],
@@ -854,7 +846,6 @@ def generate_summaries_groq(full_transcript, campaign_name):
         error_str = str(e)
         if "429" in error_str or "rate_limit" in error_str.lower():
             try:
-                # Fallback to secondary client if primary hits rate limit
                 response_detailed = client_secondary.chat.completions.create(
                     model=GROQ_SUMMARY_MODEL,
                     messages=[{"role": "user", "content": full_prompt}],
@@ -868,11 +859,9 @@ def generate_summaries_groq(full_transcript, campaign_name):
         else:
             return "Topic generation failed.", f"Model ({GROQ_SUMMARY_MODEL}) Error: {error_str}"
 
-    # --- STEP 2: SHORT TOPIC WITH FAILOVER ---
     topic_prompt = SHORT_TOPIC_PROMPT.format(call_transcript=detailed_summary)
 
     try:
-        # Attempt primary client for topic
         response_topic = client_primary.chat.completions.create(
             model=GROQ_SUMMARY_MODEL,
             messages=[{"role": "user", "content": topic_prompt}],
@@ -885,7 +874,6 @@ def generate_summaries_groq(full_transcript, campaign_name):
         error_str = str(e)
         if "429" in error_str or "rate_limit" in error_str.lower():
             try:
-                # Fallback to secondary client for topic if primary hits rate limit
                 response_topic = client_secondary.chat.completions.create(
                     model=GROQ_SUMMARY_MODEL,
                     messages=[{"role": "user", "content": topic_prompt}],
@@ -961,27 +949,17 @@ def load_audio_url(url):
     st.session_state.status = "Recording link loaded and ready."
 
 
-# ============================================================
-# GOOGLE SHEET BATCH SYNC HELPER
-# ============================================================
-
 def sync_google_sheet_batch(campaign_name):
-    """Reads recording URLs from Column H, transcribes/summarizes them,
-
-    and writes the summary back to Column J of the Google Sheet.
-    """
     try:
         gc = gspread.service_account(filename="service_account.json")
-        sheet = gc.open("DOPPCALL QC - AND")  # Updated sheet name
+        sheet = gc.open("DOPPCALL QC - AND")
         worksheet = sheet.worksheet("Sheet1")
 
         rows = worksheet.get_all_values()
         processed_count = 0
 
-        for index, row in enumerate(rows[1:], start=2):  # Skip header row (start at row 2)
-            # Column H is index 7 (0-based)
+        for index, row in enumerate(rows[1:], start=2):
             recording_url = row[7].strip() if len(row) > 7 else ""
-            # Column J is index 9 (0-based)
             existing_summary = row[9].strip() if len(row) > 9 else ""
 
             if recording_url and not existing_summary:
@@ -990,7 +968,6 @@ def sync_google_sheet_batch(campaign_name):
                     _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                     full_transcript_str = " ".join(raw_text_segments)
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
-                    # Update Column J (10)
                     worksheet.update_cell(index, 10, detailed_summary)
                     processed_count += 1
                 except Exception as e:
@@ -1196,13 +1173,12 @@ with st.sidebar:
         st.session_state.theme_mode = theme_choice.lower()
         st.rerun()
 
-    # NAVIGATION BUTTONS
     if st.button("🎙️ &nbsp; Transcriber", use_container_width=True, type="primary" if st.session_state.current_view == "transcriber" else "secondary"):
         st.session_state.current_view = "transcriber"
         st.rerun()
 
     if current_user.get("is_admin"):
-        if st.button("🛡️ &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
+        if st.button("🛡 &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
             st.session_state.current_view = "admin"
             st.rerun()
 
@@ -1218,7 +1194,6 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    # --- GOOGLE SHEET BATCH TRIGGER BUTTON ---
     render_html("""
         <div class="sidebar-divider"></div>
         <div class="sidebar-label">Google Sheets Automation</div>
@@ -1230,7 +1205,6 @@ with st.sidebar:
                 st.success(message)
             else:
                 st.error(message)
-    # -----------------------------------------
 
     render_html("""
         <div class="sidebar-divider"></div>
