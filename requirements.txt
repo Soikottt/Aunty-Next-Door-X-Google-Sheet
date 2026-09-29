@@ -2,3 +2,6 @@ streamlit
 vosk
 pydub
 audioop-lts
+groq
+gspread
+requests
