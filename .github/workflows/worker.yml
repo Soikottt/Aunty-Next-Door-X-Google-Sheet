@@ -26,8 +26,8 @@ jobs:
 
       - name: Run worker script
         env:
-            GROQ_API_KEY_PRIMARY: ${{ secrets.GROQ_API_KEY_PRIMARY }}
-            GROQ_API_KEY_SECONDARY: ${{ secrets.GROQ_API_KEY_SECONDARY }}
+            Aunty_NEXT_DOOR_API_PRIMARY: ${{ secrets.Aunty_NEXT_DOOR_API_PRIMARY }}
+            GROQ_API_KEY_SECONDARY_2: ${{ secrets.GROQ_API_KEY_SECONDARY_2 }}
             GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
         run: |
             python worker.py
