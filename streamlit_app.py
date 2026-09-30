@@ -109,29 +109,28 @@ def background_sheet_watcher():
     """Continuously watches multiple Google Sheets for new rows in the background."""
     sheet_names = ["Ringba to Sheet QC"]
 
-    # Instead of an infinite loop, let your button control when it runs, 
-    # or let it run once when the app loads:
-for sheet_name in sheet_names:
-           try:
-               # Check if running on Streamlit Cloud using secrets
-               if "gcp_service_account" in st.secrets:
-                   from google.oauth2.service_account import Credentials
-                   SCOPES = [
-                   "https://www.googleapis.com/auth/spreadsheets",
-                   "https://www.googleapis.com/auth/drive"
-                   ]
-                   creds_dict = dict(st.secrets["gcp_service_account"])
-                   creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-                   gc = gspread.authorize(creds)
-               else:
-                   # Fallback for local computer using the JSON file
-                   gc = gspread.service_account(filename="service_account.json")
-            
-               sheet = gc.open(sheet_name)
-               worksheet = sheet.worksheet("Sheet1")
+    while True:
+        for sheet_name in sheet_names:
+            try:
+                # Check if running on Streamlit Cloud using secrets
+                if "gcp_service_account" in st.secrets:
+                    from google.oauth2.service_account import Credentials
+                    SCOPES = [
+                        "https://www.googleapis.com/auth/spreadsheets",
+                        "https://www.googleapis.com/auth/drive"
+                    ]
+                    creds_dict = dict(st.secrets["gcp_service_account"])
+                    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+                    gc = gspread.authorize(creds)
+                else:
+                    # Fallback for local computer using the JSON file
+                    gc = gspread.service_account(filename="service_account.json")
+             
+                sheet = gc.open(sheet_name)
+                worksheet = sheet.worksheet("Sheet1")
 
-               rows = worksheet.get_all_values()
-                
+                rows = worksheet.get_all_values()
+                 
                 for index, row in enumerate(rows[1:], start=2):
                     raw_duration = row[5].strip() if len(row) > 5 else ""
                     raw_campaign = row[3].strip() if len(row) > 3 else ""
