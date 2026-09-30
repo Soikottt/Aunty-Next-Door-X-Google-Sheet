@@ -130,7 +130,7 @@ for sheet_name in sheet_names:
                sheet = gc.open(sheet_name)
                worksheet = sheet.worksheet("Sheet1")
 
-                rows = worksheet.get_all_values()
+               rows = worksheet.get_all_values()
                 
                 for index, row in enumerate(rows[1:], start=2):
                     raw_duration = row[5].strip() if len(row) > 5 else ""
