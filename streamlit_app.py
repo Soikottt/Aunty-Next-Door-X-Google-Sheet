@@ -106,7 +106,7 @@ def format_seconds_to_hms(total_seconds_str):
         return str(total_seconds_str)
 
 def background_sheet_watcher():
-    """Continuously watches multiple Google Sheets for new rows in the background."""
+    """Continuously watches multiple Google Sheets for new rows in the background every 15 minutes."""
     sheet_names = ["Ringba to Sheet QC"]
 
     while True:
@@ -162,7 +162,8 @@ def background_sheet_watcher():
             except Exception as e:
                 pass
 
-        time.sleep(30)
+        # Refresh automatically every 15 minutes (900 seconds)
+        time.sleep(900)
 
 if "worker_started" not in st.session_state:
     st.session_state.worker_started = True
@@ -465,13 +466,11 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 from dotenv import load_dotenv
 
-# Load variables from .env in the project folder
 load_dotenv()
 
 GROQ_API_KEY_PRIMARY = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
 GROQ_API_KEY_SECONDARY = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
 
-# Optional Streamlit secrets fallback
 if not GROQ_API_KEY_PRIMARY:
     try:
         GROQ_API_KEY_PRIMARY = st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
@@ -989,7 +988,20 @@ def load_audio_url(url):
 
 def sync_google_sheet_batch(campaign_name):
     try:
-        gc = gspread.service_account(filename="service_account.json")
+        # Check if running on Streamlit Cloud using secrets
+        if "gcp_service_account" in st.secrets:
+            from google.oauth2.service_account import Credentials
+            SCOPES = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+            gc = gspread.authorize(creds)
+        else:
+            # Fallback for local computer using the JSON file
+            gc = gspread.service_account(filename="service_account.json")
+            
         sheet = gc.open("DOPPCALL QC - AND")
         worksheet = sheet.worksheet("Sheet1")
 
