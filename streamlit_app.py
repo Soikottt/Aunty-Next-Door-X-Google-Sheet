@@ -107,7 +107,7 @@ def format_seconds_to_hms(total_seconds_str):
 
 def background_sheet_watcher():
     """Continuously watches multiple Google Sheets for new rows in the background."""
-    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
+    sheet_names = ["Ringba to Sheet QC"]
 
     while True:
         for sheet_name in sheet_names:
@@ -447,16 +447,41 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# GROQ API KEY
+# GROQ API KEYS
 # ============================================================
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+from dotenv import load_dotenv
 
-if not GROQ_API_KEY:
+# Load variables from .env in the project folder
+load_dotenv()
+
+GROQ_API_KEY_PRIMARY = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
+GROQ_API_KEY_SECONDARY = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
+
+# Optional Streamlit secrets fallback
+if not GROQ_API_KEY_PRIMARY:
     try:
-        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
+        GROQ_API_KEY_PRIMARY = st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
     except Exception:
-        GROQ_API_KEY = ""
+        GROQ_API_KEY_PRIMARY = ""
+
+if not GROQ_API_KEY_SECONDARY:
+    try:
+        GROQ_API_KEY_SECONDARY = st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
+    except Exception:
+        GROQ_API_KEY_SECONDARY = ""
+
+if not GROQ_API_KEY_PRIMARY:
+    raise RuntimeError(
+        "Primary Groq API key not found. "
+        "Please add Aunty_NEXT_DOOR_API_PRIMARY to your .env file."
+    )
+
+if not GROQ_API_KEY_SECONDARY:
+    raise RuntimeError(
+        "Secondary Groq API key not found. "
+        "Please add GROQ_API_KEY_SECONDARY_2 to your .env file."
+    )
 
 
 # ============================================================
@@ -775,10 +800,10 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY:
-        raise RuntimeError("Groq API key not found.")
+    if not GROQ_API_KEY_PRIMARY:
+        raise RuntimeError("Primary Groq API key not found.")
 
-    client = Groq(api_key=GROQ_API_KEY)
+    client = Groq(api_key=GROQ_API_KEY_PRIMARY)
 
     with open(audio_file_path, "rb") as file:
         transcription = client.audio.transcriptions.create(
@@ -816,8 +841,8 @@ GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 
 def generate_summaries_groq(full_transcript, campaign_name):
-    client_primary = Groq(api_key=GROQ_API_KEY)
-    client_secondary = Groq(api_key="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")
+    client_primary = Groq(api_key=GROQ_API_KEY_PRIMARY)
+    client_secondary = Groq(api_key=GROQ_API_KEY_SECONDARY)
     
     if campaign_name in CAMPAIGN_QC_QUESTIONS:
         qc_questions = CAMPAIGN_QC_QUESTIONS[campaign_name]
