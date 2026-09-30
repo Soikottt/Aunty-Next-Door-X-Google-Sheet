@@ -5,3 +5,4 @@ audioop-lts
 groq
 gspread
 requests
+python-dotenv
