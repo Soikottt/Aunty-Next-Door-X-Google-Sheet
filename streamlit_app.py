@@ -128,7 +128,7 @@ for sheet_name in sheet_names:
                    gc = gspread.service_account(filename="service_account.json")
             
                sheet = gc.open(sheet_name)
-                worksheet = sheet.worksheet("Sheet1")
+               worksheet = sheet.worksheet("Sheet1")
 
                 rows = worksheet.get_all_values()
                 
