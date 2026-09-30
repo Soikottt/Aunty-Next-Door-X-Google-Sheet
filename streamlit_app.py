@@ -112,21 +112,21 @@ def background_sheet_watcher():
     while True:
         for sheet_name in sheet_names:
            try:
-        # Check if running on Streamlit Cloud using secrets
-        if "gcp_service_account" in st.secrets:
-            from google.oauth2.service_account import Credentials
-            SCOPES = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-            gc = gspread.authorize(creds)
-        else:
-            # Fallback for local computer using the JSON file
-            gc = gspread.service_account(filename="service_account.json")
+               # Check if running on Streamlit Cloud using secrets
+               if "gcp_service_account" in st.secrets:
+                   from google.oauth2.service_account import Credentials
+                   SCOPES = [
+                   "https://www.googleapis.com/auth/spreadsheets",
+                   "https://www.googleapis.com/auth/drive"
+                   ]
+                   creds_dict = dict(st.secrets["gcp_service_account"])
+                   creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+                   gc = gspread.authorize(creds)
+               else:
+                   # Fallback for local computer using the JSON file
+                   gc = gspread.service_account(filename="service_account.json")
             
-        sheet = gc.open(sheet_name)
+               sheet = gc.open(sheet_name)
                 worksheet = sheet.worksheet("Sheet1")
 
                 rows = worksheet.get_all_values()
