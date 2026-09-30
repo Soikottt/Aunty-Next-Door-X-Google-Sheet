@@ -1,75 +1,20 @@
 import os
 import time
 import json
-import zipfile
 import urllib.request
-import requests
 from pathlib import Path
-from datetime import datetime, timedelta
 from groq import Groq
-from pydub import AudioSegment
 import gspread
+from google.oauth2.service_account import Credentials
 
 # ============================================================
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
-MODEL_DIR = "model"
-ZIP_PATH = "model.zip"
-FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
-
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
-
-# ============================================================
-# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
-# ============================================================
-
-def download_file_from_google_drive(file_id, destination):
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
-    
-    token = get_confirm_token(response)
-    if token:
-        params = {'id': file_id, 'confirm': token}
-        response = session.get(URL, params=params, headers=headers, stream=True)
-        
-    save_response_content(response, destination)
-
-def get_confirm_token(response):
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            return value
-    return None
-
-def save_response_content(response, destination):
-    CHUNK_SIZE = 32768
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-
-def initialize_model_directory():
-    if not os.path.exists(MODEL_DIR):
-        os.makedirs(MODEL_DIR, exist_ok=True)
-        try:
-            print("Downloading model from Google Drive...")
-            download_file_from_google_drive(FILE_ID, ZIP_PATH)
-            
-            print("Extracting model files...")
-            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(MODEL_DIR)
-                    
-            if os.path.exists(ZIP_PATH):
-                os.remove(ZIP_PATH)
-            print("Model setup complete!")
-        except Exception as e:
-            print(f"Failed to auto-download/extract model: {str(e)}")
-
 
 # ============================================================
 # CAMPAIGN & QC PROMPTS CONFIGURATION
@@ -214,11 +159,6 @@ def format_seconds_to_hms(total_seconds_str):
     except Exception:
         return str(total_seconds_str)
 
-def format_time(seconds):
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{mins:02d}:{secs:02d}"
-
 def get_groq_api_keys():
     primary = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
     secondary = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
@@ -333,24 +273,34 @@ def load_audio_url_to_path(url):
 
     return str(path)
 
+def get_gspread_client():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    # Check if the secret is provided in GitHub Actions environment variables
+    if os.environ.get("GCP_SERVICE_ACCOUNT_JSON"):
+        creds_dict = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(creds)
+    elif os.path.exists("service_account.json"):
+        return gspread.service_account(filename="service_account.json")
+    else:
+        raise FileNotFoundError("Google service account credentials not found in env or file!")
+
 
 # ============================================================
-# SINGLE-RUN SHEET WORKER EXECUTION (NO INFINITE LOOP)
+# SINGLE-RUN SHEET WORKER EXECUTION
 # ============================================================
 
 def run_sheet_sync_once():
-    """Processes target Google Sheets rows once for GitHub Actions execution and exits cleanly."""
     sheet_names = ["Ringba to Sheet QC"]
     print("Starting single-run Google Sheets sync worker...")
 
-    for sheet_name in sheet_names:
-        try:
-            if os.path.exists("service_account.json"):
-                gc = gspread.service_account(filename="service_account.json")
-            else:
-                print("service_account.json credentials not found.")
-                continue
-         
+    try:
+        gc = get_gspread_client()
+        
+        for sheet_name in sheet_names:
             sheet = gc.open(sheet_name)
             worksheet = sheet.worksheet("Sheet1")
             rows = worksheet.get_all_values()
@@ -361,13 +311,11 @@ def run_sheet_sync_once():
                 recording_url = row[8].strip() if len(row) > 8 else ""
                 existing_main_topic = row[7].strip() if len(row) > 7 else ""
 
-                # Format seconds to H:MM:SS if needed
                 if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
                     formatted_dur = format_seconds_to_hms(raw_duration)
                     worksheet.update_cell(index, 6, formatted_dur)
                     time.sleep(1)
 
-                # Auto-transcribe and summarize if URL exists but summary is empty
                 if raw_campaign and recording_url and not existing_main_topic:
                     try:
                         print(f"Processing row {index} in {sheet_name}...")
@@ -383,7 +331,6 @@ def run_sheet_sync_once():
                         worksheet.update_cell(index, 8, main_topic)
                         print(f"Successfully updated row {index}!")
                         
-                        # Cleanup local temp file
                         if os.path.exists(audio_path):
                             os.remove(audio_path)
                             
@@ -392,14 +339,13 @@ def run_sheet_sync_once():
                         print(f"Error processing row {index}: {str(err)}")
                         worksheet.update_cell(index, 7, f"Error: {str(err)}")
 
-        except Exception as e:
-            print(f"Error accessing sheet '{sheet_name}': {str(e)}")
+    except Exception as e:
+        print(f"Global worker error: {str(e)}")
 
     print("Worker sync run complete. Exiting cleanly.")
 
 
 if __name__ == "__main__":
     print("Initializing standalone worker service...")
-    initialize_model_directory()
     run_sheet_sync_once()
     print("Worker task completed successfully.")
