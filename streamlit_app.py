@@ -111,7 +111,7 @@ def background_sheet_watcher():
 
     # Instead of an infinite loop, let your button control when it runs, 
     # or let it run once when the app loads:
-        for sheet_name in sheet_names:
+for sheet_name in sheet_names:
            try:
                # Check if running on Streamlit Cloud using secrets
                if "gcp_service_account" in st.secrets:
