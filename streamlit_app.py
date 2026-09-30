@@ -20,63 +20,107 @@ import streamlit.components.v1 as components
 from groq import Groq
 from pydub import AudioSegment
 import gspread  
+from google.oauth2.service_account import Credentials  
 import threading
-import zipfile
-import requests
 
 
 # ============================================================
-# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
+# GOOGLE SHEETS CLIENT HELPER (ENV OR LOCAL FILE)
 # ============================================================
 
-MODEL_DIR = "model"  # Target directory for your model
-ZIP_PATH = "model.zip"
-FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
+def get_gspread_client():
+    """Returns an authorized gspread client using environment variables or local file."""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    if os.environ.get("GCP_SERVICE_ACCOUNT_JSON"):
+        creds_dict = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(creds)
+    elif os.path.exists("service_account.json"):
+        return gspread.service_account(filename="service_account.json")
+    else:
+        raise FileNotFoundError("Google service account credentials not found in environment variables or service_account.json!")
 
-def download_file_from_google_drive(file_id, destination):
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
+
+# ============================================================
+# BACKGROUND THREAD AUTOMATION WORKER
+# ============================================================
+
+def get_campaign_category(raw_campaign_text):
+    """Accurately maps specific row campaign names to clean umbrella categories."""
+    text = raw_campaign_text.lower()
     
-    token = get_confirm_token(response)
-    if token:
-        params = {'id': file_id, 'confirm': token}
-        response = session.get(URL, params=params, headers=headers, stream=True)
-        
-    save_response_content(response, destination)
+    if "health" in text or "u65" in text:
+        return "U65 Health Insurance"
+    elif "rehab" in text:
+        return "Rehab Services"
+    elif "dumpster" in text:
+        return "Dumpster & Porta Potty Services"
+    else:
+        return raw_campaign_text.strip() if raw_campaign_text else "General Customer Inquiry"
 
-def get_confirm_token(response):
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            return value
-    return None
-
-def save_response_content(response, destination):
-    CHUNK_SIZE = 32768
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-
-# Check and extract on first boot if missing
-if not os.path.exists(MODEL_DIR):
-    os.makedirs(MODEL_DIR, exist_ok=True)
+def format_seconds_to_hms(total_seconds_str):
+    """Converts raw seconds into a clean H:MM:SS text string."""
     try:
-        with st.spinner("Downloading model from Google Drive..."):
-            download_file_from_google_drive(FILE_ID, ZIP_PATH)
-        
-        with st.spinner("Extracting model files..."):
-            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(MODEL_DIR)
+        total_seconds = int(float(str(total_seconds_str).strip()))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    except Exception:
+        return str(total_seconds_str)
+
+def background_sheet_watcher():
+    """Continuously watches multiple Google Sheets for new rows in the background."""
+    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
+
+    while True:
+        for sheet_name in sheet_names:
+            try:
+                gc = get_gspread_client()  
+                sheet = gc.open(sheet_name)
+                worksheet = sheet.worksheet("Sheet1")
+
+                rows = worksheet.get_all_values()
                 
-        if os.path.exists(ZIP_PATH):
-            os.remove(ZIP_PATH)
-        st.success("Model setup complete!")
-    except Exception as e:
-        st.error(f"Failed to auto-download/extract model: {str(e)}")
+                for index, row in enumerate(rows[1:], start=2):
+                    raw_duration = row[5].strip() if len(row) > 5 else ""
+                    raw_campaign = row[3].strip() if len(row) > 3 else ""
+                    recording_url = row[8].strip() if len(row) > 8 else ""
+                    existing_main_topic = row[7].strip() if len(row) > 7 else ""
 
+                    if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
+                        formatted_dur = format_seconds_to_hms(raw_duration)
+                        worksheet.update_cell(index, 6, formatted_dur)  
+                        time.sleep(1)
 
+                    if raw_campaign and recording_url and not existing_main_topic:
+                        try:
+                            campaign_name = get_campaign_category(raw_campaign)
+                            load_audio_url(recording_url)
+                            _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                            full_transcript_str = " ".join(raw_text_segments)
+                            
+                            main_topic, detailed_summary = generate_summaries_groq(full_transcript_str, campaign_name)
+                            
+                            worksheet.update_cell(index, 7, detailed_summary)
+                            worksheet.update_cell(index, 8, main_topic)
+                            time.sleep(5)
+                            
+                        except Exception as err:
+                            worksheet.update_cell(index, 7, f"Error: {str(err)}")
+
+            except Exception as e:
+                pass  
+
+        time.sleep(30)  
+
+if "worker_started" not in st.session_state:
+    st.session_state.worker_started = True
+    t = threading.Thread(target=background_sheet_watcher, daemon=True)
+    t.start()
 
 # ============================================================
 # DATABASE & AUTHENTICATION SETUP (SQLite)
@@ -86,8 +130,8 @@ DB_PATH = Path("users.db")
 
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")  
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")  
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -177,6 +221,10 @@ def update_user_profile(user_id: int, new_name: str, new_email: str, new_passwor
     finally:
         conn.close()
 
+# ============================================================
+# ADMIN PANEL DATABASE HELPERS
+# ============================================================
+
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -209,6 +257,7 @@ def admin_delete_user(user_id: int):
 
 def send_reset_code_email(email: str, code: str):
     if not SMTP_EMAIL or not SMTP_PASSWORD:
+        print(f"[TESTING MODE] Reset Code for {email}: {code}")
         return True, f"Demo Mode: Credentials not configured. Your code is: {code}"
 
     try:
@@ -368,39 +417,24 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# GROQ API KEYS
+# GROQ API KEYS (STREAMLIT SECRETS & ENV)
 # ============================================================
 
-from dotenv import load_dotenv
+def get_groq_api_keys():
+    primary = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
+    if not primary:
+        primary = st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
+            
+    secondary = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
+    if not secondary:
+        secondary = st.secrets.get("GROQ_API_KEY_SECONDARY_2", "").strip()
+            
+    if not primary:
+        raise ValueError("Primary Groq API key is missing! Please configure it in your Streamlit secrets or environment variables.")
+        
+    return primary, secondary
 
-load_dotenv()
-
-GROQ_API_KEY_PRIMARY = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
-GROQ_API_KEY_SECONDARY = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
-
-if not GROQ_API_KEY_PRIMARY:
-    try:
-        GROQ_API_KEY_PRIMARY = st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
-    except Exception:
-        GROQ_API_KEY_PRIMARY = ""
-
-if not GROQ_API_KEY_SECONDARY:
-    try:
-        GROQ_API_KEY_SECONDARY = st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
-    except Exception:
-        GROQ_API_KEY_SECONDARY = ""
-
-if not GROQ_API_KEY_PRIMARY:
-    raise RuntimeError(
-        "Primary Groq API key not found. "
-        "Please add Aunty_NEXT_DOOR_API_PRIMARY to your .env file."
-    )
-
-if not GROQ_API_KEY_SECONDARY:
-    raise RuntimeError(
-        "Secondary Groq API key not found. "
-        "Please add GROQ_API_KEY_SECONDARY_2 to your .env file."
-    )
+GROQ_API_KEY, GROQ_SECONDARY_API_KEY = get_groq_api_keys()
 
 
 # ============================================================
@@ -719,10 +753,10 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY_PRIMARY:
-        raise RuntimeError("Primary Groq API key not found.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("Groq API key not found.")
 
-    client = Groq(api_key=GROQ_API_KEY_PRIMARY)
+    client = Groq(api_key=GROQ_API_KEY)
 
     with open(audio_file_path, "rb") as file:
         transcription = client.audio.transcriptions.create(
@@ -760,8 +794,8 @@ GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 
 def generate_summaries_groq(full_transcript, campaign_name):
-    client_primary = Groq(api_key=GROQ_API_KEY_PRIMARY)
-    client_secondary = Groq(api_key=GROQ_API_KEY_SECONDARY)
+    client_primary = Groq(api_key=GROQ_API_KEY)
+    client_secondary = Groq(api_key=GROQ_SECONDARY_API_KEY)
     
     if campaign_name in CAMPAIGN_QC_QUESTIONS:
         qc_questions = CAMPAIGN_QC_QUESTIONS[campaign_name]
@@ -893,29 +927,20 @@ def load_audio_url(url):
     st.session_state.status = "Recording link loaded and ready."
 
 
+# ============================================================
+# GOOGLE SHEET BATCH SYNC HELPER
+# ============================================================
+
 def sync_google_sheet_batch(campaign_name):
     try:
-        # Check if running on Streamlit Cloud using secrets
-        if "gcp_service_account" in st.secrets:
-            from google.oauth2.service_account import Credentials
-            SCOPES = [
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"
-            ]
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-            gc = gspread.authorize(creds)
-        else:
-            # Fallback for local computer using the JSON file
-            gc = gspread.service_account(filename="service_account.json")
-            
+        gc = get_gspread_client()  
         sheet = gc.open("DOPPCALL QC - AND")
         worksheet = sheet.worksheet("Sheet1")
 
         rows = worksheet.get_all_values()
         processed_count = 0
 
-        for index, row in enumerate(rows[1:], start=2):
+        for index, row in enumerate(rows[1:], start=2):  
             recording_url = row[7].strip() if len(row) > 7 else ""
             existing_summary = row[9].strip() if len(row) > 9 else ""
 
@@ -1135,7 +1160,7 @@ with st.sidebar:
         st.rerun()
 
     if current_user.get("is_admin"):
-        if st.button("🛡 &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
+        if st.button("🛡️ &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
             st.session_state.current_view = "admin"
             st.rerun()
 
