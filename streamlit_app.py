@@ -109,7 +109,8 @@ def background_sheet_watcher():
     """Continuously watches multiple Google Sheets for new rows in the background."""
     sheet_names = ["Ringba to Sheet QC"]
 
-    while True:
+    # Instead of an infinite loop, let your button control when it runs, 
+    # or let it run once when the app loads:
         for sheet_name in sheet_names:
            try:
                # Check if running on Streamlit Cloud using secrets
