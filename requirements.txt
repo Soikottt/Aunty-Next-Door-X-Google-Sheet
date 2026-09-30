@@ -1,4 +1,8 @@
+audioop-lts
 streamlit
 vosk
 pydub
-audioop-lts
+groq
+gspread
+requests
+python-dotenv

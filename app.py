@@ -435,7 +435,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # GROQ API KEYS
 # ============================================================
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+api_key = st.secrets["GROQ_API_KEY"]
 
 if not GROQ_API_KEY:
     try:
@@ -443,7 +443,7 @@ if not GROQ_API_KEY:
     except Exception:
         GROQ_API_KEY = ""
 
-GROQ_SECONDARY_API_KEY = os.environ.get("GROQ_SECONDARY_API_KEY", "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")
+api_key = st.secrets["GROQ_API_KEY"]
 
 if not GROQ_SECONDARY_API_KEY:
     try:
