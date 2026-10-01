@@ -841,61 +841,81 @@ def load_audio_url(url):
 # GOOGLE SHEET ON-DEMAND SYNC HELPER (WITH BATCH & RATE LIMITING)
 # ============================================================
 
+import requests
+
 def sync_google_sheet_batch(campaign_name):
-    """Syncs the entire sheet, finds any recording URL, transcribes it, and updates the summary column."""
+    """Syncs the sheet with status updates and connection timeouts to prevent infinite loading."""
     try:
+        # Show status in Streamlit UI
+        status_text = st.empty()
+        status_text.text("Connecting to Google Sheets...")
+
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
         sheet = gc.open("DOPPCALL QC - AND")
         worksheet = sheet.worksheet("Sheet1")
 
         rows = worksheet.get_all_values()
         if not rows or len(rows) < 2:
+            status_text.empty()
             return False, "Google Sheet is empty or missing data rows."
 
-        # Dynamically find column indices using header names
         headers = [h.strip() for h in rows[0]]
         
         try:
             url_idx = headers.index("Recording")
         except ValueError:
-            url_idx = 8  # Default to Column I if header name mismatch
+            url_idx = 8  
             
         try:
             summary_idx = headers.index("ShortSummary")
         except ValueError:
-            summary_idx = 7  # Default to Column H if header name mismatch
+            summary_idx = 7  
 
         processed_count = 0
+        total_rows = len(rows) - 1
 
-        for index, row in enumerate(rows[1:], start=2):  # Skip header row
-            # Safely extract the recording URL
+        for index, row in enumerate(rows[1:], start=2):
             recording_url = row[url_idx].strip() if len(row) > url_idx and row[url_idx] else ""
+            existing_summary = row[summary_idx].strip() if len(row) > summary_idx and row[summary_idx] else ""
 
-            # Process the row if a valid URL exists (processes all rows with links)
-            if recording_url and recording_url.startswith("http"):
+            if recording_url and recording_url.startswith("http") and not existing_summary:
                 try:
+                    status_text.text(f"Processing row {index-1} of {total_rows} (Downloading audio)...")
+                    
+                    # Optional safeguard: test downloading the URL with a 10-second timeout first
+                    response = requests.get(recording_url, timeout=10)
+                    response.raise_for_status()
+
+                    # Proceed with your standard pipeline
                     load_audio_url(recording_url)
+                    
+                    status_text.text(f"Processing row {index-1} (Transcribing with Groq)...")
                     _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                     full_transcript_str = " ".join(raw_text_segments)
+                    
+                    status_text.text(f"Processing row {index-1} (Generating AI Summary)...")
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
                     
-                    # Update the ShortSummary column directly
+                    status_text.text(f"Processing row {index-1} (Updating Google Sheet)...")
                     col_letter = chr(65 + summary_idx)
                     cell_address = f"{col_letter}{index}"
                     worksheet.update(cell_address, [[detailed_summary]])
                     
                     processed_count += 1
-                    time.sleep(3)
+                    time.sleep(1)
                 except Exception as e:
                     col_letter = chr(65 + summary_idx)
                     cell_address = f"{col_letter}{index}"
-                    worksheet.update(cell_address, [[f"Error: {str(e)}"]])
-                    time.sleep(3)
+                    error_msg = f"Error: {str(e)[:50]}"
+                    worksheet.update(cell_address, [[error_msg]])
+                    time.sleep(1)
 
+        status_text.empty()
         return True, f"Successfully processed and updated {processed_count} recordings!"
     except Exception as e:
         return False, f"Google Sheets error: {str(e)}"
 
+        
 # ============================================================
 # THEME DYNAMIC INJECTION
 # ============================================================
