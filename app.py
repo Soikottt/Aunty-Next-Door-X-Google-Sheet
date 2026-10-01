@@ -842,7 +842,7 @@ def load_audio_url(url):
 # ============================================================
 
 def sync_google_sheet_batch(campaign_name):
-    """Reads recording URLs from Column I and writes summaries to Column H."""
+    """Reads recording URLs from Column I and writes summaries to Column H directly."""
     try:
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
         sheet = gc.open("DOPPCALL QC - AND")
@@ -852,14 +852,12 @@ def sync_google_sheet_batch(campaign_name):
         if not rows or len(rows) < 2:
             return False, "Google Sheet is empty or missing data rows."
 
-        # Explicit mapping based on your sheet layout:
         # Column H (Index 7) = ShortSummary (Output)
         # Column I (Index 8) = Recording (Input URLs)
         summary_idx = 7 
         url_idx = 8     
 
         processed_count = 0
-        batch_updates = []
 
         for index, row in enumerate(rows[1:], start=2):  # Skip header row
             recording_url = row[url_idx].strip() if len(row) > url_idx else ""
@@ -872,29 +870,22 @@ def sync_google_sheet_batch(campaign_name):
                     full_transcript_str = " ".join(raw_text_segments)
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
                     
-                    # Column H is index 7 -> 'H'
+                    # Directly update the cell by coordinate (e.g., 'H2', 'H3', etc.)
                     col_letter = chr(65 + summary_idx)
-                    batch_updates.append({
-                        'range': f'{col_letter}{index}',
-                        'values': [[detailed_summary]]
-                    })
+                    cell_address = f"{col_letter}{index}"
+                    worksheet.update(cell_address, [[detailed_summary]])
+                    
                     processed_count += 1
-                    time.sleep(5)
+                    time.sleep(3)
                 except Exception as e:
                     col_letter = chr(65 + summary_idx)
-                    batch_updates.append({
-                        'range': f'{col_letter}{index}',
-                        'values': [[f"Error processing: {str(e)}"]]
-                    })
-                    time.sleep(5)
+                    cell_address = f"{col_letter}{index}"
+                    worksheet.update(cell_address, [[f"Error: {str(e)}"]])
+                    time.sleep(3)
 
-        if batch_updates:
-            worksheet.batch_update(batch_updates)
-
-        return True, f"Successfully processed {processed_count} new recordings!"
+        return True, f"Successfully processed and updated {processed_count} new recordings!"
     except Exception as e:
         return False, f"Google Sheets error: {str(e)}"
-
 
 # ============================================================
 # THEME DYNAMIC INJECTION
