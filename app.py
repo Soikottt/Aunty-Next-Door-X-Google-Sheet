@@ -838,13 +838,13 @@ def load_audio_url(url):
 
 
 # ============================================================
-# GOOGLE SHEET ON-DEMAND SYNC HELPER
+# GOOGLE SHEET ON-DEMAND SYNC HELPER (WITH BATCH & RATE LIMITING)
 # ============================================================
 
 def sync_google_sheet_batch(campaign_name):
     """Reads recording URLs from Column H on demand when clicked,
 
-    transcribes/summarizes them, and writes summaries back to Column J.
+    transcribes/summarizes them, and writes summaries back to Column J in batch with rate limiting.
     """
     try:
         # Uses gspread via Streamlit secrets (e.g., [gcp_service_account] block)
@@ -854,6 +854,7 @@ def sync_google_sheet_batch(campaign_name):
 
         rows = worksheet.get_all_values()
         processed_count = 0
+        batch_updates = []
 
         for index, row in enumerate(rows[1:], start=2):  # Skip header row
             recording_url = row[7].strip() if len(row) > 7 else ""  # Column H
@@ -865,10 +866,26 @@ def sync_google_sheet_batch(campaign_name):
                     _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                     full_transcript_str = " ".join(raw_text_segments)
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
-                    worksheet.update_cell(index, 10, detailed_summary)  # Update Column J (10)
+                    
+                    # Prepare batch update for Column J (index 10)
+                    batch_updates.append({
+                        'range': f'J{index}',
+                        'values': [[detailed_summary]]
+                    })
                     processed_count += 1
+                    
+                    # Add rate-limiting sleep between row processing to stay under Google API limits
+                    time.sleep(5)
                 except Exception as e:
-                    worksheet.update_cell(index, 10, f"Error processing: {str(e)}")
+                    batch_updates.append({
+                        'range': f'J{index}',
+                        'values': [[f"Error processing: {str(e)}"]]
+                    })
+                    time.sleep(5)
+
+        # Apply batch update if there are any results to write
+        if batch_updates:
+            worksheet.batch_update(batch_updates)
 
         return True, f"Successfully processed {processed_count} new recordings!"
     except Exception as e:
