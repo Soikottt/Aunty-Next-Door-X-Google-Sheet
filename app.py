@@ -842,7 +842,7 @@ def load_audio_url(url):
 # ============================================================
 
 def sync_google_sheet_batch(campaign_name):
-    """Reads recording URLs from Column I and writes summaries to Column H directly."""
+    """Syncs the entire sheet, finds any recording URL, transcribes it, and updates the summary column."""
     try:
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
         sheet = gc.open("DOPPCALL QC - AND")
@@ -852,28 +852,34 @@ def sync_google_sheet_batch(campaign_name):
         if not rows or len(rows) < 2:
             return False, "Google Sheet is empty or missing data rows."
 
-        # Column H (Index 7) = ShortSummary (Output)
-        # Column I (Index 8) = Recording (Input URLs)
-        summary_idx = 7 
-        url_idx = 8     
+        # Dynamically find column indices using header names
+        headers = [h.strip() for h in rows[0]]
+        
+        try:
+            url_idx = headers.index("Recording")
+        except ValueError:
+            url_idx = 8  # Default to Column I if header name mismatch
+            
+        try:
+            summary_idx = headers.index("ShortSummary")
+        except ValueError:
+            summary_idx = 7  # Default to Column H if header name mismatch
 
         processed_count = 0
 
         for index, row in enumerate(rows[1:], start=2):  # Skip header row
-            recording_url = row[url_idx].strip() if len(row) > url_idx else ""
-            existing_summary = row[summary_idx].strip() if len(row) > summary_idx else ""
+            # Safely extract the recording URL
+            recording_url = row[url_idx].strip() if len(row) > url_idx and row[url_idx] else ""
 
-            if recording_url and not existing_summary:
+            # Process the row if a valid URL exists (processes all rows with links)
+            if recording_url and recording_url.startswith("http"):
                 try:
                     load_audio_url(recording_url)
                     _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                     full_transcript_str = " ".join(raw_text_segments)
-                    _, detailed_summary = generate_summaries_groq(
-    full_transcript_str,
-    campaign_name
-)
+                    detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
                     
-                    # Directly update the cell by coordinate (e.g., 'H2', 'H3', etc.)
+                    # Update the ShortSummary column directly
                     col_letter = chr(65 + summary_idx)
                     cell_address = f"{col_letter}{index}"
                     worksheet.update(cell_address, [[detailed_summary]])
@@ -886,7 +892,7 @@ def sync_google_sheet_batch(campaign_name):
                     worksheet.update(cell_address, [[f"Error: {str(e)}"]])
                     time.sleep(3)
 
-        return True, f"Successfully processed and updated {processed_count} new recordings!"
+        return True, f"Successfully processed and updated {processed_count} recordings!"
     except Exception as e:
         return False, f"Google Sheets error: {str(e)}"
 
