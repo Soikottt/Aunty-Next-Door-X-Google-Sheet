@@ -842,23 +842,43 @@ def load_audio_url(url):
 # ============================================================
 
 def sync_google_sheet_batch(campaign_name):
-    """Reads recording URLs from Column H on demand when clicked,
+    """Reads recording URLs from the sheet on demand, transcribes/summarizes them,
 
-    transcribes/summarizes them, and writes summaries back to Column J in batch with rate limiting.
+    and writes summaries back to the summary column dynamically based on headers.
     """
     try:
-        # Uses gspread via Streamlit secrets (e.g., [gcp_service_account] block)
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
         sheet = gc.open("DOPPCALL QC - AND")
         worksheet = sheet.worksheet("Sheet1")
 
         rows = worksheet.get_all_values()
+        if not rows or len(rows) < 2:
+            return False, "Google Sheet is empty or missing data rows."
+
+        headers = [h.strip().lower() for h in rows[0]]
+        
+        # Dynamically find column indices based on header names, with safe fallbacks (H=7, J=9)
+        url_idx = -1
+        summary_idx = -1
+        
+        for idx, h in enumerate(headers):
+            if any(kw in h for kw in ["recording", "url", "audio"]):
+                url_idx = idx
+            elif any(kw in h for kw in ["summary", "qc", "note"]):
+                summary_idx = idx
+                
+        # Fallback to standard columns if headers aren't matched explicitly (H = index 7, J = index 9)
+        if url_idx == -1:
+            url_idx = 7  # Column H
+        if summary_idx == -1:
+            summary_idx = 9  # Column J
+
         processed_count = 0
         batch_updates = []
 
         for index, row in enumerate(rows[1:], start=2):  # Skip header row
-            recording_url = row[7].strip() if len(row) > 7 else ""  # Column H
-            existing_summary = row[9].strip() if len(row) > 9 else ""  # Column J
+            recording_url = row[url_idx].strip() if len(row) > url_idx else ""
+            existing_summary = row[summary_idx].strip() if len(row) > summary_idx else ""
 
             if recording_url and not existing_summary:
                 try:
@@ -867,23 +887,22 @@ def sync_google_sheet_batch(campaign_name):
                     full_transcript_str = " ".join(raw_text_segments)
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
                     
-                    # Prepare batch update for Column J (index 10)
+                    # Convert column index to letter for gspread range update (e.g., index 9 -> 'J')
+                    col_letter = chr(65 + summary_idx)
                     batch_updates.append({
-                        'range': f'J{index}',
+                        'range': f'{col_letter}{index}',
                         'values': [[detailed_summary]]
                     })
                     processed_count += 1
-                    
-                    # Add rate-limiting sleep between row processing to stay under Google API limits
                     time.sleep(5)
                 except Exception as e:
+                    col_letter = chr(65 + summary_idx)
                     batch_updates.append({
-                        'range': f'J{index}',
+                        'range': f'{col_letter}{index}',
                         'values': [[f"Error processing: {str(e)}"]]
                     })
                     time.sleep(5)
 
-        # Apply batch update if there are any results to write
         if batch_updates:
             worksheet.batch_update(batch_updates)
 
