@@ -220,8 +220,8 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def get_groq_api_keys():
-    primary = os.getenv("Aunty_NEXT_DOOR_API_PRIMARY", "").strip()
-    secondary = os.getenv("GROQ_API_KEY_SECONDARY_2", "").strip()
+    primary = os.getenv("GROQ_API_KEY", "").strip()
+    secondary = os.getenv("GROQ_SECONDARY_API_KEY", "").strip()
     return primary, secondary
 
 def transcribe_groq_whisper(audio_file_path):
