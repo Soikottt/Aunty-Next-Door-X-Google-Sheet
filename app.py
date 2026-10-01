@@ -842,10 +842,7 @@ def load_audio_url(url):
 # ============================================================
 
 def sync_google_sheet_batch(campaign_name):
-    """Reads recording URLs from the sheet on demand, transcribes/summarizes them,
-
-    and writes summaries back to the summary column dynamically based on headers.
-    """
+    """Reads recording URLs from Column I and writes summaries to Column H."""
     try:
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
         sheet = gc.open("DOPPCALL QC - AND")
@@ -855,23 +852,11 @@ def sync_google_sheet_batch(campaign_name):
         if not rows or len(rows) < 2:
             return False, "Google Sheet is empty or missing data rows."
 
-        headers = [h.strip().lower() for h in rows[0]]
-        
-        # Dynamically find column indices based on header names, with safe fallbacks (H=7, J=9)
-        url_idx = -1
-        summary_idx = -1
-        
-        for idx, h in enumerate(headers):
-            if any(kw in h for kw in ["recording", "url", "audio"]):
-                url_idx = idx
-            elif any(kw in h for kw in ["summary", "qc", "note"]):
-                summary_idx = idx
-                
-        # Fallback to standard columns if headers aren't matched explicitly (H = index 7, J = index 9)
-        if url_idx == -1:
-            url_idx = 7  # Column H
-        if summary_idx == -1:
-            summary_idx = 9  # Column J
+        # Explicit mapping based on your sheet layout:
+        # Column H (Index 7) = ShortSummary (Output)
+        # Column I (Index 8) = Recording (Input URLs)
+        summary_idx = 7 
+        url_idx = 8     
 
         processed_count = 0
         batch_updates = []
@@ -887,7 +872,7 @@ def sync_google_sheet_batch(campaign_name):
                     full_transcript_str = " ".join(raw_text_segments)
                     detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
                     
-                    # Convert column index to letter for gspread range update (e.g., index 9 -> 'J')
+                    # Column H is index 7 -> 'H'
                     col_letter = chr(65 + summary_idx)
                     batch_updates.append({
                         'range': f'{col_letter}{index}',
