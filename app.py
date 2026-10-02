@@ -842,78 +842,102 @@ def load_audio_url(url):
 # ============================================================
 
 import requests
+import os
+import time
 
-def sync_google_sheet_batch(campaign_name):
-    """Syncs the sheet with status updates and connection timeouts to prevent infinite loading."""
+def sync_google_sheet_batch(default_campaign_name=""):
+    """Syncs multiple sheets on demand, formats duration, and updates both Summary (Col G) and Main Topic (Col H)."""
+    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
+    total_processed = 0
+    
+    # Show status box in Streamlit UI
+    status_text = st.empty()
+
     try:
-        # Show status in Streamlit UI
-        status_text = st.empty()
-        status_text.text("Connecting to Google Sheets...")
-
+        # Connect once to Google Sheets using your existing credentials logic
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-        sheet = gc.open("DOPPCALL QC - AND")
-        worksheet = sheet.worksheet("Sheet1")
 
-        rows = worksheet.get_all_values()
-        if not rows or len(rows) < 2:
-            status_text.empty()
-            return False, "Google Sheet is empty or missing data rows."
+        for sheet_name in sheet_names:
+            try:
+                status_text.text(f"Checking sheet: {sheet_name}...")
+                sheet = gc.open(sheet_name)
+                worksheet = sheet.worksheet("Sheet1")
+                rows = worksheet.get_all_values()
+                
+                if not rows or len(rows) < 2:
+                    continue
 
-        headers = [h.strip() for h in rows[0]]
-        
-        try:
-            url_idx = headers.index("Recording")
-        except ValueError:
-            url_idx = 8  
-            
-        try:
-            summary_idx = headers.index("ShortSummary")
-        except ValueError:
-            summary_idx = 7  
+                total_rows = len(rows) - 1
 
-        processed_count = 0
-        total_rows = len(rows) - 1
-
-        for index, row in enumerate(rows[1:], start=2):
-            recording_url = row[url_idx].strip() if len(row) > url_idx and row[url_idx] else ""
-            existing_summary = row[summary_idx].strip() if len(row) > summary_idx and row[summary_idx] else ""
-
-            if recording_url and recording_url.startswith("http") and not existing_summary:
-                try:
-                    status_text.text(f"Processing row {index-1} of {total_rows} (Downloading audio)...")
+                for index, row in enumerate(rows[1:], start=2):
+                    # Column definitions (0-based list index):
+                    # Column D (index 3): Raw Campaign Name
+                    # Column F (index 5): Duration (seconds)
+                    # Column G (index 6): AI Call Summary
+                    # Column H (index 7): Main Topic (used as check flag)
+                    # Column I (index 8): Recording URL
                     
-                    # Optional safeguard: test downloading the URL with a 10-second timeout first
-                    response = requests.get(recording_url, timeout=10)
-                    response.raise_for_status()
+                    raw_campaign = row[3].strip() if len(row) > 3 else ""
+                    raw_duration = row[5].strip() if len(row) > 5 else ""
+                    existing_main_topic = row[7].strip() if len(row) > 7 else ""
+                    recording_url = row[8].strip() if len(row) > 8 else ""
 
-                    # Proceed with your standard pipeline
-                    load_audio_url(recording_url)
-                    
-                    status_text.text(f"Processing row {index-1} (Transcribing with Groq)...")
-                    _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
-                    full_transcript_str = " ".join(raw_text_segments)
-                    
-                    status_text.text(f"Processing row {index-1} (Generating AI Summary)...")
-                    detailed_summary, _ = generate_summaries_groq(full_transcript_str, campaign_name)
-                    
-                    status_text.text(f"Processing row {index-1} (Updating Google Sheet)...")
-                    col_letter = chr(65 + summary_idx)
-                    cell_address = f"{col_letter}{index}"
-                    worksheet.update(cell_address, [[detailed_summary]])
-                    
-                    processed_count += 1
-                    time.sleep(1)
-                except Exception as e:
-                    col_letter = chr(65 + summary_idx)
-                    cell_address = f"{col_letter}{index}"
-                    error_msg = f"Error: {str(e)[:50]}"
-                    worksheet.update(cell_address, [[error_msg]])
-                    time.sleep(1)
+                    # 1. Format Duration in Column F if it contains raw numbers
+                    if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
+                        try:
+                            formatted_dur = format_seconds_to_hms(raw_duration)
+                            worksheet.update_cell(index, 6, formatted_dur)  # Column F (cell 6)
+                            time.sleep(1)
+                        except Exception:
+                            pass
+
+                    # 2. Process Audio if Campaign + Recording URL exist and it's not yet summarized
+                    if recording_url and recording_url.startswith("http") and not existing_main_topic:
+                        try:
+                            status_text.text(f"[{sheet_name}] Processing Row {index-1}/{total_rows} (Downloading audio)...")
+                            
+                            # Safe download with timeout
+                            response = requests.get(recording_url, timeout=15)
+                            response.raise_for_status()
+
+                            temp_filename = "temp_downloaded_audio.mp3"
+                            with open(temp_filename, "wb") as f:
+                                f.write(response.content)
+                            st.session_state.file_path = temp_filename
+
+                            # Determine campaign category
+                            campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
+
+                            status_text.text(f"[{sheet_name}] Row {index-1}: Transcribing audio...")
+                            _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                            full_transcript_str = " ".join(raw_text_segments)
+                            
+                            status_text.text(f"[{sheet_name}] Row {index-1}: Generating AI summary & topic...")
+                            main_topic, detailed_summary = generate_summaries_groq(full_transcript_str, campaign_to_use)
+                            
+                            status_text.text(f"[{sheet_name}] Row {index-1}: Updating Google Sheet...")
+                            # Write AI Call Summary to Column G (cell row, column 7)
+                            worksheet.update_cell(index, 7, detailed_summary)
+                            
+                            # Write Main Topic to Column H (cell row, column 8)
+                            worksheet.update_cell(index, 8, main_topic)
+                            
+                            total_processed += 1
+                            time.sleep(2)
+                        except Exception as row_err:
+                            # Write error cleanly into Column G so you see what failed
+                            worksheet.update_cell(index, 7, f"Error: {str(row_err)[:60]}")
+                            time.sleep(1)
+
+            except Exception as sheet_err:
+                # Skip individual sheet errors gracefully
+                continue
 
         status_text.empty()
-        return True, f"Successfully processed and updated {processed_count} recordings!"
+        return True, f"Successfully processed {total_processed} new call records across sheets!"
     except Exception as e:
-        return False, f"Google Sheets error: {str(e)}"
+        status_text.empty()
+        return False, f"Google Sheets connection error: {str(e)}"
 
         
 # ============================================================
