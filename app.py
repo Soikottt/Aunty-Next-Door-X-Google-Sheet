@@ -851,7 +851,7 @@ def get_campaign_category(raw_campaign):
 
 def sync_google_sheet_batch(default_campaign_name=""):
     """Syncs sheets, formats duration in Column F, downloads audio securely, and updates Column G and Column H."""
-    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
+    sheet_names = ["Ringba to Sheet QC"]
     total_processed = 0
     
     status_text = st.empty()
