@@ -610,7 +610,7 @@ If the call ends because one side stops responding, describe the actual response
 DO NOT use any Markdown formatting or asterisks (* or **). Output PLAIN TEXT ONLY.
 
 OUTPUT:
-Return ONLY the final QC summary paragraph.
+Return only the final QC summary paragraph in simple, natural English, using basic words and correct grammar.
 
 CALL TRANSCRIPT:
 {call_transcript}
