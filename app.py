@@ -847,7 +847,7 @@ import time
 
 def sync_google_sheet_batch(default_campaign_name=""):
     """Syncs multiple sheets on demand, formats duration, and updates both Summary (Col G) and Main Topic (Col H)."""
-    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
+    sheet_names = ["Ringba to Sheet QC"]
     total_processed = 0
     
     # Show status box in Streamlit UI
