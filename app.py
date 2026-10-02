@@ -448,7 +448,7 @@ Always include the caller's clearly stated insurance name and type in the summar
 
 Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, Inusrance name if mentioned, service, action, or outcome.
 
-Keep the final summary very short, factual, natural, and conversational, like a human-written QC note.
+Keep the final summary very short, factual, natural, conversational and included insurance name, like a human-written QC note.
 """,
 
     "Dumpster & Porta Potty Services": """
