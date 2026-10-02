@@ -446,7 +446,7 @@ Always include the caller's clearly stated insurance name and type in the summar
 
 **Example:** "The caller confirmed he has HealthPartners private insurance through his wife's employer."
 
-Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, service, action, or outcome.
+Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, Inusrance name if mentioned, service, action, or outcome.
 
 Keep the final summary very short, factual, natural, and conversational, like a human-written QC note.
 """,
