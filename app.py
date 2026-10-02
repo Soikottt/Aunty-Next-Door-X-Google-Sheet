@@ -433,6 +433,19 @@ Avoid unnatural phrases such as:
 "No clear details were provided..."
 "No confirmed appointment was made..."
 
+**INSURANCE EXTRACTION RULE:**
+
+Always include the caller's clearly stated insurance name and type in the summary when discussed.
+
+* Include the exact insurance provider or plan name, such as HealthPartners, Blue Cross, Aetna, or Medicaid.
+* Identify the insurance type or source when clearly stated, such as private insurance, employer-sponsored, spouse's employer plan, Medicare, or Medicaid.
+* If the caller says the insurance is through a spouse's employer, include that detail.
+* Do not assume the insurance type if it is not confirmed.
+* If insurance is discussed but the name or type is unclear, include only the confirmed information.
+* Never omit clearly stated insurance details just to make the summary shorter.
+
+**Example:** "The caller confirmed he has HealthPartners private insurance through his wife's employer."
+
 Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, service, action, or outcome.
 
 Keep the final summary very short, factual, natural, and conversational, like a human-written QC note.
