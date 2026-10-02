@@ -850,8 +850,8 @@ def get_campaign_category(raw_campaign):
     return raw_campaign if raw_campaign else "Default Campaign"
 
 def sync_google_sheet_batch(default_campaign_name=""):
-    """Syncs sheets, formats duration, downloads audio securely, and updates Column G (Note) and Column H (ShortSummary)."""
-    sheet_names = ["Ringba to Sheet QC"]
+    """Syncs sheets, formats duration in Column F, downloads audio securely, and updates Column G and Column H."""
+    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
     total_processed = 0
     
     status_text = st.empty()
@@ -873,28 +873,35 @@ def sync_google_sheet_batch(default_campaign_name=""):
 
                 for index, row in enumerate(rows[1:], start=2):
                     # Column mappings (0-based list index):
-                    # Column D (index 3): Campaign
-                    # Column F (index 5): Duration
-                    # Column G (index 6): Note / Detailed Summary
-                    # Column H (index 7): ShortSummary
-                    # Column I (index 8): Recording URL
+                    # Column D (index 3) - Campaign name
+                    # Column F (index 5) - Duration (seconds) -> strict Column F check & conversion
+                    # Column G (index 6) - Note / Detailed Summary
+                    # Column H (index 7) - ShortSummary / Main Topic (used as check flag)
+                    # Column I (index 8) - Recording URL
                     
                     raw_campaign = row[3].strip() if len(row) > 3 else ""
                     raw_duration = row[5].strip() if len(row) > 5 else ""
-                    existing_summary = row[7].strip() if len(row) > 7 else ""
+                    existing_main_topic = row[7].strip() if len(row) > 7 else ""
                     recording_url = row[8].strip() if len(row) > 8 else ""
 
-                    # 1. Format Duration in Column F if raw seconds exist
-                    if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
+                    # 1. FORMAT DURATION: Clean and convert raw numbers in Column F exclusively into H:MM:SS
+                    if raw_duration and ":" not in raw_duration:
                         try:
-                            formatted_dur = format_seconds_to_hms(raw_duration)
-                            worksheet.update_cell(index, 6, formatted_dur)
-                            time.sleep(1)
+                            clean_dur = raw_duration.strip()
+                            if clean_dur.isdigit():
+                                total_seconds = int(clean_dur)
+                                hours = total_seconds // 3600
+                                minutes = (total_seconds % 3600) // 60
+                                seconds = total_seconds % 60
+                                formatted_dur = f"{hours}:{minutes:02d}:{seconds:02d}"
+                                
+                                worksheet.update_cell(index, 6, formatted_dur)  # Column F (cell row, column 6)
+                                time.sleep(0.5)
                         except Exception:
                             pass
 
                     # 2. Process Audio if Recording URL exists and Column H is empty
-                    if recording_url and recording_url.startswith("http") and not existing_summary:
+                    if recording_url and recording_url.startswith("http") and not existing_main_topic:
                         try:
                             status_text.text(f"[{sheet_name}] Row {index-1}/{total_rows} (Downloading audio)...")
                             
@@ -908,7 +915,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
                                 f.write(response.content)
                             st.session_state.file_path = temp_filename
 
-                            # Determine campaign safely
+                            # Determine campaign category safely
                             campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
 
                             status_text.text(f"[{sheet_name}] Row {index-1}: Transcribing audio...")
@@ -917,7 +924,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
                             
                             status_text.text(f"[{sheet_name}] Row {index-1}: Generating AI summary...")
                             
-                            # Handle summary generation safely (whether it returns 1 or 2 values)
+                            # Generate summaries (handles both single string or tuple outputs)
                             summary_output = generate_summaries_groq(full_transcript_str, campaign_to_use)
                             if isinstance(summary_output, tuple):
                                 main_topic, detailed_summary = summary_output
@@ -936,7 +943,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
                             total_processed += 1
                             time.sleep(2)
                         except Exception as row_err:
-                            # Log error into Column G so it doesn't silently fail
+                            # Log error into Column G so it doesn't fail silently
                             worksheet.update_cell(index, 7, f"Error: {str(row_err)[:60]}")
                             time.sleep(1)
 
