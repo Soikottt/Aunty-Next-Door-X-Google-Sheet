@@ -845,16 +845,18 @@ import requests
 import os
 import time
 
+# Safe fallback if get_campaign_category is missing
+def get_campaign_category(raw_campaign):
+    return raw_campaign if raw_campaign else "Default Campaign"
+
 def sync_google_sheet_batch(default_campaign_name=""):
-    """Syncs multiple sheets on demand, formats duration, and updates both Summary (Col G) and Main Topic (Col H)."""
-    sheet_names = ["Ringba to Sheet QC"]
+    """Syncs sheets, formats duration, downloads audio securely, and updates Column G (Note) and Column H (ShortSummary)."""
+    sheet_names = ["DOPPCALL QC - AND", "Ringba to Sheet QC"]
     total_processed = 0
     
-    # Show status box in Streamlit UI
     status_text = st.empty()
 
     try:
-        # Connect once to Google Sheets using your existing credentials logic
         gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
 
         for sheet_name in sheet_names:
@@ -870,34 +872,35 @@ def sync_google_sheet_batch(default_campaign_name=""):
                 total_rows = len(rows) - 1
 
                 for index, row in enumerate(rows[1:], start=2):
-                    # Column definitions (0-based list index):
-                    # Column D (index 3): Raw Campaign Name
-                    # Column F (index 5): Duration (seconds)
-                    # Column G (index 6): AI Call Summary
-                    # Column H (index 7): Main Topic (used as check flag)
+                    # Column mappings (0-based list index):
+                    # Column D (index 3): Campaign
+                    # Column F (index 5): Duration
+                    # Column G (index 6): Note / Detailed Summary
+                    # Column H (index 7): ShortSummary
                     # Column I (index 8): Recording URL
                     
                     raw_campaign = row[3].strip() if len(row) > 3 else ""
                     raw_duration = row[5].strip() if len(row) > 5 else ""
-                    existing_main_topic = row[7].strip() if len(row) > 7 else ""
+                    existing_summary = row[7].strip() if len(row) > 7 else ""
                     recording_url = row[8].strip() if len(row) > 8 else ""
 
-                    # 1. Format Duration in Column F if it contains raw numbers
+                    # 1. Format Duration in Column F if raw seconds exist
                     if raw_duration and not ":" in raw_duration and not "[" in raw_duration:
                         try:
                             formatted_dur = format_seconds_to_hms(raw_duration)
-                            worksheet.update_cell(index, 6, formatted_dur)  # Column F (cell 6)
+                            worksheet.update_cell(index, 6, formatted_dur)
                             time.sleep(1)
                         except Exception:
                             pass
 
-                    # 2. Process Audio if Campaign + Recording URL exist and it's not yet summarized
-                    if recording_url and recording_url.startswith("http") and not existing_main_topic:
+                    # 2. Process Audio if Recording URL exists and Column H is empty
+                    if recording_url and recording_url.startswith("http") and not existing_summary:
                         try:
-                            status_text.text(f"[{sheet_name}] Processing Row {index-1}/{total_rows} (Downloading audio)...")
+                            status_text.text(f"[{sheet_name}] Row {index-1}/{total_rows} (Downloading audio)...")
                             
-                            # Safe download with timeout
-                            response = requests.get(recording_url, timeout=15)
+                            # Add headers to avoid 403 Forbidden blocks from AWS S3
+                            headers_s3 = {'User-Agent': 'Mozilla/5.0'}
+                            response = requests.get(recording_url, headers=headers_s3, timeout=15)
                             response.raise_for_status()
 
                             temp_filename = "temp_downloaded_audio.mp3"
@@ -905,36 +908,43 @@ def sync_google_sheet_batch(default_campaign_name=""):
                                 f.write(response.content)
                             st.session_state.file_path = temp_filename
 
-                            # Determine campaign category
+                            # Determine campaign safely
                             campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
 
                             status_text.text(f"[{sheet_name}] Row {index-1}: Transcribing audio...")
                             _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                             full_transcript_str = " ".join(raw_text_segments)
                             
-                            status_text.text(f"[{sheet_name}] Row {index-1}: Generating AI summary & topic...")
-                            main_topic, detailed_summary = generate_summaries_groq(full_transcript_str, campaign_to_use)
+                            status_text.text(f"[{sheet_name}] Row {index-1}: Generating AI summary...")
+                            
+                            # Handle summary generation safely (whether it returns 1 or 2 values)
+                            summary_output = generate_summaries_groq(full_transcript_str, campaign_to_use)
+                            if isinstance(summary_output, tuple):
+                                main_topic, detailed_summary = summary_output
+                            else:
+                                main_topic = summary_output
+                                detailed_summary = summary_output
                             
                             status_text.text(f"[{sheet_name}] Row {index-1}: Updating Google Sheet...")
-                            # Write AI Call Summary to Column G (cell row, column 7)
+                            
+                            # Write Detailed Summary to Column G (cell row, column 7)
                             worksheet.update_cell(index, 7, detailed_summary)
                             
-                            # Write Main Topic to Column H (cell row, column 8)
+                            # Write ShortSummary/Main Topic to Column H (cell row, column 8)
                             worksheet.update_cell(index, 8, main_topic)
                             
                             total_processed += 1
                             time.sleep(2)
                         except Exception as row_err:
-                            # Write error cleanly into Column G so you see what failed
+                            # Log error into Column G so it doesn't silently fail
                             worksheet.update_cell(index, 7, f"Error: {str(row_err)[:60]}")
                             time.sleep(1)
 
             except Exception as sheet_err:
-                # Skip individual sheet errors gracefully
                 continue
 
         status_text.empty()
-        return True, f"Successfully processed {total_processed} new call records across sheets!"
+        return True, f"Successfully processed {total_processed} new call records!"
     except Exception as e:
         status_text.empty()
         return False, f"Google Sheets connection error: {str(e)}"
