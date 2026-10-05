@@ -408,28 +408,52 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# GROQ API KEYS (STREAMLIT SECRETS ONLY)
+# GROQ API KEYS (ROUND-ROBIN ROTATION & STREAMLIT SECRETS)
 # ============================================================
-# API keys are intentionally NOT stored in this source file.
-# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
-# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
-# Old secret names are also supported for compatibility.
+# First two secrets remain exactly as requested with backward compatibility:
+# 1. Aunty_NEXT_DOOR_API_PRIMARY (or GROQ_API_KEY)
+# 2. GROQ_API_KEY_SECONDARY_2 (or GROQ_SECONDARY_API_KEY)
+# Additional keys (e.g., GROQ_API_KEY_3, etc.) will also be included if present.
 
+GROQ_KEYS = []
 try:
-    GROQ_API_KEY = (
+    primary_key = (
         st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
         or st.secrets.get("GROQ_API_KEY", "")
     )
-    GROQ_SECONDARY_API_KEY = (
+    secondary_key = (
         st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
         or st.secrets.get("GROQ_SECONDARY_API_KEY", "")
     )
+    
+    if primary_key:
+        GROQ_KEYS.append(primary_key)
+    if secondary_key:
+        GROQ_KEYS.append(secondary_key)
+        
+    # Optional: Automatically scan for additional keys if provided (GROQ_API_KEY_3, GROQ_API_KEY_4, etc.)
+    for i in range(3, 10):
+        extra_key = st.secrets.get(f"GROQ_API_KEY_{i}", "")
+        if extra_key:
+            GROQ_KEYS.append(extra_key)
 except Exception:
-    GROQ_API_KEY = ""
-    GROQ_SECONDARY_API_KEY = ""
+    pass
 
-if not GROQ_API_KEY:
-    st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
+_api_key_lock = threading.Lock()
+_api_key_index = 0
+
+def get_next_groq_key():
+    """Returns the next Groq API key in round-robin order."""
+    global _api_key_index
+    with _api_key_lock:
+        if not GROQ_KEYS:
+            return ""
+        key = GROQ_KEYS[_api_key_index % len(GROQ_KEYS)]
+        _api_key_index += 1
+        return key
+
+if not GROQ_KEYS:
+    st.warning("No Groq API keys are configured in Streamlit Secrets.")
 
 
 # ============================================================
@@ -748,10 +772,11 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY:
-        raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
+    api_key = get_next_groq_key()
+    if not api_key:
+        raise RuntimeError("No Groq API keys found. Configure credentials in Streamlit Secrets.")
 
-    client = Groq(api_key=GROQ_API_KEY)
+    client = Groq(api_key=api_key)
 
     with open(audio_file_path, "rb") as file:
         transcription = client.audio.transcriptions.create(
@@ -954,24 +979,23 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
-    if not GROQ_API_KEY:
-        raise RuntimeError("Primary Groq API key is not configured.")
+    if not GROQ_KEYS:
+        raise RuntimeError("No Groq API keys configured.")
 
     prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
-    primary_error = None
-
-    try:
-        analysis = _call_structured_analysis(Groq(api_key=GROQ_API_KEY), prompt)
-    except Exception as primary_exc:
-        primary_error = primary_exc
-        if not GROQ_SECONDARY_API_KEY:
-            raise RuntimeError(f"Primary Groq analysis failed: {primary_exc}")
+    
+    # Try using round-robin with automatic fallback through the available key pool
+    last_error = None
+    for _ in range(len(GROQ_KEYS)):
+        current_key = get_next_groq_key()
         try:
-            analysis = _call_structured_analysis(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
-        except Exception as secondary_exc:
-            raise RuntimeError(
-                f"Both Groq analysis accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
-            )
+            analysis = _call_structured_analysis(Groq(api_key=current_key), prompt)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    else:
+        raise RuntimeError(f"All Groq analysis accounts/keys failed. Last error: {last_error}")
 
     if timeline_data is not None:
         speaker_map = {
@@ -1031,8 +1055,8 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI summary.")
 
-    if not GROQ_API_KEY:
-        raise RuntimeError("Primary Groq API key is not configured.")
+    if not GROQ_KEYS:
+        raise RuntimeError("No Groq API keys configured.")
 
     campaign_family = get_campaign_category(campaign_name)
     prompt = f"""
@@ -1064,19 +1088,17 @@ TRANSCRIPT:
 {full_transcript}
 """
 
-    primary_error = None
-    try:
-        result = _call_fast_summary(Groq(api_key=GROQ_API_KEY), prompt)
-    except Exception as primary_exc:
-        primary_error = primary_exc
-        if not GROQ_SECONDARY_API_KEY:
-            raise RuntimeError(f"Primary Groq fast summary failed: {primary_exc}")
+    last_error = None
+    for _ in range(len(GROQ_KEYS)):
+        current_key = get_next_groq_key()
         try:
-            result = _call_fast_summary(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
-        except Exception as secondary_exc:
-            raise RuntimeError(
-                f"Both Groq summary accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
-            )
+            result = _call_fast_summary(Groq(api_key=current_key), prompt)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    else:
+        raise RuntimeError(f"All Groq summary accounts/keys failed. Last error: {last_error}")
 
     main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
     long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
@@ -1314,9 +1336,6 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
         )
         return
 
-    # Rehab insurance has a business rule that takes priority over the normal
-    # score colors: government/state insurance = yellow (not qualified),
-    # private/employer insurance = green.
     campaign_category = str(analysis.get("campaign_category", "") or "").strip()
     if campaign_category == "Rehab & Addiction Treatment":
         rehab_status = get_rehab_insurance_status(analysis)
@@ -1328,7 +1347,6 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
                 worksheet.format(ranges, {"backgroundColor": insurance_color})
             return
 
-    # L (score) always gets the score color, even if it previously had a color.
     columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
     ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
     ranges.append(f"L{row_number}")
@@ -1410,17 +1428,7 @@ def get_google_client():
 
 
 def sync_google_sheet_batch(default_campaign_name=""):
-    """Process Ringba recordings from the shared Google Sheet.
-
-    Sheet layout:
-    D = Campaign
-    G = Long AI Summary
-    H = Main Topic / processing flag
-    I = Recording URL
-    J = Existing carrier / VOIP data (untouched)
-    K = AI QC Report
-    L = Numeric quality score
-    """
+    """Process Ringba recordings from the shared Google Sheet."""
     try:
         gc = get_google_client()
         sheet = gc.open("Ringba to Sheet QC")
@@ -1440,7 +1448,6 @@ def sync_google_sheet_batch(default_campaign_name=""):
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
 
-            # Keep the existing duration formatting behavior.
             if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
                 try:
                     worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
@@ -1448,7 +1455,6 @@ def sync_google_sheet_batch(default_campaign_name=""):
                 except Exception:
                     pass
 
-            # Existing trigger stays: recording exists + H is empty.
             if not recording_url or not recording_url.startswith("http") or existing_main_topic:
                 continue
 
