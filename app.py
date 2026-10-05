@@ -852,13 +852,63 @@ CAMPAIGN FAMILY:
 CAMPAIGN QC GUIDANCE:
 {qc_questions}
 
-Analyze the complete transcript and return structured call information.
+Your job is to analyze the complete transcript and return structured call information.
 
-RULES:
-- Long Summary: Write a factual, useful 2-5 sentence summary in simple natural English. Describe what happened, caller intent, insurance/location if stated, and outcome.
-- Main Topic: One short sentence describing what the caller was calling about.
-- Call Type & Qualification: Categorize accurately based on campaign requirements. Fill in qualification_reason and spam_reason where applicable.
-- Missing Information: Use empty strings `""` for text fields if information was not discussed. Do not invent values.
+IMPORTANT SPEAKER RULE:
+Whisper provides transcript segments but does not reliably identify speakers. You must infer whether each numbered segment is from the Agent, Caller, or Unknown using the conversation context. The agent is usually the representative asking qualification questions, explaining services, pricing, scheduling, transferring, or giving instructions. The caller is the person seeking the service, asking for help, answering qualification questions, or describing their problem.
+An Agent question is NEVER the Caller answer. Never infer caller information from an agent question.
+If the speaker cannot be determined with reasonable confidence, use Unknown instead of guessing.
+
+LONG SUMMARY RULES:
+- Write a factual, useful 2-5 sentence summary in simple natural English.
+- Describe only what actually happened in the call.
+- Include the caller's real reason for calling, requested service, important qualification information, insurance when clearly stated by the caller, location when relevant, important agent/caller actions, and the actual outcome when supported.
+- Do not add filler such as "the conversation was natural" or "there were no obvious signs of a robot" unless that fact is itself relevant to QC.
+- Do not invent facts, outcomes, appointments, insurance, or caller intent.
+- If the caller was not looking for the campaign service, explain what they actually wanted instead of simply writing "irrelevant".
+- If it was a wrong number, say what the caller was trying to reach when clear.
+- If it was spam/robot, summarize what the automated call was promoting or asking the recipient to do.
+- Never turn an Agent's question into a Caller answer.
+- Do not include unnecessary personal information such as full phone numbers or addresses.
+
+MAIN TOPIC RULES:
+- One short sentence, normally 5-15 words.
+- Answer: "What was this caller actually calling about?"
+- Do not make SPAM / ROBOT the main topic unless the call itself was an automated solicitation or spam event. In that case, describe the actual subject, such as "Automated Google listing and SEO solicitation."
+- For unrelated calls, describe the actual request and make it clear that it was unrelated.
+
+SPAM / ROBOT RULES:
+- Do NOT use exact phrase matching only.
+- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Similar wording must be recognized even when the exact words differ.
+- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
+- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
+- spam_confidence must reflect the strength of the evidence from 0-100.
+- Provide a brief explanation in spam_reason if applicable.
+
+QUALIFICATION RULES:
+- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
+- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
+- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
+- Provide a brief explanation in qualification_reason.
+
+MISSING INFORMATION:
+For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
+
+CALL TYPE:
+- QUALIFIED: relevant and clearly qualified.
+- NON-QUALIFIED: relevant but clearly not qualified.
+- WRONG NUMBER: caller was trying to reach another person/business/service.
+- SPAM / ROBOT: automated/scripted spam or marketing call.
+- INFORMATION ONLY: caller wanted information but not the campaign service/action.
+- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
+- OTHER: anything else that does not fit the categories.
+
+QC ISSUE:
+Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
+
+Read the entire transcript before deciding.
 
 TRANSCRIPT:
 {transcript_for_ai}
