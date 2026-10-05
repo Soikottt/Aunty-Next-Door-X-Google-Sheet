@@ -20,6 +20,167 @@ import streamlit.components.v1 as components
 from groq import Groq
 from pydub import AudioSegment
 import gspread  
+import threading
+import zipfile
+import requests
+
+
+
+# ============================================================
+# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
+# ============================================================
+
+MODEL_DIR = "model"  # Target directory for your model
+ZIP_PATH = "model.zip"
+FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
+
+def download_file_from_google_drive(file_id, destination):
+    URL = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
+    
+    token = get_confirm_token(response)
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, headers=headers, stream=True)
+        
+    save_response_content(response, destination)
+
+def get_confirm_token(response):
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            return value
+    return None
+
+def save_response_content(response, destination):
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+# Check and extract on first boot if missing
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    try:
+        with st.spinner("Downloading model from Google Drive..."):
+            download_file_from_google_drive(FILE_ID, ZIP_PATH)
+        
+        with st.spinner("Extracting model files..."):
+            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
+                zip_ref.extractall(MODEL_DIR)
+                
+        if os.path.exists(ZIP_PATH):
+            os.remove(ZIP_PATH)
+        st.success("Model setup complete!")
+    except Exception as e:
+        st.error(f"Failed to auto-download/extract model: {str(e)}")
+
+
+# ============================================================
+# BACKGROUND THREAD AUTOMATION WORKER
+# ============================================================
+
+def get_campaign_category(raw_campaign_text):
+    """Map real Ringba campaign names to the closest QC campaign family."""
+    raw = (raw_campaign_text or "").strip()
+    text = raw.lower()
+
+    if not raw:
+        return "General Customer Inquiry"
+
+    if any(k in text for k in ["rehab", "addiction", "mental health", "substance", "treatment"]):
+        return "Rehab & Addiction Treatment"
+
+    if any(k in text for k in ["dumpster", "porta potty", "portable toilet"]):
+        return "Dumpster & Porta Potty Services"
+
+    if any(k in text for k in ["pest", "roofing", "roof", "home service", "plumbing", "hvac", "moving"]):
+        return "Pest Control & Home Services"
+
+    if any(k in text for k in ["insurance", "medicare", "medicaid", "auto insurance", "home insurance", "final expense", "health insurance"]):
+        return "Insurance (Health / Auto / Home)"
+
+    if any(k in text for k in ["debt", "debt relief", "settlement", "financial", "loan", "mca"]):
+        return "Debt Relief & Financial Services"
+
+    return raw
+
+def format_seconds_to_hms(total_seconds_str):
+    """Converts raw seconds into a clean H:MM:SS text string."""
+    try:
+        total_seconds = int(float(str(total_seconds_str).strip()))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    except Exception:
+        return str(total_seconds_str)
+
+def background_sheet_watcher():
+    """Continuously watches Ringba to Sheet QC for new recordings."""
+    # Give the Streamlit script time to finish defining the processing functions.
+    time.sleep(8)
+
+    while True:
+        try:
+            gc = get_google_client()
+            sheet = gc.open("Ringba to Sheet QC")
+            worksheet = sheet.worksheet("Sheet1")
+            rows = worksheet.get_all_values()
+
+            special_color_map = get_existing_special_columns(worksheet, 2, len(rows)) if len(rows) > 1 else {}
+
+            for index, row in enumerate(rows[1:], start=2):
+                raw_duration = row[5].strip() if len(row) > 5 else ""
+                raw_campaign = row[3].strip() if len(row) > 3 else ""
+                recording_url = row[8].strip() if len(row) > 8 else ""
+                existing_main_topic = row[7].strip() if len(row) > 7 else ""
+
+                if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
+                    try:
+                        worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
+                    except Exception:
+                        pass
+
+                if not raw_campaign or not recording_url or not recording_url.startswith("http") or existing_main_topic:
+                    continue
+
+                try:
+                    campaign_name = get_campaign_category(raw_campaign)
+                    load_audio_url(recording_url)
+                    timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                    full_transcript_str = " ".join(raw_text_segments).strip()
+
+                    analysis = generate_call_analysis_groq(
+                        full_transcript_str,
+                        campaign_name,
+                        timeline_data=timeline_data,
+                    )
+                    score = calculate_call_quality_score(analysis)
+
+                    worksheet.update_cell(index, 7, analysis["long_summary"])
+                    worksheet.update_cell(index, 8, analysis["main_topic"])
+                    worksheet.update_cell(index, 11, build_qc_report(analysis))
+                    worksheet.update_cell(index, 12, score)
+                    apply_row_score_color(worksheet, index, score, analysis, special_color_map.get(index, set()))
+                except Exception as err:
+                    try:
+                        worksheet.update_cell(index, 7, f"Processing error: {str(err)}")
+                        worksheet.update_cell(index, 11, f"Processing error: {str(err)}")
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+
+        time.sleep(30)
+
+if "worker_started" not in st.session_state:
+    st.session_state.worker_started = True
+    t = threading.Thread(target=background_sheet_watcher, daemon=True)
+    t.start()
 
 
 # ============================================================
@@ -28,14 +189,12 @@ import gspread
 
 DB_PATH = Path("users.db")
 
-# SMTP Configuration (Set environment variables or st.secrets for actual email delivery)
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")  # Sender Email
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")  # Sender App Password
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 def init_db():
-    """Create users and reset_tokens tables if they don't exist and run auto-migration."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
@@ -57,14 +216,12 @@ def init_db():
     """)
     conn.commit()
 
-    # Migration check: Ensure 'is_admin' column exists if DB existed prior
     c.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in c.fetchall()]
     if "is_admin" not in columns:
         c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
         conn.commit()
 
-    # Make sure at least one default admin exists if user table is fresh
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
         admin_pwd = hash_password("admin123")
@@ -77,11 +234,9 @@ def init_db():
     conn.close()
 
 def hash_password(password: str) -> str:
-    """Hash password using SHA-256."""
     return hashlib.sha256(password.encode()).hexdigest()
 
 def register_user(name: str, email: str, password: str, is_admin: int = 0):
-    """Register a new public or admin user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -98,7 +253,6 @@ def register_user(name: str, email: str, password: str, is_admin: int = 0):
         conn.close()
 
 def authenticate_user(email: str, password: str):
-    """Authenticate logging in user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     pwd_hash = hash_password(password)
@@ -113,7 +267,6 @@ def authenticate_user(email: str, password: str):
     return None
 
 def update_user_profile(user_id: int, new_name: str, new_email: str, new_password: str = ""):
-    """Update user information in database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     try:
@@ -129,12 +282,7 @@ def update_user_profile(user_id: int, new_name: str, new_email: str, new_passwor
     finally:
         conn.close()
 
-# ============================================================
-# ADMIN PANEL DATABASE HELPERS
-# ============================================================
-
 def get_all_users():
-    """Retrieve all registered users for admin panel."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT id, name, email, is_admin FROM users ORDER BY id ASC")
@@ -143,7 +291,6 @@ def get_all_users():
     return [{"id": u[0], "name": u[1], "email": u[2], "is_admin": bool(u[3])} for u in users]
 
 def admin_toggle_role(user_id: int, make_admin: bool):
-    """Grant or revoke admin access for a user."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if make_admin else 0, user_id))
@@ -151,7 +298,6 @@ def admin_toggle_role(user_id: int, make_admin: bool):
     conn.close()
 
 def admin_reset_password(user_id: int, new_password: str):
-    """Force reset a user password from admin panel."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     pwd_hash = hash_password(new_password)
@@ -160,7 +306,6 @@ def admin_reset_password(user_id: int, new_password: str):
     conn.close()
 
 def admin_delete_user(user_id: int):
-    """Delete user from database."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -168,9 +313,7 @@ def admin_delete_user(user_id: int):
     conn.close()
 
 def send_reset_code_email(email: str, code: str):
-    """Sends the reset code via SMTP email."""
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print(f"[TESTING MODE] Reset Code for {email}: {code}")
         return True, f"Demo Mode: Credentials not configured. Your code is: {code}"
 
     try:
@@ -203,7 +346,6 @@ def send_reset_code_email(email: str, code: str):
         return False, f"Failed to send email: {str(e)}"
 
 def generate_reset_code(email: str):
-    """Generates a 6-digit reset code, saves it to DB, and emails it."""
     email_clean = email.lower().strip()
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -225,7 +367,6 @@ def generate_reset_code(email: str):
     return send_reset_code_email(email_clean, code)
 
 def reset_password_with_code(email: str, code: str, new_password: str):
-    """Verifies reset code and updates password."""
     email_clean = email.lower().strip()
     code_clean = code.strip()
     
@@ -254,12 +395,10 @@ def reset_password_with_code(email: str, code: str, new_password: str):
 
     return True, "Password reset successfully! You can now log in with your new password."
 
-# Initialize DB
 init_db()
 
 
 def render_html(content):
-    """Render HTML/CSS without Markdown's code-block indentation rules."""
     st.html(textwrap.dedent(content))
 
 
@@ -268,7 +407,6 @@ def render_html(content):
 # ============================================================
 
 def render_copy_icon_button(text_to_copy, button_id):
-    """Renders a browser-native Javascript copy button matching standard full-width primary buttons."""
     escaped_text = json.dumps(text_to_copy)
     button_html = f"""
     <div style="display: flex; justify-content: center; width: 100%; margin-top: 6px;">
@@ -335,14 +473,28 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# GROQ API KEYS (SECURE ST.SECRETS RETRIEVAL)
+# GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
+# API keys are intentionally NOT stored in this source file.
+# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
+# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
+# Old secret names are also supported for compatibility.
 
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
-GROQ_SECONDARY_API_KEY = st.secrets.get("GROQ_SECONDARY_API_KEY", "")
+try:
+    GROQ_API_KEY = (
+        st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
+        or st.secrets.get("GROQ_API_KEY", "")
+    )
+    GROQ_SECONDARY_API_KEY = (
+        st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
+        or st.secrets.get("GROQ_SECONDARY_API_KEY", "")
+    )
+except Exception:
+    GROQ_API_KEY = ""
+    GROQ_SECONDARY_API_KEY = ""
 
 if not GROQ_API_KEY:
-    st.warning("GROQ_API_KEY is not configured in Streamlit Secrets.")
+    st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
 
 
 # ============================================================
@@ -433,22 +585,9 @@ Avoid unnatural phrases such as:
 "No clear details were provided..."
 "No confirmed appointment was made..."
 
-**INSURANCE EXTRACTION RULE:**
+Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, service, action, or outcome.
 
-Always include the caller's clearly stated insurance name and type in the summary when discussed.
-
-* Include the exact insurance provider or plan name, such as HealthPartners, Blue Cross, Aetna, or Medicaid.
-* Identify the insurance type or source when clearly stated, such as private insurance, employer-sponsored, spouse's employer plan, Medicare, or Medicaid.
-* If the caller says the insurance is through a spouse's employer, include that detail.
-* Do not assume the insurance type if it is not confirmed.
-* If insurance is discussed but the name or type is unclear, include only the confirmed information.
-* Never omit clearly stated insurance details just to make the summary shorter.
-
-**Example:** "The caller confirmed he has HealthPartners private insurance through his wife's employer."
-
-Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, Inusrance name if mentioned, service, action, or outcome.
-
-Keep the final summary very short, factual, natural, conversational and included insurance name, like a human-written QC note.
+Keep the final summary very short, factual, natural, and conversational, like a human-written QC note.
 """,
 
     "Dumpster & Porta Potty Services": """
@@ -623,7 +762,7 @@ If the call ends because one side stops responding, describe the actual response
 DO NOT use any Markdown formatting or asterisks (* or **). Output PLAIN TEXT ONLY.
 
 OUTPUT:
-Return only the final QC summary paragraph in simple, natural English, using basic words and correct grammar.
+Return ONLY the final QC summary paragraph.
 
 CALL TRANSCRIPT:
 {call_transcript}
@@ -675,7 +814,7 @@ def format_time(seconds):
 
 def transcribe_groq_whisper(audio_file_path):
     if not GROQ_API_KEY:
-        raise RuntimeError("Groq API key not found.")
+        raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
 
     client = Groq(api_key=GROQ_API_KEY)
 
@@ -699,96 +838,422 @@ def transcribe_groq_whisper(audio_file_path):
             if text_value:
                 timeline_data.append({
                     "time": f"{format_time(start_t)} – {format_time(end_t)}",
-                    "speaker": "Speaker",
+                    "speaker": "Unknown",
                     "line": text_value,
                 })
                 raw_text_segments.append(text_value)
     else:
         full_text = getattr(transcription, "text", "").strip()
         if full_text:
-            timeline_data.append({"time": "00:00 – 00:00", "speaker": "Speaker", "line": full_text})
+            timeline_data.append({"time": "00:00 – 00:00", "speaker": "Unknown", "line": full_text})
             raw_text_segments.append(full_text)
 
     return timeline_data, raw_text_segments
 
+
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 
-def generate_summaries_groq(full_transcript, campaign_name):
-    client_primary = Groq(api_key=GROQ_API_KEY)
-    client_secondary = Groq(api_key=GROQ_SECONDARY_API_KEY) if GROQ_SECONDARY_API_KEY else client_primary
-    
-    if campaign_name in CAMPAIGN_QC_QUESTIONS:
-        qc_questions = CAMPAIGN_QC_QUESTIONS[campaign_name]
+CALL_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "long_summary": {"type": "string"},
+        "main_topic": {"type": "string"},
+        "call_type": {
+            "type": "string",
+            "enum": ["QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT", "INFORMATION ONLY", "SILENT / NO RESPONSE", "OTHER"]
+        },
+        "qualification_status": {
+            "type": "string",
+            "enum": ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"]
+        },
+        "caller_intent": {"type": "string"},
+        "why_called": {"type": "string"},
+        "service_requested": {"type": "string"},
+        "insurance": {"type": "string"},
+        "location": {"type": "string"},
+        "outcome": {"type": "string"},
+        "spam_robot": {"type": "boolean"},
+        "spam_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "qc_issue": {"type": "string"},
+        "relevant_intent": {"type": "boolean"},
+        "qualification_info_present": {"type": "boolean"},
+        "location_or_eligibility_present": {"type": "boolean"},
+        "clear_outcome": {"type": "boolean"},
+        "two_way_conversation": {"type": "boolean"},
+        "major_qc_issue": {"type": "boolean"},
+        "speaker_segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "segment_id": {"type": "integer"},
+                    "speaker": {"type": "string", "enum": ["Agent", "Caller", "Unknown"]}
+                },
+                "required": ["segment_id", "speaker"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": [
+        "long_summary", "main_topic", "call_type", "qualification_status",
+        "caller_intent", "why_called", "service_requested", "insurance", "location",
+        "outcome", "spam_robot", "spam_confidence", "qc_issue", "relevant_intent",
+        "qualification_info_present", "location_or_eligibility_present", "clear_outcome",
+        "two_way_conversation", "major_qc_issue", "speaker_segments"
+    ],
+    "additionalProperties": False
+}
+
+
+def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
+    qc_questions = get_qc_questions(campaign_name)
+
+    if timeline_data:
+        transcript_for_ai = "\n".join(
+            f"SEGMENT {i}: [{item.get('time', '')}] {item.get('line', '').strip()}"
+            for i, item in enumerate(timeline_data, start=1)
+            if item.get("line", "").strip()
+        )
     else:
-        qc_questions = "Verify the main intent of the call, customer questions, and final outcome."
+        transcript_for_ai = full_transcript
 
-    full_prompt = QC_SYSTEM_PROMPT.format(
-        campaign_name=campaign_name,
-        qc_questions=qc_questions,
-        call_transcript=full_transcript
+    return f"""
+You are the call-analysis and QC engine for a pay-per-call network.
+
+CAMPAIGN FAMILY:
+{campaign_name}
+
+CAMPAIGN QC GUIDANCE:
+{qc_questions}
+
+Your job is to analyze the complete transcript and return structured call information.
+
+IMPORTANT SPEAKER RULE:
+Whisper provides transcript segments but does not reliably identify speakers. You must infer whether each numbered segment is from the Agent, Caller, or Unknown using the conversation context. The agent is usually the representative asking qualification questions, explaining services, pricing, scheduling, transferring, or giving instructions. The caller is the person seeking the service, asking for help, answering qualification questions, or describing their problem.
+An Agent question is NEVER the Caller answer. Never infer caller information from an agent question.
+If the speaker cannot be determined with reasonable confidence, use Unknown instead of guessing.
+
+LONG SUMMARY RULES:
+- Write a factual, useful 2-5 sentence summary in simple natural English.
+- Describe only what actually happened in the call.
+- Include the caller's real reason for calling, requested service, important qualification information, insurance when clearly stated by the caller, location when relevant, important agent/caller actions, and the actual outcome when supported.
+- Do not add filler such as "the conversation was natural" or "there were no obvious signs of a robot" unless that fact is itself relevant to QC.
+- Do not invent facts, outcomes, appointments, insurance, or caller intent.
+- If the caller was not looking for the campaign service, explain what they actually wanted instead of simply writing "irrelevant".
+- If it was a wrong number, say what the caller was trying to reach when clear.
+- If it was spam/robot, summarize what the automated call was promoting or asking the recipient to do.
+- Never turn an Agent's question into a Caller answer.
+- Do not include unnecessary personal information such as full phone numbers or addresses.
+
+MAIN TOPIC RULES:
+- One short sentence, normally 5-15 words.
+- Answer: "What was this caller actually calling about?"
+- Do not make SPAM / ROBOT the main topic unless the call itself was an automated solicitation or spam event. In that case, describe the actual subject, such as "Automated Google listing and SEO solicitation."
+- For unrelated calls, describe the actual request and make it clear that it was unrelated.
+
+SPAM / ROBOT RULES:
+- Do NOT use exact phrase matching only.
+- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Similar wording must be recognized even when the exact words differ.
+- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
+- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
+- spam_confidence must reflect the strength of the evidence from 0-100.
+
+QUALIFICATION RULES:
+- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
+- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
+- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
+
+MISSING INFORMATION:
+For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
+
+CALL TYPE:
+- QUALIFIED: relevant and clearly qualified.
+- NON-QUALIFIED: relevant but clearly not qualified.
+- WRONG NUMBER: caller was trying to reach another person/business/service.
+- SPAM / ROBOT: automated/scripted spam or marketing call.
+- INFORMATION ONLY: caller wanted information but not the campaign service/action.
+- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
+- OTHER: anything else that does not fit the categories.
+
+QC ISSUE:
+Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
+
+Read the entire transcript before deciding.
+
+TRANSCRIPT:
+{transcript_for_ai}
+"""
+
+
+def _call_structured_analysis(client, prompt):
+    response = client.chat.completions.create(
+        model=GROQ_SUMMARY_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Return only the structured call-analysis object. Do not add commentary."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+        max_tokens=1400,
+        reasoning_effort="low",
+        reasoning_format="hidden",
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "call_qc_analysis",
+                "strict": True,
+                "schema": CALL_ANALYSIS_SCHEMA
+            }
+        }
     )
+    content = response.choices[0].message.content or "{}"
+    return json.loads(content)
 
-    detailed_summary = "Failed to generate summary."
-    short_topic = "Failed to generate topic."
 
-    # --- STEP 1: DETAILED SUMMARY WITH FAILOVER ---
-    try:
-        response_detailed = client_primary.chat.completions.create(
-            model=GROQ_SUMMARY_MODEL,
-            messages=[{"role": "user", "content": full_prompt}],
-            temperature=0.2,
-            max_tokens=450,
-            reasoning_effort="low"
-        )
-        detailed_summary = response_detailed.choices[0].message.content.replace("*", "").strip()
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str or "rate_limit" in error_str.lower():
-            try:
-                response_detailed = client_secondary.chat.completions.create(
-                    model=GROQ_SUMMARY_MODEL,
-                    messages=[{"role": "user", "content": full_prompt}],
-                    temperature=0.2,
-                    max_tokens=450,
-                    reasoning_effort="low"
-                )
-                detailed_summary = response_detailed.choices[0].message.content.replace("*", "").strip()
-            except Exception as secondary_e:
-                return "Topic generation failed.", f"Model ({GROQ_SUMMARY_MODEL}) Error (Both Accounts Failed): {str(secondary_e)}"
-        else:
-            return "Topic generation failed.", f"Model ({GROQ_SUMMARY_MODEL}) Error: {error_str}"
+def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
+    if not full_transcript.strip():
+        raise RuntimeError("No transcription text was available for AI analysis.")
 
-    # --- STEP 2: SHORT TOPIC WITH FAILOVER ---
-    topic_prompt = SHORT_TOPIC_PROMPT.format(call_transcript=detailed_summary)
+    if not GROQ_API_KEY:
+        raise RuntimeError("Primary Groq API key is not configured.")
+
+    prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
+    primary_error = None
 
     try:
-        response_topic = client_primary.chat.completions.create(
-            model=GROQ_SUMMARY_MODEL,
-            messages=[{"role": "user", "content": topic_prompt}],
-            temperature=0.2,
-            max_tokens=50,
-            reasoning_effort="low"
-        )
-        short_topic = response_topic.choices[0].message.content.replace("*", "").strip()
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str or "rate_limit" in error_str.lower():
-            try:
-                response_topic = client_secondary.chat.completions.create(
-                    model=GROQ_SUMMARY_MODEL,
-                    messages=[{"role": "user", "content": topic_prompt}],
-                    temperature=0.2,
-                    max_tokens=50,
-                    reasoning_effort="low"
-                )
-                short_topic = response_topic.choices[0].message.content.replace("*", "").strip()
-            except Exception as secondary_e:
-                short_topic = "Topic generation failed."
-        else:
-            short_topic = "Topic generation failed."
+        analysis = _call_structured_analysis(Groq(api_key=GROQ_API_KEY), prompt)
+    except Exception as primary_exc:
+        primary_error = primary_exc
+        if not GROQ_SECONDARY_API_KEY:
+            raise RuntimeError(f"Primary Groq analysis failed: {primary_exc}")
+        try:
+            analysis = _call_structured_analysis(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
+        except Exception as secondary_exc:
+            raise RuntimeError(
+                f"Both Groq analysis accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
+            )
 
-    return short_topic, detailed_summary
+    if timeline_data is not None:
+        speaker_map = {
+            int(item.get("segment_id")): item.get("speaker", "Unknown")
+            for item in analysis.get("speaker_segments", [])
+        }
+        for idx, item in enumerate(timeline_data, start=1):
+            item["speaker"] = speaker_map.get(idx, "Unknown")
+
+    analysis["main_topic"] = str(analysis.get("main_topic", "")).replace("*", "").strip()
+    analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
+    analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
+    return analysis
+
+
+def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
+    """Compatibility wrapper for the existing UI: returns (main_topic, long_summary)."""
+    analysis = generate_call_analysis_groq(
+        full_transcript,
+        get_campaign_category(campaign_name),
+        timeline_data=timeline_data,
+    )
+    return analysis["main_topic"], analysis["long_summary"]
+
+
+def build_qc_report(analysis):
+    parts = [
+        f"Call Type: {analysis.get('call_type', 'OTHER')}",
+        f"Caller Intent: {analysis.get('caller_intent', '').strip()}",
+        f"Why They Called: {analysis.get('why_called', '').strip()}",
+        f"Treatment/Service Interest: {analysis.get('service_requested', '').strip()}",
+    ]
+
+    if analysis.get("insurance", "").strip():
+        parts.append(f"Insurance: {analysis['insurance'].strip()}")
+    if analysis.get("location", "").strip():
+        parts.append(f"Location: {analysis['location'].strip()}")
+    if analysis.get("outcome", "").strip():
+        parts.append(f"Outcome: {analysis['outcome'].strip()}")
+
+    parts.extend([
+        f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
+        f"Spam Confidence: {int(analysis.get('spam_confidence', 0))}%",
+        f"QC Issue: {analysis.get('qc_issue', '').strip() or 'None'}",
+    ])
+
+    return " | ".join(part for part in parts if part.split(": ", 1)[-1].strip())
+
+
+def calculate_call_quality_score(analysis):
+    """Deterministic 0-100 score. AI supplies facts; Python supplies the score."""
+    score = 0
+
+    qualification_status = analysis.get("qualification_status", "NOT CLEAR")
+    if qualification_status == "QUALIFIED":
+        score += 25
+    elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
+        score += 10
+
+    if analysis.get("service_requested", "").strip():
+        score += 15
+    if analysis.get("qualification_info_present"):
+        score += 15
+    if analysis.get("location_or_eligibility_present"):
+        score += 10
+    if analysis.get("clear_outcome"):
+        score += 10
+    if analysis.get("two_way_conversation"):
+        score += 10
+    if not analysis.get("spam_robot"):
+        score += 5
+    if not analysis.get("major_qc_issue"):
+        score += 10
+
+    call_type = analysis.get("call_type", "OTHER")
+    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+
+    if analysis.get("spam_robot") and spam_confidence >= 90:
+        return 5
+    if analysis.get("spam_robot"):
+        return min(score, 25)
+    if call_type == "WRONG NUMBER":
+        return min(score, 30)
+    if call_type == "SILENT / NO RESPONSE":
+        return min(score, 15)
+    if call_type in {"NON-QUALIFIED", "INFORMATION ONLY"}:
+        return min(score, 60)
+
+    return max(0, min(100, score))
+
+
+SCORE_COLORS = {
+    "excellent": {"red": 0.56, "green": 0.83, "blue": 0.60},
+    "good": {"red": 0.75, "green": 0.93, "blue": 0.78},
+    "yellow": {"red": 1.00, "green": 0.93, "blue": 0.60},
+    "orange": {"red": 1.00, "green": 0.78, "blue": 0.50},
+    "poor": {"red": 1.00, "green": 0.60, "blue": 0.60},
+    "spam": {"red": 1.00, "green": 0.35, "blue": 0.35},
+}
+
+
+def get_score_color(score, analysis):
+    if analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90:
+        return SCORE_COLORS["spam"]
+    if score >= 95:
+        return SCORE_COLORS["excellent"]
+    if score >= 80:
+        return SCORE_COLORS["good"]
+    if score >= 60:
+        return SCORE_COLORS["yellow"]
+    if score >= 40:
+        return SCORE_COLORS["orange"]
+    return SCORE_COLORS["poor"]
+
+
+def _background_is_special(background):
+    if not background:
+        return False
+
+    color = background.get("rgbColor", background)
+    if not isinstance(color, dict):
+        return False
+
+    r = 1.0 if color.get("red") is None else float(color.get("red", 1.0))
+    g = 1.0 if color.get("green") is None else float(color.get("green", 1.0))
+    b = 1.0 if color.get("blue") is None else float(color.get("blue", 1.0))
+
+    # Treat plain/near-white as the normal background.
+    return not (r >= 0.97 and g >= 0.97 and b >= 0.97)
+
+
+def get_existing_special_columns(worksheet, start_row, end_row):
+    """Read user-entered background colors so existing VOIP/special colors survive score coloring."""
+    if end_row < start_row:
+        return {}
+
+    try:
+        metadata = worksheet.spreadsheet.fetch_sheet_metadata(
+            params={
+                "includeGridData": True,
+                "ranges": [f"'{worksheet.title}'!A{start_row}:L{end_row}"],
+                "fields": "sheets/data/startRow,sheets/data/rowData/values/userEnteredFormat/backgroundColor,sheets/data/rowData/values/userEnteredFormat/backgroundColorStyle",
+            }
+        )
+    except Exception:
+        return {}
+
+    special_by_row = {}
+
+    for sheet_data in metadata.get("sheets", []):
+        for grid_data in sheet_data.get("data", []):
+            base_row = int(grid_data.get("startRow", start_row - 1)) + 1
+            for offset, row_data in enumerate(grid_data.get("rowData", [])):
+                row_number = base_row + offset
+                special_columns = set()
+
+                for col_number, cell in enumerate(row_data.get("values", []), start=1):
+                    user_format = cell.get("userEnteredFormat", {})
+                    background = user_format.get("backgroundColor")
+                    background_style = user_format.get("backgroundColorStyle")
+                    if _background_is_special(background) or _background_is_special(background_style):
+                        special_columns.add(col_number)
+
+                special_by_row[row_number] = special_columns
+
+    return special_by_row
+
+
+def _column_letter(number):
+    result = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _contiguous_ranges_for_row(row_number, columns):
+    if not columns:
+        return []
+
+    columns = sorted(set(columns))
+    ranges = []
+    start_col = previous_col = columns[0]
+
+    for col in columns[1:]:
+        if col == previous_col + 1:
+            previous_col = col
+            continue
+
+        ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
+        start_col = previous_col = col
+
+    ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
+    return ranges
+
+
+def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
+    """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
+    special_columns = set(special_columns or [])
+    color = get_score_color(score, analysis)
+
+    high_confidence_spam = analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90
+
+    if high_confidence_spam:
+        worksheet.format(
+            f"A{row_number}:L{row_number}",
+            {"backgroundColor": SCORE_COLORS["spam"]}
+        )
+        return
+
+    # L (score) always gets the score color, even if it previously had a color.
+    columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
+    ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
+    ranges.append(f"L{row_number}")
+
+    if ranges:
+        worksheet.format(ranges, {"backgroundColor": color})
 
 def save_uploaded_audio(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
@@ -850,126 +1315,111 @@ def load_audio_url(url):
     st.session_state.status = "Recording link loaded and ready."
 
 
-# ============================================================
-# GOOGLE SHEET ON-DEMAND SYNC HELPER (WITH BATCH & RATE LIMITING)
-# ============================================================
-
-import requests
-import os
-import time
-
-# Safe fallback if get_campaign_category is missing
-def get_campaign_category(raw_campaign):
-    return raw_campaign if raw_campaign else "Default Campaign"
-
-def sync_google_sheet_batch(default_campaign_name=""):
-    """Syncs sheets, formats duration in Column F, downloads audio securely, and updates Column G and Column H."""
-    sheet_names = ["Ringba to Sheet QC"]
-    total_processed = 0
-    
-    status_text = st.empty()
+def get_google_client():
+    """Connect to Google Sheets using the local service account or Streamlit Secrets."""
+    if os.path.exists("service_account.json"):
+        return gspread.service_account(filename="service_account.json")
 
     try:
-        gc = gspread.service_account(filename="service_account.json") if os.path.exists("service_account.json") else gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+        return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    except Exception as exc:
+        raise RuntimeError(
+            "Google Sheets credentials not found. Add service_account.json or gcp_service_account to Streamlit Secrets."
+        ) from exc
 
-        for sheet_name in sheet_names:
-            try:
-                status_text.text(f"Checking sheet: {sheet_name}...")
-                sheet = gc.open(sheet_name)
-                worksheet = sheet.worksheet("Sheet1")
-                rows = worksheet.get_all_values()
-                
-                if not rows or len(rows) < 2:
-                    continue
 
-                total_rows = len(rows) - 1
+def sync_google_sheet_batch(default_campaign_name=""):
+    """Process Ringba recordings from the shared Google Sheet.
 
-                for index, row in enumerate(rows[1:], start=2):
-                    # Column mappings (0-based list index):
-                    # Column D (index 3) - Campaign name
-                    # Column F (index 5) - Duration (seconds) -> strict Column F check & conversion
-                    # Column G (index 6) - Note / Detailed Summary
-                    # Column H (index 7) - ShortSummary / Main Topic (used as check flag)
-                    # Column I (index 8) - Recording URL
-                    
-                    raw_campaign = row[3].strip() if len(row) > 3 else ""
-                    raw_duration = row[5].strip() if len(row) > 5 else ""
-                    existing_main_topic = row[7].strip() if len(row) > 7 else ""
-                    recording_url = row[8].strip() if len(row) > 8 else ""
+    Sheet layout:
+    D = Campaign
+    G = Long AI Summary
+    H = Main Topic / processing flag
+    I = Recording URL
+    J = Existing carrier / VOIP data (untouched)
+    K = AI QC Report
+    L = Numeric quality score
+    """
+    try:
+        gc = get_google_client()
+        sheet = gc.open("Ringba to Sheet QC")
+        worksheet = sheet.worksheet("Sheet1")
 
-                    # 1. FORMAT DURATION: Clean and convert raw numbers in Column F exclusively into H:MM:SS
-                    if raw_duration and ":" not in raw_duration:
-                        try:
-                            clean_dur = raw_duration.strip()
-                            if clean_dur.isdigit():
-                                total_seconds = int(clean_dur)
-                                hours = total_seconds // 3600
-                                minutes = (total_seconds % 3600) // 60
-                                seconds = total_seconds % 60
-                                formatted_dur = f"{hours}:{minutes:02d}:{seconds:02d}"
-                                
-                                worksheet.update_cell(index, 6, formatted_dur)  # Column F (cell row, column 6)
-                                time.sleep(0.5)
-                        except Exception:
-                            pass
+        rows = worksheet.get_all_values()
+        processed_count = 0
 
-                    # 2. Process Audio if Recording URL exists and Column H is empty
-                    if recording_url and recording_url.startswith("http") and not existing_main_topic:
-                        try:
-                            status_text.text(f"[{sheet_name}] Row {index-1}/{total_rows} (Downloading audio)...")
-                            
-                            # Add headers to avoid 403 Forbidden blocks from AWS S3
-                            headers_s3 = {'User-Agent': 'Mozilla/5.0'}
-                            response = requests.get(recording_url, headers=headers_s3, timeout=15)
-                            response.raise_for_status()
+        if len(rows) > 1:
+            special_color_map = get_existing_special_columns(worksheet, 2, len(rows))
+        else:
+            special_color_map = {}
 
-                            temp_filename = "temp_downloaded_audio.mp3"
-                            with open(temp_filename, "wb") as f:
-                                f.write(response.content)
-                            st.session_state.file_path = temp_filename
+        for index, row in enumerate(rows[1:], start=2):
+            raw_campaign = row[3].strip() if len(row) > 3 else ""
+            raw_duration = row[5].strip() if len(row) > 5 else ""
+            existing_main_topic = row[7].strip() if len(row) > 7 else ""
+            recording_url = row[8].strip() if len(row) > 8 else ""
 
-                            # Determine campaign category safely
-                            campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
+            # Keep the existing duration formatting behavior.
+            if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
+                try:
+                    worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
+                    time.sleep(0.3)
+                except Exception:
+                    pass
 
-                            status_text.text(f"[{sheet_name}] Row {index-1}: Transcribing audio...")
-                            _, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
-                            full_transcript_str = " ".join(raw_text_segments)
-                            
-                            status_text.text(f"[{sheet_name}] Row {index-1}: Generating AI summary...")
-                            
-                            # Generate summaries (handles both single string or tuple outputs)
-                            summary_output = generate_summaries_groq(full_transcript_str, campaign_to_use)
-                            if isinstance(summary_output, tuple):
-                                main_topic, detailed_summary = summary_output
-                            else:
-                                main_topic = summary_output
-                                detailed_summary = summary_output
-                            
-                            status_text.text(f"[{sheet_name}] Row {index-1}: Updating Google Sheet...")
-                            
-                            # Write Detailed Summary to Column G (cell row, column 7)
-                            worksheet.update_cell(index, 7, detailed_summary)
-                            
-                            # Write ShortSummary/Main Topic to Column H (cell row, column 8)
-                            worksheet.update_cell(index, 8, main_topic)
-                            
-                            total_processed += 1
-                            time.sleep(2)
-                        except Exception as row_err:
-                            # Log error into Column G so it doesn't fail silently
-                            worksheet.update_cell(index, 7, f"Error: {str(row_err)[:60]}")
-                            time.sleep(1)
-
-            except Exception as sheet_err:
+            # Existing trigger stays: recording exists + H is empty.
+            if not recording_url or not recording_url.startswith("http") or existing_main_topic:
                 continue
 
-        status_text.empty()
-        return True, f"Successfully processed {total_processed} new call records!"
-    except Exception as e:
-        status_text.empty()
-        return False, f"Google Sheets connection error: {str(e)}"
+            try:
+                campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
+                if not campaign_to_use:
+                    campaign_to_use = "General Customer Inquiry"
 
-        
+                load_audio_url(recording_url)
+                timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                full_transcript_str = " ".join(raw_text_segments).strip()
+
+                analysis = generate_call_analysis_groq(
+                    full_transcript_str,
+                    campaign_to_use,
+                    timeline_data=timeline_data,
+                )
+
+                main_topic = analysis["main_topic"]
+                detailed_summary = analysis["long_summary"]
+                qc_report = build_qc_report(analysis)
+                score = calculate_call_quality_score(analysis)
+
+                worksheet.update_cell(index, 7, detailed_summary)  # G
+                worksheet.update_cell(index, 8, main_topic)        # H
+                worksheet.update_cell(index, 11, qc_report)        # K
+                worksheet.update_cell(index, 12, score)             # L
+
+                apply_row_score_color(
+                    worksheet,
+                    index,
+                    score,
+                    analysis,
+                    special_color_map.get(index, set()),
+                )
+
+                processed_count += 1
+                time.sleep(1)
+
+            except Exception as e:
+                error_text = f"Processing error: {str(e)}"
+                try:
+                    worksheet.update_cell(index, 7, error_text)
+                    worksheet.update_cell(index, 11, error_text)
+                except Exception:
+                    pass
+
+        return True, f"Successfully processed {processed_count} new recordings!"
+    except Exception as e:
+        return False, f"Google Sheets error: {str(e)}"
+
+
 # ============================================================
 # THEME DYNAMIC INJECTION
 # ============================================================
@@ -1165,13 +1615,12 @@ with st.sidebar:
         st.session_state.theme_mode = theme_choice.lower()
         st.rerun()
 
-    # NAVIGATION BUTTONS
     if st.button("🎙️ &nbsp; Transcriber", use_container_width=True, type="primary" if st.session_state.current_view == "transcriber" else "secondary"):
         st.session_state.current_view = "transcriber"
         st.rerun()
 
     if current_user.get("is_admin"):
-        if st.button("🛡️ &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
+        if st.button("🛡 &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
             st.session_state.current_view = "admin"
             st.rerun()
 
@@ -1187,7 +1636,6 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    # --- GOOGLE SHEET ON-DEMAND SYNC BUTTON ---
     render_html("""
         <div class="sidebar-divider"></div>
         <div class="sidebar-label">Google Sheets Automation</div>
@@ -1199,7 +1647,6 @@ with st.sidebar:
                 st.success(message)
             else:
                 st.error(message)
-    # -----------------------------------------
 
     render_html("""
         <div class="sidebar-divider"></div>
@@ -1413,7 +1860,11 @@ with left_col:
             progress_bar.progress(65, text="Generating AI summary...")
 
             full_transcript_str = " ".join(raw_text_segments)
-            detailed_summary, short_topic = generate_summaries_groq(full_transcript_str, selected_campaign)
+            short_topic, detailed_summary = generate_summaries_groq(
+                full_transcript_str,
+                selected_campaign,
+                timeline_data=timeline_data,
+            )
             elapsed_time = round(time.time() - start_clock, 1)
 
             st.session_state.transcript = timeline_data
@@ -1497,7 +1948,7 @@ with right_col:
         rows = []
         for item in transcript_data:
             timestamp = item.get("time", "")
-            speaker = item.get("speaker", "Speaker")
+            speaker = item.get("speaker", "Unknown")
             line_text = item.get("line", "")
             if query and query not in f"{timestamp} {speaker} {line_text}".lower():
                 continue
@@ -1521,5 +1972,3 @@ with right_col:
                     </div>
                 </div>
             """)
-
-
