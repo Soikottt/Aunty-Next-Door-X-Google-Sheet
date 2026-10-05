@@ -1052,14 +1052,111 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     return analysis
 
 
-def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
-    """Compatibility wrapper for the existing UI: returns (main_topic, long_summary)."""
-    analysis = generate_call_analysis_groq(
-        full_transcript,
-        get_campaign_category(campaign_name),
-        timeline_data=timeline_data,
+FAST_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "main_topic": {"type": "string"},
+        "long_summary": {"type": "string"}
+    },
+    "required": ["main_topic", "long_summary"],
+    "additionalProperties": False
+}
+
+
+def _call_fast_summary(client, prompt):
+    """Small, fast AI request used only by the manual Transcriber UI."""
+    response = client.chat.completions.create(
+        model=GROQ_SUMMARY_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Return only the requested two-field summary object. Do not add commentary."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+        max_tokens=500,
+        reasoning_effort="low",
+        reasoning_format="hidden",
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "fast_call_summary",
+                "strict": True,
+                "schema": FAST_SUMMARY_SCHEMA
+            }
+        }
     )
-    return analysis["main_topic"], analysis["long_summary"]
+    content = response.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+def generate_fast_summary_groq(full_transcript, campaign_name):
+    """Fast manual summary: only Main Topic + Long Summary. Full QC stays separate."""
+    if not full_transcript.strip():
+        raise RuntimeError("No transcription text was available for AI summary.")
+
+    if not GROQ_API_KEY:
+        raise RuntimeError("Primary Groq API key is not configured.")
+
+    campaign_family = get_campaign_category(campaign_name)
+    prompt = f"""
+You are a fast call-summary assistant for a pay-per-call network.
+
+CAMPAIGN:
+{campaign_family}
+
+Create only two outputs from the transcript: a short Main Topic and a factual Long Summary.
+
+MAIN TOPIC:
+- One short sentence, normally 5-15 words.
+- State what the caller was actually calling about.
+- If unrelated, describe what they actually wanted.
+- If spam/robot, describe the actual subject of the spam, such as a Google listing or SEO solicitation.
+
+LONG SUMMARY:
+- Write 2-4 short, natural sentences.
+- Include the caller's actual reason for calling, requested service, important information clearly provided, and the actual outcome when supported.
+- Use only facts clearly supported by the transcript.
+- Never invent insurance, location, qualification, appointments, transfers, or outcomes.
+- An agent's question is NOT the caller's answer. Only treat information as caller-provided when the caller clearly states or confirms it.
+- If the caller did not respond, do not invent a reason for the call.
+- If the call is clearly an automated solicitation, summarize what it was promoting or asking the recipient to do.
+- No bullets, headings, markdown, filler, or comments about the quality of the conversation.
+- Keep the wording simple and human.
+
+TRANSCRIPT:
+{full_transcript}
+"""
+
+    primary_error = None
+    try:
+        result = _call_fast_summary(Groq(api_key=GROQ_API_KEY), prompt)
+    except Exception as primary_exc:
+        primary_error = primary_exc
+        if not GROQ_SECONDARY_API_KEY:
+            raise RuntimeError(f"Primary Groq fast summary failed: {primary_exc}")
+        try:
+            result = _call_fast_summary(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
+        except Exception as secondary_exc:
+            raise RuntimeError(
+                f"Both Groq summary accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
+            )
+
+    main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
+    long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
+
+    if not main_topic:
+        main_topic = "No clear main topic identified."
+    if not long_summary:
+        long_summary = "No summary could be generated from the transcript."
+
+    return main_topic, long_summary
+
+
+def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
+    """Compatibility wrapper for the existing UI; uses the fast summary path."""
+    return generate_fast_summary_groq(full_transcript, campaign_name)
 
 
 def build_qc_report(analysis):
@@ -1860,10 +1957,9 @@ with left_col:
             progress_bar.progress(65, text="Generating AI summary...")
 
             full_transcript_str = " ".join(raw_text_segments)
-            short_topic, detailed_summary = generate_summaries_groq(
+            short_topic, detailed_summary = generate_fast_summary_groq(
                 full_transcript_str,
                 selected_campaign,
-                timeline_data=timeline_data,
             )
             elapsed_time = round(time.time() - start_clock, 1)
 
