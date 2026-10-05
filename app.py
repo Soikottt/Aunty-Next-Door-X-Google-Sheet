@@ -944,7 +944,6 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
     analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
     return analysis
-```
 
 #### 4. Updated Python-Side `calculate_call_quality_score`
 def calculate_call_quality_score(analysis):
@@ -1003,7 +1002,6 @@ def calculate_call_quality_score(analysis):
         return min(score, 60)
 
     return max(0, min(100, score))
-```
 
 
 SCORE_COLORS = {
