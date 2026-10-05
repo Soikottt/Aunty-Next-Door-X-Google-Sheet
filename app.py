@@ -172,39 +172,37 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
 # API keys are intentionally NOT stored in this source file.
-#
-# Active priority:
-# 1. GROQ_API_KEY
-# 2. GROQ_SECONDARY_API_KEY
-# 3. GROQ_API_KEY_3
-#
-# These are read from Streamlit Secrets / environment variables.
+# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
+# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
+# Old secret names are also supported for compatibility.
 
 def _discover_groq_keys():
-    """Discover Groq API keys in fixed priority order."""
+    """Primary first, then secondary, then any other Groq key found in Secrets/env (tertiary, etc.)."""
     found = []
 
-    def add(value):
+    def add(value, require_prefix=False):
         value = str(value or "").strip()
-        if value and value not in found:
+        if value and value not in found and (not require_prefix or value.startswith("gsk_")):
             found.append(value)
 
-    # --------------------------------------------------------
-    # Fixed priority: Primary → Secondary → Tertiary
-    # --------------------------------------------------------
-    add(get_secret("GROQ_API_KEY"))
-    add(get_secret("GROQ_SECONDARY_API_KEY"))
-    add(get_secret("GROQ_API_KEY_3"))
+    add(get_secret("Aunty_NEXT_DOOR_API_PRIMARY") or get_secret("GROQ_API_KEY"))
+    add(get_secret("GROQ_API_KEY_SECONDARY_2") or get_secret("GROQ_SECONDARY_API_KEY"))
 
+    names = set(os.environ.keys())
+    try:
+        names |= set(st.secrets.keys())
+    except Exception:
+        pass
+    for name in sorted(names):
+        upper = name.upper()
+        if ("GROQ" in upper and "KEY" in upper) or upper.startswith("AUNTY_NEXT_DOOR_API"):
+            add(get_secret(name), require_prefix=True)
     return found
 
 
 GROQ_API_KEYS = _discover_groq_keys()
-
-# Individual keys for compatibility with existing code
-GROQ_API_KEY = GROQ_API_KEYS[0] if len(GROQ_API_KEYS) > 0 else ""
+GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 GROQ_SECONDARY_API_KEY = GROQ_API_KEYS[1] if len(GROQ_API_KEYS) > 1 else ""
-GROQ_TERTIARY_API_KEY = GROQ_API_KEYS[2] if len(GROQ_API_KEYS) > 2 else ""
 
 if not GROQ_API_KEY:
     st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
@@ -521,7 +519,8 @@ def transcribe_groq_whisper(audio_file_path):
 # + transcript (capped) + <=800 output tokens.  Typical total: 2,000-4,500 tokens.
 
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
-MAX_TRANSCRIPT_CHARS = _get_int_setting("MAX_TRANSCRIPT_CHARS", 9000)   # ~2,200 tokens
+# 0 (default) = always send the FULL transcript, however long. Set e.g. 9000 in Secrets to cap very long calls.
+MAX_TRANSCRIPT_CHARS = _get_int_setting("MAX_TRANSCRIPT_CHARS", 0)
 ANALYSIS_MAX_OUTPUT_TOKENS = _get_int_setting("ANALYSIS_MAX_OUTPUT_TOKENS", 800)
 MIN_WORDS_FOR_AI = 12   # shorter transcripts are handled without calling the AI at all
 # Set USE_FULL_QC_QUESTIONS=1 to send your long original QC question text instead of the compact guidance.
@@ -603,7 +602,7 @@ def _build_schema(include_speakers):
 def _shorten_transcript(text):
     """Keep the opening and the ending of very long calls; that is where QC facts usually are."""
     text = text.strip()
-    if len(text) <= MAX_TRANSCRIPT_CHARS:
+    if MAX_TRANSCRIPT_CHARS <= 0 or len(text) <= MAX_TRANSCRIPT_CHARS:
         return text
     head = int(MAX_TRANSCRIPT_CHARS * 0.65)
     tail = MAX_TRANSCRIPT_CHARS - head
@@ -637,7 +636,7 @@ TRANSCRIPT:
 {transcript_text}"""
 
 
-def _call_structured_analysis(client, prompt, schema):
+def _call_structured_analysis(client, prompt, schema, max_tokens=None):
     response = client.chat.completions.create(
         model=GROQ_SUMMARY_MODEL,
         messages=[
@@ -645,7 +644,7 @@ def _call_structured_analysis(client, prompt, schema):
             {"role": "user", "content": prompt},
         ],
         temperature=0.1,
-        max_tokens=ANALYSIS_MAX_OUTPUT_TOKENS,
+        max_tokens=max_tokens or ANALYSIS_MAX_OUTPUT_TOKENS,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={
@@ -694,7 +693,7 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     if include_speakers and timeline_data:
         lines = [item.get("line", "").strip() for item in timeline_data if item.get("line", "").strip()]
         numbered_text = "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=1))
-        if len(numbered_text) <= MAX_TRANSCRIPT_CHARS and len(lines) == len(timeline_data):
+        if (MAX_TRANSCRIPT_CHARS <= 0 or len(numbered_text) <= MAX_TRANSCRIPT_CHARS) and len(lines) == len(timeline_data):
             transcript_text = numbered_text
             numbered = True
     if not numbered:
@@ -702,12 +701,13 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
 
     prompt = _analysis_prompt(transcript_text, campaign_name, numbered)
     schema = _build_schema(numbered)
+    output_limit = ANALYSIS_MAX_OUTPUT_TOKENS + (3 * len(timeline_data) if numbered else 0)
 
     analysis = None
     errors, waits = [], []
     for key in GROQ_API_KEYS:
         try:
-            analysis = _call_structured_analysis(Groq(api_key=key), prompt, schema)
+            analysis = _call_structured_analysis(Groq(api_key=key), prompt, schema, output_limit)
             break
         except Exception as exc:
             wait = _rate_limit_wait(exc)
@@ -1215,30 +1215,45 @@ def _process_sheet_locked(shared, fallback_campaign):
         except GroqRateLimitError as rl:
             wait = min(max(rl.wait_seconds, 60), 6 * 3600) + 30
             shared["paused_until"] = time.time() + wait
-            logger.warning("Groq limit reached; pausing the sheet worker for ~%s min", int(wait // 60))
+            minutes = int(wait // 60)
+            logger.warning("Groq limit reached; pausing the sheet worker for ~%s min", minutes)
+            note = (
+                f"Processing error: Groq token limit reached on all API keys. "
+                f"Waiting - will retry automatically in about {minutes} min."
+            )
             try:
-                worksheet.update_cell(index, 8, "")  # release the claim; NOT an error, retried after the pause
+                # Show the reason in G/K (like before). H stays empty so the row is retried automatically.
+                worksheet.batch_update(
+                    [
+                        {"range": f"G{index}:H{index}", "values": [[note, ""]]},
+                        {"range": f"K{index}", "values": [[note]]},
+                    ],
+                    value_input_option="RAW",
+                )
             except Exception as write_exc:
-                logger.warning("Could not release row %s: %s", index, write_exc)
+                logger.warning("Could not write limit note for row %s: %s", index, write_exc)
             break
         except Exception as exc:
             logger.exception("Row %s failed", index)
             count = attempts.get(recording_url, 0) + 1
             attempts[recording_url] = count
-            error_text = f"Processing error: {exc}"
+            give_up = count >= MAX_ROW_ATTEMPTS
+            if give_up:
+                error_text = f"Processing error: {exc}"
+            else:
+                error_text = f"Processing error: {exc} (attempt {count} of {MAX_ROW_ATTEMPTS}, will retry automatically)"
             try:
-                if count >= MAX_ROW_ATTEMPTS:
-                    # Give up so the row is not retried (and billed) forever.
-                    worksheet.batch_update(
-                        [
-                            {"range": f"G{index}:H{index}", "values": [[error_text, ERROR_MARKER]]},
-                            {"range": f"K{index}", "values": [[error_text]]},
-                        ],
-                        value_input_option="RAW",
-                    )
+                # The reason is always visible in G and K, so you can see why a row is not complete.
+                # H gets the ERROR marker only after the last attempt; until then it is empty and the row is retried.
+                worksheet.batch_update(
+                    [
+                        {"range": f"G{index}:H{index}", "values": [[error_text, ERROR_MARKER if give_up else ""]]},
+                        {"range": f"K{index}", "values": [[error_text]]},
+                    ],
+                    value_input_option="RAW",
+                )
+                if give_up:
                     attempts.pop(recording_url, None)
-                else:
-                    worksheet.update_cell(index, 8, "")  # release the claim; retried on the next cycle
             except Exception as write_exc:
                 logger.warning("Could not record error for row %s: %s", index, write_exc)
         finally:
