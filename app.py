@@ -1023,6 +1023,25 @@ def calculate_call_quality_score(analysis):
     return max(0, min(100, score))
 
 
+def build_qc_report(analysis, campaign_name):
+    """Builds and formats the QC report dictionary or string based on analysis results."""
+    return {
+        "call_type": analysis.get("call_type", "OTHER"),
+        "qualification_status": analysis.get("qualification_status", "NOT CLEAR"),
+        "qualification_reason": analysis.get("qualification_reason", ""),
+        "long_summary": analysis.get("long_summary", ""),
+        "main_topic": analysis.get("main_topic", ""),
+        "service_requested": analysis.get("service_requested", ""),
+        "insurance": analysis.get("insurance", ""),
+        "location": analysis.get("location", ""),
+        "outcome": analysis.get("outcome", ""),
+        "spam_robot": analysis.get("spam_robot", False),
+        "spam_confidence": analysis.get("spam_confidence", 0),
+        "spam_reason": analysis.get("spam_reason", ""),
+        "qc_issue": analysis.get("qc_issue", "")
+    }
+
+
 SCORE_COLORS = {
     "excellent": {"red": 0.56, "green": 0.83, "blue": 0.60},
     "good": {"red": 0.75, "green": 0.93, "blue": 0.78},
