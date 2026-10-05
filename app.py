@@ -1,16 +1,22 @@
 import sqlite3
 import hashlib
+import hmac
+import secrets
+import ipaddress
+import socket
+import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import json
 import os
+import re
 from pathlib import Path
 import textwrap
-import tempfile
 import uuid
 import time
 import urllib.request
+import urllib.parse
 import html
-import random
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -19,67 +25,45 @@ import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
 from pydub import AudioSegment
-import gspread  
+import gspread
 import threading
-import zipfile
-import requests
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("aunty_next_door")
 
 
 # ============================================================
-# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
+# CONFIG HELPERS
 # ============================================================
 
-MODEL_DIR = "model"  # Target directory for your model
-ZIP_PATH = "model.zip"
-FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
-
-def download_file_from_google_drive(file_id, destination):
-    URL = "https://docs.google.com/uc?export=download"
-    session = requests.Session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
-    
-    token = get_confirm_token(response)
-    if token:
-        params = {'id': file_id, 'confirm': token}
-        response = session.get(URL, params=params, headers=headers, stream=True)
-        
-    save_response_content(response, destination)
-
-def get_confirm_token(response):
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            return value
-    return None
-
-def save_response_content(response, destination):
-    CHUNK_SIZE = 32768
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-
-# Check and extract on first boot if missing
-if not os.path.exists(MODEL_DIR):
-    os.makedirs(MODEL_DIR, exist_ok=True)
+def get_secret(name, default=""):
+    """Read a setting from environment variables first, then Streamlit Secrets."""
+    value = os.environ.get(name)
+    if value:
+        return value
     try:
-        with st.spinner("Downloading model from Google Drive..."):
-            download_file_from_google_drive(FILE_ID, ZIP_PATH)
-        
-        with st.spinner("Extracting model files..."):
-            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(MODEL_DIR)
-                
-        if os.path.exists(ZIP_PATH):
-            os.remove(ZIP_PATH)
-        st.success("Model setup complete!")
-    except Exception as e:
-        st.error(f"Failed to auto-download/extract model: {str(e)}")
+        value = st.secrets.get(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return default
+
+
+def _get_int_setting(name, default):
+    try:
+        return int(get_secret(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_AUDIO_MB = _get_int_setting("MAX_AUDIO_MB", 25)  # Groq Whisper rejects files above its size limit
+SHEET_NAME = "Ringba to Sheet QC"
+WORKSHEET_NAME = "Sheet1"
 
 
 # ============================================================
-# BACKGROUND THREAD AUTOMATION WORKER
+# SHEET HELPERS
 # ============================================================
 
 def get_campaign_category(raw_campaign_text):
@@ -118,217 +102,248 @@ def format_seconds_to_hms(total_seconds_str):
     except Exception:
         return str(total_seconds_str)
 
+
 # ============================================================
 # DATABASE & AUTHENTICATION SETUP (SQLite)
 # ============================================================
 
-DB_PATH = Path("users.db")
+DB_PATH = Path(get_secret("USERS_DB_PATH", "users.db"))
 
-SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_SERVER = get_secret("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = _get_int_setting("SMTP_PORT", 587)
+SMTP_EMAIL = get_secret("SMTP_EMAIL", "")
+SMTP_PASSWORD = get_secret("SMTP_PASSWORD", "")
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS reset_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL,
-            code TEXT NOT NULL,
-            expires_at DATETIME NOT NULL
-        )
-    """)
-    conn.commit()
+AUTO_APPROVE_SIGNUPS = get_secret("AUTO_APPROVE_SIGNUPS", "0").strip().lower() in {"1", "true", "yes"}
 
-    c.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in c.fetchall()]
-    if "is_admin" not in columns:
-        c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+MIN_PASSWORD_LENGTH = 8
+MAX_FAILED_LOGINS = 5
+LOCKOUT_MINUTES = 15
+PBKDF2_ITERATIONS = 310_000
+
+
+@contextmanager
+def db():
+    """Open a SQLite connection that commits on success, rolls back on error, and always closes."""
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-    c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
-        admin_pwd = hash_password("admin123")
-        c.execute(
-            "INSERT INTO users (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)",
-            ("System Admin", "admin@domain.com", admin_pwd)
-        )
-        conn.commit()
 
-    conn.close()
+# ---------- password helpers ----------
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Salted PBKDF2-SHA256 hash."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
 
-def register_user(name: str, email: str, password: str, is_admin: int = 0):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+
+def is_legacy_hash(stored: str) -> bool:
+    return bool(stored) and not stored.startswith("pbkdf2_sha256$")
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, iterations, salt_hex, digest_hex = stored.split("$")
+            digest = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+            )
+            return hmac.compare_digest(digest.hex(), digest_hex)
+        except (ValueError, TypeError):
+            return False
+    legacy = hashlib.sha256(password.encode()).hexdigest()
+    return hmac.compare_digest(legacy, stored)
+
+
+def validate_password(password: str):
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
+    return True, ""
+
+
+def validate_email(email: str) -> bool:
+    email = (email or "").strip()
+    if " " in email or email.count("@") != 1:
+        return False
+    local, domain = email.split("@")
+    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
+
+
+# ---------- schema ----------
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER DEFAULT 0,
+                is_approved INTEGER DEFAULT 1
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                attempted_at REAL NOT NULL
+            )
+        """)
+
+        c.execute("PRAGMA table_info(users)")
+        user_cols = [col[1] for col in c.fetchall()]
+        if "is_admin" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        if "is_approved" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN is_approved INTEGER DEFAULT 1")
+
+        c.execute("SELECT COUNT(*) FROM users")
+        if c.fetchone()[0] == 0:
+            admin_email = get_secret("ADMIN_EMAIL", "admin@domain.com").lower().strip()
+            admin_password = get_secret("ADMIN_PASSWORD", "")
+            generated = False
+            if len(admin_password) < MIN_PASSWORD_LENGTH:
+                admin_password = secrets.token_urlsafe(12)
+                generated = True
+            c.execute(
+                "INSERT INTO users (name, email, password_hash, is_admin, is_approved) VALUES (?, ?, ?, 1, 1)",
+                ("System Admin", admin_email, hash_password(admin_password)),
+            )
+            if generated:
+                logger.warning(
+                    "FIRST-RUN ADMIN CREATED. Email: %s | Temporary password: %s | "
+                    "Set ADMIN_EMAIL and ADMIN_PASSWORD in Secrets to choose your own.",
+                    admin_email, admin_password,
+                )
+            else:
+                logger.info("First-run admin created for %s", admin_email)
+
+
+# ---------- login throttling ----------
+
+def _failed_login_count(email_clean: str) -> int:
+    cutoff = time.time() - LOCKOUT_MINUTES * 60
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM login_attempts WHERE email = ? AND attempted_at > ?",
+            (email_clean, cutoff),
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def record_failed_login(email_clean: str):
+    now = time.time()
+    with db() as conn:
+        conn.execute("INSERT INTO login_attempts (email, attempted_at) VALUES (?, ?)", (email_clean, now))
+        conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (now - LOCKOUT_MINUTES * 60,))
+
+
+def clear_failed_logins(email_clean: str):
+    with db() as conn:
+        conn.execute("DELETE FROM login_attempts WHERE email = ?", (email_clean,))
+
+
+# ---------- users ----------
+
+def register_user(name: str, email: str, password: str, is_admin: int = 0, is_approved: int = 1):
+    name = (name or "").strip()
+    email_clean = (email or "").lower().strip()
+
+    if not name:
+        return False, "Please enter your name."
+    if not validate_email(email_clean):
+        return False, "Please enter a valid email address."
+    ok, msg = validate_password(password)
+    if not ok:
+        return False, msg
+
     try:
-        pwd_hash = hash_password(password)
-        c.execute(
-            "INSERT INTO users (name, email, password_hash, is_admin) VALUES (?, ?, ?, ?)",
-            (name, email.lower().strip(), pwd_hash, is_admin)
-        )
-        conn.commit()
-        return True, "Account created successfully! Please log in."
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO users (name, email, password_hash, is_admin, is_approved) VALUES (?, ?, ?, ?, ?)",
+                (name, email_clean, hash_password(password), int(is_admin), int(is_approved)),
+            )
     except sqlite3.IntegrityError:
         return False, "An account with this email already exists."
-    finally:
-        conn.close()
+
+    if is_approved:
+        return True, "Account created successfully! Please log in."
+    return True, "Account created! An admin needs to approve it before you can log in."
+
 
 def authenticate_user(email: str, password: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    pwd_hash = hash_password(password)
-    c.execute(
-        "SELECT id, name, email, is_admin FROM users WHERE lower(email) = ? AND password_hash = ?",
-        (email.lower().strip(), pwd_hash)
-    )
-    user = c.fetchone()
-    conn.close()
-    if user:
-        return {"id": user[0], "name": user[1], "email": user[2], "is_admin": bool(user[3])}
-    return None
+    """Returns (user_dict, "") on success or (None, error_message) on failure."""
+    email_clean = (email or "").lower().strip()
 
-def update_user_profile(user_id: int, new_name: str, new_email: str, new_password: str = ""):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    try:
-        if new_password.strip():
-            pwd_hash = hash_password(new_password)
-            c.execute("UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ?", (new_name, new_email.lower().strip(), pwd_hash, user_id))
+    if _failed_login_count(email_clean) >= MAX_FAILED_LOGINS:
+        return None, f"Too many failed attempts. Please try again in {LOCKOUT_MINUTES} minutes."
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, name, email, is_admin, password_hash, is_approved FROM users WHERE lower(email) = ?",
+            (email_clean,),
+        ).fetchone()
+
+        if not row or not verify_password(password, row[4]):
+            failed = True
         else:
-            c.execute("UPDATE users SET name = ?, email = ? WHERE id = ?", (new_name, new_email.lower().strip(), user_id))
-        conn.commit()
-        return True, "Profile updated successfully!"
+            failed = False
+            if is_legacy_hash(row[4]):
+                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(password), row[0]))
+
+    if failed:
+        record_failed_login(email_clean)
+        return None, "Invalid email or password."
+
+    if not row[5]:
+        return None, "Your account is waiting for admin approval."
+
+    clear_failed_logins(email_clean)
+    return {"id": row[0], "name": row[1], "email": row[2], "is_admin": bool(row[3])}, ""
+
+
+def get_user_by_id(user_id: int):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, name, email, is_admin, is_approved FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "email": row[2], "is_admin": bool(row[3]), "is_approved": bool(row[4])}
+
+
+def update_user_profile(user_id: int, new_name: str, new_email: str):
+    new_name = (new_name or "").strip()
+    email_clean = (new_email or "").lower().strip()
+
+    if not new_name:
+        return False, "Name cannot be empty."
+    if not validate_email(email_clean):
+        return False, "Please enter a valid email address."
+
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE users SET name = ?, email = ? WHERE id = ?",
+                (new_name, email_clean, user_id),
+            )
     except sqlite3.IntegrityError:
         return False, "Email address is already in use by another account."
-    finally:
-        conn.close()
+    return True, "Profile updated successfully!"
 
-def get_all_users():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, name, email, is_admin FROM users ORDER BY id ASC")
-    users = c.fetchall()
-    conn.close()
-    return [{"id": u[0], "name": u[1], "email": u[2], "is_admin": bool(u[3])} for u in users]
-
-def admin_toggle_role(user_id: int, make_admin: bool):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if make_admin else 0, user_id))
-    conn.commit()
-    conn.close()
-
-def admin_reset_password(user_id: int, new_password: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    pwd_hash = hash_password(new_password)
-    c.execute("UPDATE users SET password_hash = ? WHERE id = ?", (pwd_hash, user_id))
-    conn.commit()
-    conn.close()
-
-def admin_delete_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def send_reset_code_email(email: str, code: str):
-    if not SMTP_EMAIL or not SMTP_PASSWORD:
-        return True, f"Demo Mode: Credentials not configured. Your code is: {code}"
-
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = SMTP_EMAIL
-        msg['To'] = email
-        msg['Subject'] = "Password Reset Code - Aunty Next DOOR"
-
-        body = f"""
-        Hello,
-
-        We received a request to reset your password for your Aunty Next DOOR account.
-
-        Your 6-digit verification code is: {code}
-
-        This code will expire in 15 minutes. If you did not request a password reset, please ignore this email.
-
-        Regards,
-        Aunty Next DOOR Team
-        """
-        msg.attach(MIMEText(body, 'plain'))
-
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        return True, f"Reset code sent to {email}. Please check your inbox."
-    except Exception as e:
-        return False, f"Failed to send email: {str(e)}"
-
-def generate_reset_code(email: str):
-    email_clean = email.lower().strip()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id FROM users WHERE lower(email) = ?", (email_clean,))
-    user = c.fetchone()
-    
-    if not user:
-        conn.close()
-        return False, "No account found with that email address."
-
-    code = f"{random.randint(100000, 999999)}"
-    expires_at = datetime.now() + timedelta(minutes=15)
-
-    c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
-    c.execute("INSERT INTO reset_tokens (email, code, expires_at) VALUES (?, ?, ?)", (email_clean, code, expires_at))
-    conn.commit()
-    conn.close()
-
-    return send_reset_code_email(email_clean, code)
-
-def reset_password_with_code(email: str, code: str, new_password: str):
-    email_clean = email.lower().strip()
-    code_clean = code.strip()
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT expires_at FROM reset_tokens WHERE lower(email) = ? AND code = ?", (email_clean, code_clean))
-    record = c.fetchone()
-
-    if not record:
-        conn.close()
-        return False, "Invalid verification code or email address."
-
-    expires_at = datetime.strptime(record[0], "%Y-%m-%d %H:%M:%S.%f") if "." in record[0] else datetime.strptime(record[0], "%Y-%m-%d %H:%M:%S")
-    
-    if datetime.now() > expires_at:
-        c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
-        conn.commit()
-        conn.close()
-        return False, "Verification code has expired. Please request a new one."
-
-    pwd_hash = hash_password(new_password)
-    c.execute("UPDATE users SET password_hash = ? WHERE lower(email) = ?", (pwd_hash, email_clean))
-    c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
-    conn.commit()
-    conn.close()
-
-    return True, "Password reset successfully! You can now log in with your new password."
 
 init_db()
 
@@ -376,7 +391,7 @@ def render_copy_icon_button(text_to_copy, button_id):
                 setTimeout(function() {{
                     btn.innerText = 'Copy text';
                     btn.style.background = '#ff4d4d';
-                    btn.style.boxShadow = '0 4px 12px rgba(255, 77, 77, 0.25);';
+                    btn.style.boxShadow = '0 4px 12px rgba(255, 77, 77, 0.25)';
                 }}, 2000);
             }}).catch(function(err) {{
                 console.error('Copy error: ', err);
@@ -410,28 +425,33 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # ============================================================
 # GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
-# API keys are intentionally NOT stored in this source file.
-# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
-# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
-# Tertiary preferred secret: GROQ_API_KEY_3
-# Old secret names are also supported for compatibility.
 
-try:
-    GROQ_API_KEY = (
-        st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
-        or st.secrets.get("GROQ_API_KEY", "")
-    )
-    GROQ_SECONDARY_API_KEY = (
-        st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
-        or st.secrets.get("GROQ_SECONDARY_API_KEY", "")
-    )
-    GROQ_TERTIARY_API_KEY = (
-        st.secrets.get("GROQ_API_KEY_3", "")
-    )
-except Exception:
-    GROQ_API_KEY = ""
-    GROQ_SECONDARY_API_KEY = ""
-    GROQ_TERTIARY_API_KEY = ""
+def _discover_groq_keys():
+    found = []
+
+    def add(value, require_prefix=False):
+        value = str(value or "").strip()
+        if value and value not in found and (not require_prefix or value.startswith("gsk_")):
+            found.append(value)
+
+    add(get_secret("Aunty_NEXT_DOOR_API_PRIMARY") or get_secret("GROQ_API_KEY"))
+    add(get_secret("GROQ_API_KEY_SECONDARY_2") or get_secret("GROQ_SECONDARY_API_KEY"))
+
+    names = set(os.environ.keys())
+    try:
+        names |= set(st.secrets.keys())
+    except Exception:
+        pass
+    for name in sorted(names):
+        upper = name.upper()
+        if ("GROQ" in upper and "KEY" in upper) or upper.startswith("AUNTY_NEXT_DOOR_API"):
+            add(get_secret(name), require_prefix=True)
+    return found
+
+
+GROQ_API_KEYS = _discover_groq_keys()
+GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+GROQ_SECONDARY_API_KEY = GROQ_API_KEYS[1] if len(GROQ_API_KEYS) > 1 else ""
 
 if not GROQ_API_KEY:
     st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
@@ -626,104 +646,6 @@ Write ONE short paragraph only. No bullets, headings, or sections.
 
 
 # ============================================================
-# MAIN QC SYSTEM PROMPT
-# ============================================================
-
-QC_SYSTEM_PROMPT = """
-You are a Call QC analyst for a pay-per-call affiliate network.
-
-Your task is to summarize a call transcript for QC review based on the campaign-specific QC questions provided below.
-
-The transcript is generated by Vosk speech-to-text and may contain grammar mistakes, repeated words, missing words, or incorrect word recognition. Understand the conversation using context and correct obvious transcription errors only when the intended meaning is clear. Never invent or assume information.
-
-CAMPAIGN:
-{campaign_name}
-
-QC QUESTIONS:
-{qc_questions}
-
-STRICT RULES:
-Read the entire transcript before summarizing.
-Check the transcript against the QC questions for this campaign.
-Include only information clearly supported by the transcript.
-If a QC question is not answered or the information is unclear, skip it completely.
-Never write "not mentioned", "not provided", "unknown", or similar phrases for missing information.
-Never guess or assume missing information.
-Keep campaign-specific details that are relevant to QC and qualification.
-Mention important issues such as wrong number, unrelated inquiry, disqualification, agent mistake, caller objection, fake/coached behavior, or other QC concerns when clearly supported by the call.
-Include how the call ended when this information is available.
-Do not include unnecessary personal information such as the caller's name, phone number, or address.
-Do not repeat information.
-Do not mention the QC questions in the summary.
-Do not use bullet points or numbered lists.
-Do not use headings or separate sections.
-Write ONE short, flat paragraph only.
-Use simple, clear, professional English.
-Focus on facts relevant to the campaign and QC.
-Do not make a payment, credit, or rejection decision unless the QC questions specifically ask for it.
-Do not add any information that is not supported by the transcript.
-
-UNIVERSAL RESPONSE RULES:
-These rules apply to EVERY campaign, including campaigns with campaign-specific QC questions and campaigns using the default QC questions.
-
-Always pay attention to whether both sides actually responded to each other.
-
-An agent's question is NOT the caller's answer.
-
-If the agent speaks or asks a question and the caller does not respond, clearly describe that situation when it is relevant to the QC outcome.
-
-Use natural wording such as:
-"The agent spoke, but the caller did not respond."
-"The agent asked a question, but the caller did not respond."
-
-If the caller speaks or asks a question and the agent does not respond, clearly describe that situation when it is relevant to the QC outcome.
-
-Use natural wording such as:
-"The caller responded, but the agent did not respond."
-
-If neither side responds and the transcript clearly indicates silence, no meaningful speech, or dead air, write:
-"The call had dead air with no response from either side."
-
-If the agent gives a greeting or speaks and there is no caller response, do not create a reason for the call and do not assume the caller disconnected. Simply describe the lack of response.
-
-If the caller gives a response but the agent does not continue or answer, do not assume that the call was completed, transferred, scheduled, or resolved.
-
-If the transcript contains unclear, garbled, or incomplete speech, do not convert it into a definite response. Only describe the response if the intended meaning is reasonably clear.
-
-Do not use "dead air" when one side clearly responded.
-Use "did not respond" when only one side failed to respond.
-
-Do not repeat the same response issue multiple times. Mention it once in the most natural place in the QC summary.
-
-If the transcript contains only a greeting, attempted greeting, or very short exchange without a meaningful conversation, summarize only what actually happened. Do not invent a caller intent or campaign qualification.
-
-If the call ends because one side stops responding, describe the actual response pattern when it is relevant. Do not assume the reason for the call ending.
-
-DO NOT use any Markdown formatting or asterisks (* or **). Output PLAIN TEXT ONLY.
-
-OUTPUT:
-Return ONLY the final QC summary paragraph.
-
-CALL TRANSCRIPT:
-{call_transcript}
-"""
-
-
-# ============================================================
-# SHORT TOPIC PROMPT
-# ============================================================
-
-SHORT_TOPIC_PROMPT = """
-MAIN TOPIC SUMMARY:
-
-Write ONE short sentence describing the caller's true main topic and reason for calling based on the summary below.
-
-SUMMARY:
-{call_transcript}
-"""
-
-
-# ============================================================
 # QC QUESTION SELECTOR
 # ============================================================
 
@@ -752,19 +674,68 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{mins:02d}:{secs:02d}"
 
+class GroqRateLimitError(RuntimeError):
+    """Raised when every Groq key is rate limited. wait_seconds = shortest wait before a retry can work."""
+
+    def __init__(self, wait_seconds, message="Groq rate limit reached on all API keys."):
+        super().__init__(message)
+        self.wait_seconds = float(wait_seconds)
+
+
+_WAIT_PART_RE = re.compile(r"([\d.]+)(h|ms|m|s)")
+
+
+def _rate_limit_wait(exc):
+    """Seconds to wait if exc is a Groq rate-limit (429) error, else None."""
+    text = str(exc)
+    if getattr(exc, "status_code", None) != 429 and "rate_limit_exceeded" not in text and "Error code: 429" not in text:
+        return None
+
+    match = re.search(r"try again in\s+([0-9hms.]+)", text, re.I)
+    if not match:
+        return 300.0
+
+    unit_seconds = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    total = sum(float(num) * unit_seconds[unit] for num, unit in _WAIT_PART_RE.findall(match.group(1)))
+    return total or 300.0
+
+
+def _short_error(exc, limit=160):
+    if _rate_limit_wait(exc) is not None:
+        return "rate limit (429)"
+    text = " ".join(str(exc).split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEYS:
         raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
 
-    client = Groq(api_key=GROQ_API_KEY)
-
     with open(audio_file_path, "rb") as file:
-        transcription = client.audio.transcriptions.create(
-            file=(os.path.basename(audio_file_path), file.read()),
-            model="whisper-large-v3-turbo",
-            response_format="verbose_json",
-            language="en",
-        )
+        audio_bytes = file.read()
+    file_name = os.path.basename(audio_file_path)
+
+    transcription = None
+    errors, waits = [], []
+    for key in GROQ_API_KEYS:
+        try:
+            transcription = Groq(api_key=key).audio.transcriptions.create(
+                file=(file_name, audio_bytes),
+                model="whisper-large-v3-turbo",
+                response_format="verbose_json",
+                language="en",
+            )
+            break
+        except Exception as exc:
+            wait = _rate_limit_wait(exc)
+            if wait is not None:
+                waits.append(wait)
+            errors.append(_short_error(exc))
+
+    if transcription is None:
+        if waits and len(waits) == len(errors):
+            raise GroqRateLimitError(min(waits), "Groq Whisper rate limit reached on all API keys.")
+        raise RuntimeError("Whisper transcription failed: " + " | ".join(errors))
 
     timeline_data = []
     raw_text_segments = []
@@ -791,227 +762,283 @@ def transcribe_groq_whisper(audio_file_path):
     return timeline_data, raw_text_segments
 
 
+# ------------------------------------------------------------
+# AI CALL ANALYSIS (token-optimised)
+# ------------------------------------------------------------
+
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
+MAX_TRANSCRIPT_CHARS = _get_int_setting("MAX_TRANSCRIPT_CHARS", 9000)
+ANALYSIS_MAX_OUTPUT_TOKENS = _get_int_setting("ANALYSIS_MAX_OUTPUT_TOKENS", 800)
+MIN_WORDS_FOR_AI = 12
+USE_FULL_QC_QUESTIONS = get_secret("USE_FULL_QC_QUESTIONS", "0").strip().lower() in {"1", "true", "yes"}
+
+ANALYSIS_GUIDANCE = {
+    "Rehab & Addiction Treatment": (
+        "Reason for calling; rehab/treatment service wanted; location or ZIP; insurance ONLY if the CALLER clearly "
+        "states it (name the provider, or say they have none); appointment only if clearly scheduled; "
+        "what the agent provided; how the call ended."
+    ),
+    "Dumpster & Porta Potty Services": (
+        "Dumpster or porta potty; size/capacity; residential/commercial/event use; price discussed; "
+        "delivery address/date; phone given; booking confirmed."
+    ),
+    "Pest Control & Home Services": (
+        "Specific pest/home service; homeowner or renter; service area; quote vs service vs wrong number; "
+        "appointment scheduled; how the call ended; agent handling."
+    ),
+    "Insurance (Health / Auto / Home)": (
+        "Coverage type (health/Medicare/auto/home); current coverage; new policy, quote or existing policy; "
+        "qualification (age, state); wrong number; ending (transfer/quote/callback)."
+    ),
+    "Debt Relief & Financial Services": (
+        "Type of debt help; total debt amount; secured vs unsecured; wrong number/spam; "
+        "transferred/enrolled/consultation; how the call ended."
+    ),
+}
+DEFAULT_ANALYSIS_GUIDANCE = (
+    "Why they called; service or information sought; qualification and location; price, quote, appointment "
+    "or transfer discussed; relevance (wrong number/unrelated); caller objections; agent mistakes; how it ended."
+)
 
 
-CALL_ANALYSIS_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "long_summary": {"type": "string"},
-        "main_topic": {"type": "string"},
-        "call_type": {
-            "type": "string",
-            "enum": ["QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT", "INFORMATION ONLY", "SILENT / NO RESPONSE", "OTHER"]
-        },
-        "qualification_status": {
-            "type": "string",
-            "enum": ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"]
-        },
-        "qualification_reason": {"type": "string"},
-        "caller_intent": {"type": "string"},
-        "why_called": {"type": "string"},
-        "service_requested": {"type": "string"},
-        "insurance": {"type": "string"},
-        "location": {"type": "string"},
-        "outcome": {"type": "string"},
-        "spam_robot": {"type": "boolean"},
-        "spam_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-        "spam_reason": {"type": "string"},
-        "qc_issue": {"type": "string"}
+def get_analysis_guidance(campaign_name):
+    if USE_FULL_QC_QUESTIONS:
+        return get_qc_questions(campaign_name)
+    return ANALYSIS_GUIDANCE.get(campaign_name, DEFAULT_ANALYSIS_GUIDANCE)
+
+
+_BASE_ANALYSIS_PROPERTIES = {
+    "long_summary": {"type": "string"},
+    "main_topic": {"type": "string"},
+    "call_type": {
+        "type": "string",
+        "enum": ["QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT", "INFORMATION ONLY", "SILENT / NO RESPONSE", "OTHER"],
     },
-    "required": [
-        "long_summary", "main_topic", "call_type", "qualification_status",
-        "qualification_reason", "caller_intent", "why_called", "service_requested",
-        "insurance", "location", "outcome", "spam_robot", "spam_confidence",
-        "spam_reason", "qc_issue"
-    ],
-    "additionalProperties": False
+    "qualification_status": {"type": "string", "enum": ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"]},
+    "caller_intent": {"type": "string"},
+    "why_called": {"type": "string"},
+    "service_requested": {"type": "string"},
+    "insurance": {"type": "string"},
+    "location": {"type": "string"},
+    "outcome": {"type": "string"},
+    "spam_robot": {"type": "boolean"},
+    "spam_confidence": {"type": "integer"},
+    "qc_issue": {"type": "string"},
+    "relevant_intent": {"type": "boolean"},
+    "qualification_info_present": {"type": "boolean"},
+    "location_or_eligibility_present": {"type": "boolean"},
+    "clear_outcome": {"type": "boolean"},
+    "two_way_conversation": {"type": "boolean"},
+    "major_qc_issue": {"type": "boolean"},
 }
 
-#### 2. Updated `_analysis_prompt`
-def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
-    qc_questions = get_qc_questions(campaign_name)
 
-    if timeline_data:
-        transcript_for_ai = "\n".join(
-            f"SEGMENT {i}: [{item.get('time', '')}] {item.get('line', '').strip()}"
-            for i, item in enumerate(timeline_data, start=1)
-            if item.get("line", "").strip()
+def _build_schema(include_speakers):
+    properties = dict(_BASE_ANALYSIS_PROPERTIES)
+    if include_speakers:
+        properties["speaker_labels"] = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties.keys()),
+        "additionalProperties": False,
+    }
+
+
+def _shorten_transcript(text):
+    text = text.strip()
+    if len(text) <= MAX_TRANSCRIPT_CHARS:
+        return text
+    head = int(MAX_TRANSCRIPT_CHARS * 0.65)
+    tail = MAX_TRANSCRIPT_CHARS - head
+    return f"{text[:head]} [...middle of call omitted...] {text[-tail:]}"
+
+
+def _analysis_prompt(transcript_text, campaign_name, numbered_segments):
+    speaker_rule = ""
+    if numbered_segments:
+        speaker_rule = (
+            "\n- speaker_labels: one comma-separated letter per numbered line, in order "
+            "(A=Agent, C=Caller, U=unsure), e.g. \"A,C,C,A\". Exactly one letter per line."
         )
-    else:
-        transcript_for_ai = full_transcript
 
-    return f"""
-You are the call-analysis and QC engine for a pay-per-call network.
+    return f"""Call QC analyst for a pay-per-call network.
+Campaign: {campaign_name}
+Focus on: {get_analysis_guidance(campaign_name)}
 
-CAMPAIGN FAMILY:
-{campaign_name}
+The transcript is machine speech-to-text (errors possible, no speaker labels). Infer Agent vs Caller from context. An agent's question is never the caller's answer. Use only facts clearly stated; never guess. Use "" for anything not clearly discussed.
 
-CAMPAIGN QC GUIDANCE:
-{qc_questions}
-
-Your job is to analyze the complete transcript and return structured call information.
-
-IMPORTANT SPEAKER RULE:
-Whisper provides transcript segments but does not reliably identify speakers. You must infer whether each numbered segment is from the Agent, Caller, or Unknown using the conversation context. The agent is usually the representative asking qualification questions, explaining services, pricing, scheduling, transferring, or giving instructions. The caller is the person seeking the service, asking for help, answering qualification questions, or describing their problem.
-An Agent question is NEVER the Caller answer. Never infer caller information from an agent question.
-If the speaker cannot be determined with reasonable confidence, use Unknown instead of guessing.
-
-LONG SUMMARY RULES:
-- Write a factual, useful 2-5 sentence summary in simple natural English.
-- Describe only what actually happened in the call.
-- Include the caller's real reason for calling, requested service, important qualification information, insurance when clearly stated by the caller, location when relevant, important agent/caller actions, and the actual outcome when supported.
-- Do not add filler such as "the conversation was natural" or "there were no obvious signs of a robot" unless that fact is itself relevant to QC.
-- Do not invent facts, outcomes, appointments, insurance, or caller intent.
-- If the caller was not looking for the campaign service, explain what they actually wanted instead of simply writing "irrelevant".
-- If it was a wrong number, say what the caller was trying to reach when clear.
-- If it was spam/robot, summarize what the automated call was promoting or asking the recipient to do.
-- Never turn an Agent's question into a Caller answer.
-- Do not include unnecessary personal information such as full phone numbers or addresses.
-
-MAIN TOPIC RULES:
-- One short sentence, normally 5-15 words.
-- Answer: "What was this caller actually calling about?"
-- Do not make SPAM / ROBOT the main topic unless the call itself was an automated solicitation or spam event. In that case, describe the actual subject, such as "Automated Google listing and SEO solicitation."
-- For unrelated calls, describe the actual request and make it clear that it was unrelated.
-
-SPAM / ROBOT RULES:
-- Do NOT use exact phrase matching only.
-- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
-- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
-- Similar wording must be recognized even when the exact words differ.
-- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
-- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
-- spam_confidence must reflect the strength of the evidence from 0-100.
-- Provide a brief explanation in spam_reason if applicable.
-
-QUALIFICATION RULES:
-- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
-- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
-- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
-- Provide a brief explanation in qualification_reason.
-
-MISSING INFORMATION:
-For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
-
-CALL TYPE:
-- QUALIFIED: relevant and clearly qualified.
-- NON-QUALIFIED: relevant but clearly not qualified.
-- WRONG NUMBER: caller was trying to reach another person/business/service.
-- SPAM / ROBOT: automated/scripted spam or marketing call.
-- INFORMATION ONLY: caller wanted information but not the campaign service/action.
-- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
-- OTHER: anything else that does not fit the categories.
-
-QC ISSUE:
-Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
-
-Read the entire transcript before deciding.
+Return JSON:
+- long_summary: 2-4 plain sentences, no markdown: real reason for calling, service wanted, key qualification facts, insurance only if the caller stated it, and the outcome. No names, phone numbers or addresses.
+- main_topic: one sentence (5-15 words): what the caller actually called about; say so if unrelated.
+- call_type / qualification_status: QUALIFIED only if campaign requirements are clearly met; NON-QUALIFIED if relevant but fails them; NOT CLEAR if unknown.
+- caller_intent, why_called, service_requested, insurance, location, outcome: max 12 words each.
+- spam_robot: true only with strong evidence (press-0/9 scripts, Google listing/SEO pitch, fake verification, marketing robot). An irrelevant human is not spam. spam_confidence 0-100.
+- qc_issue: a real issue (wrong number, agent mistake, objection, silence, solicitation) or "".
+- Booleans: relevant_intent, qualification_info_present, location_or_eligibility_present, clear_outcome, two_way_conversation, major_qc_issue.{speaker_rule}
 
 TRANSCRIPT:
-{transcript_for_ai}
-"""
+{transcript_text}"""
 
-#### 3. Updated `generate_call_analysis_groq`
-def _call_structured_analysis(client, prompt):
-    """Helper function to call Groq API using the openai/gpt-oss-20b model."""
+
+def _call_structured_analysis(client, prompt, schema):
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model=GROQ_SUMMARY_MODEL,
         messages=[
-            {
-                "role": "system", 
-                "content": "You are a precise data extraction and call-analysis engine. You must output valid JSON matching the requested schema precisely."
-            },
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "Return only the structured call-analysis object. Do not add commentary."},
+            {"role": "user", "content": prompt},
         ],
-        response_format={"type": "json_object"},
-        temperature=0.1
+        temperature=0.1,
+        max_tokens=ANALYSIS_MAX_OUTPUT_TOKENS,
+        reasoning_effort="low",
+        reasoning_format="hidden",
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "call_qc_analysis", "strict": True, "schema": schema},
+        },
     )
-    
-    content = response.choices[0].message.content
+    content = response.choices[0].message.content or "{}"
     return json.loads(content)
 
 
-def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
+def _trivial_analysis(text):
+    text = text.strip()
+    if text:
+        summary = f'The call had almost no speech. The transcript only shows: "{text}".'
+    else:
+        summary = "The call had dead air with no response from either side."
+    return {
+        "long_summary": summary,
+        "main_topic": "No meaningful conversation on the call",
+        "call_type": "SILENT / NO RESPONSE",
+        "qualification_status": "NOT CLEAR",
+        "caller_intent": "", "why_called": "", "service_requested": "",
+        "insurance": "", "location": "", "outcome": "",
+        "spam_robot": False, "spam_confidence": 0,
+        "qc_issue": "Very little or no speech on the call",
+        "relevant_intent": False, "qualification_info_present": False,
+        "location_or_eligibility_present": False, "clear_outcome": False,
+        "two_way_conversation": False, "major_qc_issue": True,
+    }
+
+
+def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None, include_speakers=False):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
-    prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
-    
-    keys_to_try = [
-        ("Primary", GROQ_API_KEY),
-        ("Secondary", GROQ_SECONDARY_API_KEY),
-        ("Tertiary", GROQ_TERTIARY_API_KEY)
-    ]
-    
-    errors = []
-    analysis = None
-    
-    for label, key in keys_to_try:
-        if not key:
-            continue
-        try:
-            analysis = _call_structured_analysis(Groq(api_key=key), prompt)
-            break
-        except Exception as e:
-            errors.append(f"{label}: {str(e)}")
-            
-    if analysis is None:
-        raise RuntimeError(f"All Groq analysis API keys failed. Errors: {'; '.join(errors)}")
+    if not GROQ_API_KEYS:
+        raise RuntimeError("Primary Groq API key is not configured.")
 
-    analysis["main_topic"] = str(analysis.get("main_topic", "")).replace("*", "").strip()
-    analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
-    analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
+    if len(full_transcript.split()) < MIN_WORDS_FOR_AI:
+        return _trivial_analysis(full_transcript)
+
+    numbered = False
+    if include_speakers and timeline_data:
+        lines = [item.get("line", "").strip() for item in timeline_data if item.get("line", "").strip()]
+        numbered_text = "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=1))
+        if len(numbered_text) <= MAX_TRANSCRIPT_CHARS and len(lines) == len(timeline_data):
+            transcript_text = numbered_text
+            numbered = True
+    if not numbered:
+        transcript_text = _shorten_transcript(full_transcript)
+
+    prompt = _analysis_prompt(transcript_text, campaign_name, numbered)
+    schema = _build_schema(numbered)
+
+    analysis = None
+    errors, waits = [], []
+    for key in GROQ_API_KEYS:
+        try:
+            analysis = _call_structured_analysis(Groq(api_key=key), prompt, schema)
+            break
+        except Exception as exc:
+            wait = _rate_limit_wait(exc)
+            if wait is not None:
+                waits.append(wait)
+            errors.append(_short_error(exc))
+
+    if analysis is None:
+        if waits and len(waits) == len(errors):
+            raise GroqRateLimitError(min(waits), "Groq daily/minute token limit reached on all API keys.")
+        raise RuntimeError("All Groq analysis API keys failed: " + " | ".join(errors))
+
+    if numbered and timeline_data is not None:
+        labels = [p.strip().upper() for p in str(analysis.get("speaker_labels", "")).split(",") if p.strip()]
+        names = {"A": "Agent", "C": "Caller"}
+        if len(labels) == len(timeline_data):
+            for item, label in zip(timeline_data, labels):
+                item["speaker"] = names.get(label[:1], "Unknown")
+    analysis.pop("speaker_labels", None)
+
+    for field in ("main_topic", "long_summary", "qc_issue"):
+        analysis[field] = str(analysis.get(field, "")).replace("*", "").strip()
     return analysis
 
-#### 4. Updated Python-Side `calculate_call_quality_score`
+
+def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
+    analysis = generate_call_analysis_groq(
+        full_transcript,
+        get_campaign_category(campaign_name),
+        timeline_data=timeline_data,
+        include_speakers=True,
+    )
+    return analysis["main_topic"], analysis["long_summary"]
+
+
+def build_qc_report(analysis):
+    parts = [
+        f"Call Type: {analysis.get('call_type', 'OTHER')}",
+        f"Caller Intent: {analysis.get('caller_intent', '').strip()}",
+        f"Why They Called: {analysis.get('why_called', '').strip()}",
+        f"Treatment/Service Interest: {analysis.get('service_requested', '').strip()}",
+    ]
+
+    if analysis.get("insurance", "").strip():
+        parts.append(f"Insurance: {analysis['insurance'].strip()}")
+    if analysis.get("location", "").strip():
+        parts.append(f"Location: {analysis['location'].strip()}")
+    if analysis.get("outcome", "").strip():
+        parts.append(f"Outcome: {analysis['outcome'].strip()}")
+
+    parts.extend([
+        f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
+        f"Spam Confidence: {int(analysis.get('spam_confidence', 0))}%",
+        f"QC Issue: {analysis.get('qc_issue', '').strip() or 'None'}",
+    ])
+
+    return " | ".join(part for part in parts if part.split(": ", 1)[-1].strip())
+
+
 def calculate_call_quality_score(analysis):
-    """Deterministic 0-100 score derived from compact AI outputs."""
     score = 0
 
     qualification_status = analysis.get("qualification_status", "NOT CLEAR")
-    caller_intent = str(analysis.get("caller_intent", "")).strip()
-    why_called = str(analysis.get("why_called", "")).strip()
-    service_requested = str(analysis.get("service_requested", "")).strip()
-    insurance = str(analysis.get("insurance", "")).strip()
-    location = str(analysis.get("location", "")).strip()
-    outcome = str(analysis.get("outcome", "")).strip()
-    call_type = analysis.get("call_type", "OTHER")
-    spam_robot = analysis.get("spam_robot", False)
-    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
-    qc_issue = str(analysis.get("qc_issue", "")).strip()
-
-    # Derived flags for scoring
-    relevant_intent = bool(caller_intent or why_called) and call_type not in {"WRONG NUMBER", "SPAM / ROBOT"}
-    qualification_info_present = bool(analysis.get("qualification_reason") or service_requested or insurance)
-    location_or_eligibility_present = bool(location or insurance)
-    clear_outcome = bool(outcome)
-    two_way_conversation = call_type != "SILENT / NO RESPONSE"
-    major_qc_issue = bool(qc_issue) or (spam_robot and spam_confidence >= 80)
-
     if qualification_status == "QUALIFIED":
         score += 25
-    elif qualification_status == "NOT CLEAR" and relevant_intent:
+    elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
         score += 10
 
-    if service_requested:
+    if analysis.get("service_requested", "").strip():
         score += 15
-    if qualification_info_present:
+    if analysis.get("qualification_info_present"):
         score += 15
-    if location_or_eligibility_present:
+    if analysis.get("location_or_eligibility_present"):
         score += 10
-    if clear_outcome:
+    if analysis.get("clear_outcome"):
         score += 10
-    if two_way_conversation:
+    if analysis.get("two_way_conversation"):
         score += 10
-    if not spam_robot:
+    if not analysis.get("spam_robot"):
         score += 5
-    if not major_qc_issue:
+    if not analysis.get("major_qc_issue"):
         score += 10
 
-    if spam_robot and spam_confidence >= 90:
+    call_type = analysis.get("call_type", "OTHER")
+    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+
+    if analysis.get("spam_robot") and spam_confidence >= 90:
         return 5
-    if spam_robot:
+    if analysis.get("spam_robot"):
         return min(score, 25)
     if call_type == "WRONG NUMBER":
         return min(score, 30)
@@ -1021,25 +1048,6 @@ def calculate_call_quality_score(analysis):
         return min(score, 60)
 
     return max(0, min(100, score))
-
-
-def build_qc_report(analysis, campaign_name):
-    """Builds and formats the QC report dictionary or string based on analysis results."""
-    return {
-        "call_type": analysis.get("call_type", "OTHER"),
-        "qualification_status": analysis.get("qualification_status", "NOT CLEAR"),
-        "qualification_reason": analysis.get("qualification_reason", ""),
-        "long_summary": analysis.get("long_summary", ""),
-        "main_topic": analysis.get("main_topic", ""),
-        "service_requested": analysis.get("service_requested", ""),
-        "insurance": analysis.get("insurance", ""),
-        "location": analysis.get("location", ""),
-        "outcome": analysis.get("outcome", ""),
-        "spam_robot": analysis.get("spam_robot", False),
-        "spam_confidence": analysis.get("spam_confidence", 0),
-        "spam_reason": analysis.get("spam_reason", ""),
-        "qc_issue": analysis.get("qc_issue", "")
-    }
 
 
 SCORE_COLORS = {
@@ -1078,12 +1086,10 @@ def _background_is_special(background):
     g = 1.0 if color.get("green") is None else float(color.get("green", 1.0))
     b = 1.0 if color.get("blue") is None else float(color.get("blue", 1.0))
 
-    # Treat plain/near-white as the normal background.
     return not (r >= 0.97 and g >= 0.97 and b >= 0.97)
 
 
 def get_existing_special_columns(worksheet, start_row, end_row):
-    """Read user-entered background colors so existing VOIP/special colors survive score coloring."""
     if end_row < start_row:
         return {}
 
@@ -1147,41 +1153,7 @@ def _contiguous_ranges_for_row(row_number, columns):
     return ranges
 
 
-def get_rehab_insurance_status(analysis):
-    """Classify Rehab insurance for row coloring. Returns GREEN, YELLOW, or None."""
-    insurance = str(analysis.get("insurance", "") or "").strip().lower()
-    if not insurance:
-        return None
-
-    # Government/state insurance = not qualified for the Rehab campaign.
-    government_terms = [
-        "medicaid", "medicare", "state insurance", "state-funded",
-        "state funded", "government insurance", "government-funded",
-        "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip",
-    ]
-    if any(term in insurance for term in government_terms):
-        return "YELLOW"
-
-    # Private/employer/employee insurance = qualified/green for Rehab.
-    private_terms = [
-        "private", "employer", "employee", "commercial", "company insurance",
-        "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-    ]
-    if any(term in insurance for term in private_terms):
-        return "GREEN"
-
-    return None
-
-
-REHAB_INSURANCE_COLORS = {
-    "GREEN": {"red": 0.56, "green": 0.83, "blue": 0.60},
-    "YELLOW": {"red": 1.00, "green": 0.93, "blue": 0.60},
-}
-
-
 def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
-    """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
     special_columns = set(special_columns or [])
     color = get_score_color(score, analysis)
 
@@ -1194,21 +1166,6 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
         )
         return
 
-    # Rehab insurance has a business rule that takes priority over the normal
-    # score colors: government/state insurance = yellow (not qualified),
-    # private/employer insurance = green.
-    campaign_category = str(analysis.get("campaign_category", "") or "").strip()
-    if campaign_category == "Rehab & Addiction Treatment":
-        rehab_status = get_rehab_insurance_status(analysis)
-        if rehab_status in REHAB_INSURANCE_COLORS:
-            insurance_color = REHAB_INSURANCE_COLORS[rehab_status]
-            columns_to_color = [col for col in range(1, 13) if col not in special_columns]
-            ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
-            if ranges:
-                worksheet.format(ranges, {"backgroundColor": insurance_color})
-            return
-
-    # L (score) always gets the score color, even if it previously had a color.
     columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
     ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
     ranges.append(f"L{row_number}")
@@ -1216,11 +1173,101 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
     if ranges:
         worksheet.format(ranges, {"backgroundColor": color})
 
+
+ALLOWED_AUDIO_EXTS = {".mp3", ".wav"}
+UPLOAD_MAX_AGE_SEC = 6 * 3600
+
+
+def cleanup_old_uploads(max_age_sec=UPLOAD_MAX_AGE_SEC):
+    cutoff = time.time() - max_age_sec
+    try:
+        for file in UPLOAD_DIR.iterdir():
+            try:
+                if file.is_file() and file.stat().st_mtime < cutoff:
+                    file.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _host_is_public(hostname):
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def validate_audio_url(url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only http(s) recording URLs are supported.")
+    if not _host_is_public(parsed.hostname):
+        raise ValueError("That URL points to a private or unreachable address.")
+
+
+def download_audio(url):
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("URL is required.")
+
+    validate_audio_url(url)
+    cleanup_old_uploads()
+
+    filename = url.split("/")[-1].split("?")[0] or "web_audio.mp3"
+    ext = Path(filename).suffix.lower()
+    path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext if ext in ALLOWED_AUDIO_EXTS else '.mp3'}"
+
+    max_bytes = MAX_AUDIO_MB * 1024 * 1024
+    too_big = f"Recording is larger than the {MAX_AUDIO_MB} MB limit."
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            final_host = urllib.parse.urlparse(response.geturl()).hostname
+            if final_host and not _host_is_public(final_host):
+                raise ValueError("The recording redirected to a private address.")
+
+            length = response.headers.get("Content-Length")
+            if length and length.isdigit() and int(length) > max_bytes:
+                raise ValueError(too_big)
+
+            total = 0
+            with open(path, "wb") as out_file:
+                while True:
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(too_big)
+                    out_file.write(chunk)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+    return path, filename
+
+
 def save_uploaded_audio(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
-    if ext not in {".mp3", ".wav"}:
+    if ext not in ALLOWED_AUDIO_EXTS:
         raise ValueError("Only MP3 and WAV are supported.")
 
+    if uploaded_file.size > MAX_AUDIO_MB * 1024 * 1024:
+        raise ValueError(f"File is larger than the {MAX_AUDIO_MB} MB limit.")
+
+    cleanup_old_uploads()
     safe_name = f"{uuid.uuid4().hex}{ext}"
     path = UPLOAD_DIR / safe_name
 
@@ -1245,23 +1292,16 @@ def save_uploaded_audio(uploaded_file):
     st.session_state.detailed_summary = "No summary generated yet."
     st.session_state.status = "Audio loaded and ready for processing."
 
+
 def load_audio_url(url):
-    url = url.strip()
-    if not url:
-        raise ValueError("URL is required.")
+    path, filename = download_audio(url)
 
-    filename = url.split("/")[-1].split("?")[0] or "web_audio.mp3"
-    ext = Path(filename).suffix.lower()
-    safe_name = f"{uuid.uuid4().hex}{ext if ext in {'.mp3', '.wav'} else '.mp3'}"
-    path = UPLOAD_DIR / safe_name
-
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as response:
-        with open(path, "wb") as out_file:
-            out_file.write(response.read())
-
-    sound = AudioSegment.from_file(path)
-    duration_sec = len(sound) / 1000.0
+    try:
+        sound = AudioSegment.from_file(path)
+        duration_sec = len(sound) / 1000.0
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
     st.session_state.source_name = filename
     st.session_state.file_path = str(path)
@@ -1277,7 +1317,6 @@ def load_audio_url(url):
 
 
 def get_google_client():
-    """Connect to Google Sheets using the local service account or Streamlit Secrets."""
     if os.path.exists("service_account.json"):
         return gspread.service_account(filename="service_account.json")
 
@@ -1289,97 +1328,219 @@ def get_google_client():
         ) from exc
 
 
-def sync_google_sheet_batch(default_campaign_name=""):
-    """Process Ringba recordings from the shared Google Sheet.
+PROCESSING_MARKER = "⏳ Processing..."
+ERROR_MARKER = "ERROR - clear this cell to retry"
+MAX_ROW_ATTEMPTS = 3
+WATCHER_INTERVAL_SEC = 30
 
-    Sheet layout:
-    D = Campaign
-    G = Long AI Summary
-    H = Main Topic / processing flag
-    I = Recording URL
-    J = Existing carrier / VOIP data (untouched)
-    K = AI QC Report
-    L = Numeric quality score
-    """
-    try:
-        gc = get_google_client()
-        sheet = gc.open("Ringba to Sheet QC")
-        worksheet = sheet.worksheet("Sheet1")
 
-        rows = worksheet.get_all_values()
-        processed_count = 0
+def _chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
-        if len(rows) > 1:
-            special_color_map = get_existing_special_columns(worksheet, 2, len(rows))
+
+def _process_sheet_locked(shared, fallback_campaign):
+    attempts = shared["attempts"]
+    gc = get_google_client()
+    worksheet = gc.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+    rows = worksheet.get_all_values()
+
+    if len(rows) < 2:
+        return 0
+
+    duration_updates = []
+    pending = []
+
+    for index, row in enumerate(rows[1:], start=2):
+        raw_campaign = row[3].strip() if len(row) > 3 else ""
+        raw_duration = row[5].strip() if len(row) > 5 else ""
+        existing_main_topic = row[7].strip() if len(row) > 7 else ""
+        recording_url = row[8].strip() if len(row) > 8 else ""
+
+        if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
+            formatted = format_seconds_to_hms(raw_duration)
+            if formatted != raw_duration:
+                duration_updates.append({"range": f"F{index}", "values": [[formatted]]})
+
+        if not recording_url.startswith("http") or existing_main_topic:
+            continue
+
+        if raw_campaign:
+            campaign_name = get_campaign_category(raw_campaign)
+        elif fallback_campaign is not None:
+            campaign_name = fallback_campaign or "General Customer Inquiry"
         else:
-            special_color_map = {}
+            continue
 
-        for index, row in enumerate(rows[1:], start=2):
-            raw_campaign = row[3].strip() if len(row) > 3 else ""
-            raw_duration = row[5].strip() if len(row) > 5 else ""
-            existing_main_topic = row[7].strip() if len(row) > 7 else ""
-            recording_url = row[8].strip() if len(row) > 8 else ""
+        pending.append((index, recording_url, campaign_name))
 
-            # Keep the existing duration formatting behavior.
-            if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
-                try:
-                    worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
-                    time.sleep(0.3)
-                except Exception:
-                    pass
+    for batch in _chunks(duration_updates, 200):
+        try:
+            worksheet.batch_update(batch, value_input_option="USER_ENTERED")
+        except Exception as exc:
+            logger.warning("Duration cleanup failed: %s", exc)
 
-            # Existing trigger stays: recording exists + H is empty.
-            if not recording_url or not recording_url.startswith("http") or existing_main_topic:
-                continue
+    if not pending:
+        return 0
+
+    special_color_map = get_existing_special_columns(worksheet, 2, len(rows))
+    processed = 0
+
+    for index, recording_url, campaign_name in pending:
+        try:
+            current = worksheet.row_values(index)
+        except Exception as exc:
+            logger.warning("Could not re-read row %s: %s", index, exc)
+            continue
+
+        current_topic = current[7].strip() if len(current) > 7 else ""
+        current_url = current[8].strip() if len(current) > 8 else ""
+        if current_url != recording_url or current_topic:
+            continue
+
+        try:
+            worksheet.update_cell(index, 8, PROCESSING_MARKER)
+        except Exception as exc:
+            logger.warning("Could not claim row %s: %s", index, exc)
+            continue
+
+        audio_path = None
+        try:
+            audio_path, _ = download_audio(recording_url)
+            timeline_data, raw_text_segments = transcribe_groq_whisper(str(audio_path))
+            full_transcript_str = " ".join(raw_text_segments).strip()
+
+            analysis = generate_call_analysis_groq(
+                full_transcript_str,
+                campaign_name,
+                timeline_data=timeline_data,
+            )
+            score = calculate_call_quality_score(analysis)
+            main_topic = analysis["main_topic"] or "No topic detected"
+
+            worksheet.batch_update(
+                [
+                    {"range": f"G{index}:H{index}", "values": [[analysis["long_summary"], main_topic]]},
+                    {"range": f"K{index}:L{index}", "values": [[build_qc_report(analysis), score]]},
+                ],
+                value_input_option="RAW",
+            )
+            attempts.pop(recording_url, None)
+            processed += 1
 
             try:
-                campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
-                if not campaign_to_use:
-                    campaign_to_use = "General Customer Inquiry"
+                apply_row_score_color(worksheet, index, score, analysis, special_color_map.get(index, set()))
+            except Exception as exc:
+                logger.warning("Row %s processed but coloring failed: %s", index, exc)
 
-                load_audio_url(recording_url)
-                timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
-                full_transcript_str = " ".join(raw_text_segments).strip()
+        except GroqRateLimitError as rl:
+            wait = min(max(rl.wait_seconds, 60), 6 * 3600) + 30
+            shared["paused_until"] = time.time() + wait
+            logger.warning("Groq limit reached; pausing the sheet worker for ~%s min", int(wait // 60))
+            try:
+                worksheet.update_cell(index, 8, "")
+            except Exception as write_exc:
+                logger.warning("Could not release row %s: %s", index, write_exc)
+            break
+        except Exception as exc:
+            logger.exception("Row %s failed", index)
+            count = attempts.get(recording_url, 0) + 1
+            attempts[recording_url] = count
+            error_text = f"Processing error: {exc}"
+            try:
+                if count >= MAX_ROW_ATTEMPTS:
+                    worksheet.batch_update(
+                        [
+                            {"range": f"G{index}:H{index}", "values": [[error_text, ERROR_MARKER]]},
+                            {"range": f"K{index}", "values": [[error_text]]},
+                        ],
+                        value_input_option="RAW",
+                    )
+                    attempts.pop(recording_url, None)
+                else:
+                    worksheet.update_cell(index, 8, "")
+            except Exception as write_exc:
+                logger.warning("Could not record error for row %s: %s", index, write_exc)
+        finally:
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
 
-                analysis = generate_call_analysis_groq(
-                    full_transcript_str,
-                    campaign_to_use,
-                    timeline_data=timeline_data,
-                )
-                analysis["campaign_category"] = campaign_to_use
+        time.sleep(1)
 
-                main_topic = analysis["main_topic"]
-                detailed_summary = analysis["long_summary"]
-                qc_report = build_qc_report(analysis)
-                score = calculate_call_quality_score(analysis)
+    return processed
 
-                worksheet.update_cell(index, 7, detailed_summary)  # G
-                worksheet.update_cell(index, 8, main_topic)        # H
-                worksheet.update_cell(index, 11, qc_report)        # K
-                worksheet.update_cell(index, 12, score)             # L
 
-                apply_row_score_color(
-                    worksheet,
-                    index,
-                    score,
-                    analysis,
-                    special_color_map.get(index, set()),
-                )
+def process_sheet_once(shared, fallback_campaign=None, blocking=False):
+    if shared.get("paused_until", 0) > time.time():
+        return 0, "paused"
+    if not shared["lock"].acquire(blocking=blocking):
+        return 0, "busy"
+    try:
+        return _process_sheet_locked(shared, fallback_campaign), "ok"
+    finally:
+        shared["lock"].release()
 
-                processed_count += 1
-                time.sleep(1)
 
-            except Exception as e:
-                error_text = f"Processing error: {str(e)}"
-                try:
-                    worksheet.update_cell(index, 7, error_text)
-                    worksheet.update_cell(index, 11, error_text)
-                except Exception:
-                    pass
+def _clear_stale_claims(shared):
+    with shared["lock"]:
+        worksheet = get_google_client().open(SHEET_NAME).worksheet(WORKSHEET_NAME)
+        column_h = worksheet.col_values(8)
+        updates = [
+            {"range": f"H{i}", "values": [[""]]}
+            for i, value in enumerate(column_h, start=1)
+            if value.strip() == PROCESSING_MARKER
+        ]
+        if updates:
+            worksheet.batch_update(updates, value_input_option="RAW")
+            logger.info("Cleared %s stale processing markers", len(updates))
 
-        return True, f"Successfully processed {processed_count} new recordings!"
+
+def background_sheet_watcher(shared):
+    time.sleep(5)
+
+    try:
+        _clear_stale_claims(shared)
+    except Exception as exc:
+        logger.warning("Startup cleanup skipped: %s", exc)
+
+    while True:
+        try:
+            process_sheet_once(shared, fallback_campaign=None, blocking=False)
+        except Exception as exc:
+            logger.warning("Background watcher cycle failed: %s", exc)
+        time.sleep(WATCHER_INTERVAL_SEC)
+
+
+@st.cache_resource
+def start_background_worker():
+    shared = {"lock": threading.Lock(), "attempts": {}}
+    thread = threading.Thread(
+        target=background_sheet_watcher, args=(shared,), daemon=True, name="sheet-watcher"
+    )
+    thread.start()
+    return shared
+
+
+def sync_google_sheet_batch(default_campaign_name=""):
+    shared = start_background_worker()
+    try:
+        count, state = process_sheet_once(
+            shared,
+            fallback_campaign=default_campaign_name or "General Customer Inquiry",
+            blocking=False,
+        )
     except Exception as e:
         return False, f"Google Sheets error: {str(e)}"
+
+    if state == "busy":
+        return False, "The background worker is processing the sheet right now. Please try again in a minute."
+    if state == "paused":
+        minutes = max(1, int((shared.get("paused_until", 0) - time.time()) // 60))
+        return False, f"Groq token limit reached on all API keys. Processing resumes automatically in about {minutes} min."
+    return True, f"Successfully processed {count} new recordings!"
+
+
+start_background_worker()
 
 
 # ============================================================
@@ -1475,21 +1636,21 @@ div.stButton > button[kind="primary"] {{ background: #2563eb !important; color: 
 
 
 # ============================================================
-# AUTHENTICATION SCREEN (LOGIN / SIGN UP / FORGOT PASSWORD)
+# AUTHENTICATION SCREEN (LOGIN / SIGN UP)
 # ============================================================
 
 if not st.session_state.logged_in_user:
     st.markdown("## Welcome to **Aunty Next DOOR**")
-    st.markdown("Please log in, create a public account, or reset your password.")
+    st.markdown("Please log in or create an account.")
 
-    auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🔐 Login", "📝 Sign Up", "🔑 Forgot Password"])
+    auth_tab1, auth_tab2 = st.tabs(["🔐 Login", "📝 Sign Up"])
 
     with auth_tab1:
         st.subheader("Login to your account")
         login_email = st.text_input("Email Address", key="login_email")
         login_password = st.text_input("Password", type="password", key="login_pass")
         if st.button("Log In", type="primary", use_container_width=True):
-            user = authenticate_user(login_email, login_password)
+            user, login_error = authenticate_user(login_email, login_password)
             if user:
                 st.session_state.logged_in_user = user
                 st.session_state.current_view = "transcriber"
@@ -1497,7 +1658,7 @@ if not st.session_state.logged_in_user:
                 time.sleep(0.5)
                 st.rerun()
             else:
-                st.error("Invalid email or password.")
+                st.error(login_error)
 
     with auth_tab2:
         st.subheader("Create a public account")
@@ -1506,48 +1667,16 @@ if not st.session_state.logged_in_user:
         signup_password = st.text_input("Create Password", type="password", key="signup_pass")
         if st.button("Create Account", type="primary", use_container_width=True):
             if signup_name and signup_email and signup_password:
-                ok, msg = register_user(signup_name, signup_email, signup_password)
+                ok, msg = register_user(
+                    signup_name, signup_email, signup_password,
+                    is_admin=0, is_approved=1 if AUTO_APPROVE_SIGNUPS else 0,
+                )
                 if ok:
                     st.success(msg)
                 else:
                     st.error(msg)
             else:
                 st.warning("Please fill out all fields.")
-
-    with auth_tab3:
-        st.subheader("Reset Password via Email")
-        
-        step1, step2 = st.columns(2)
-        
-        with step1:
-            st.markdown("##### 1. Request Reset Code")
-            reset_req_email = st.text_input("Registered Email Address", key="reset_req_email")
-            if st.button("Send Verification Code", use_container_width=True):
-                if reset_req_email.strip():
-                    with st.spinner("Generating and sending code..."):
-                        ok, msg = generate_reset_code(reset_req_email)
-                        if ok:
-                            st.success(msg)
-                        else:
-                            st.error(msg)
-                else:
-                    st.warning("Please enter your email address.")
-
-        with step2:
-            st.markdown("##### 2. Enter Code & Set New Password")
-            reset_email = st.text_input("Email Address", key="reset_email")
-            reset_code = st.text_input("6-Digit Code", key="reset_code")
-            new_pass = st.text_input("New Password", type="password", key="reset_new_pass")
-            
-            if st.button("Update Password", type="primary", use_container_width=True):
-                if reset_email.strip() and reset_code.strip() and new_pass.strip():
-                    ok, msg = reset_password_with_code(reset_email, reset_code, new_pass)
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-                else:
-                    st.warning("Please fill in all reset fields.")
 
     st.stop()
 
@@ -1557,6 +1686,13 @@ if not st.session_state.logged_in_user:
 # ============================================================
 
 current_user = st.session_state.logged_in_user
+
+_fresh_user = get_user_by_id(current_user["id"])
+if not _fresh_user or not _fresh_user["is_approved"]:
+    st.session_state.logged_in_user = None
+    st.rerun()
+current_user = {k: _fresh_user[k] for k in ("id", "name", "email", "is_admin")}
+st.session_state.logged_in_user = current_user
 
 with st.sidebar:
     render_html("""
@@ -1580,11 +1716,6 @@ with st.sidebar:
     if st.button("🎙️ &nbsp; Transcriber", use_container_width=True, type="primary" if st.session_state.current_view == "transcriber" else "secondary"):
         st.session_state.current_view = "transcriber"
         st.rerun()
-
-    if current_user.get("is_admin"):
-        if st.button("🛡 &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
-            st.session_state.current_view = "admin"
-            st.rerun()
 
     render_html("""
         <div class="sidebar-divider"></div>
@@ -1618,12 +1749,11 @@ with st.sidebar:
     with st.form("profile_update_form"):
         new_name = st.text_input("Name", value=current_user["name"])
         new_email = st.text_input("Email", value=current_user["email"])
-        new_pass = st.text_input("New Password (optional)", type="password", placeholder="Leave blank to keep current")
 
         save_profile = st.form_submit_button("Save Profile Changes", use_container_width=True, type="primary")
 
         if save_profile:
-            ok, msg = update_user_profile(current_user["id"], new_name, new_email, new_pass)
+            ok, msg = update_user_profile(current_user["id"], new_name, new_email)
             if ok:
                 st.session_state.logged_in_user["name"] = new_name
                 st.session_state.logged_in_user["email"] = new_email
@@ -1638,92 +1768,12 @@ with st.sidebar:
         st.rerun()
 
     initials = "".join([part[0].upper() for part in current_user['name'].split()[:2]]) or "U"
-    admin_badge = " <span style='font-size:10px; color:#10b981;'>(Admin)</span>" if current_user.get("is_admin") else ""
     render_html(f"""
         <div class="sidebar-user">
             <div class="avatar">{initials}</div>
-            <div style="flex:1">{html.escape(current_user['name'])}{admin_badge}</div>
+            <div style="flex:1">{html.escape(current_user['name'])}</div>
         </div>
     """)
-
-
-# ============================================================
-# ADMIN PANEL VIEW
-# ============================================================
-
-if st.session_state.current_view == "admin":
-    if not current_user.get("is_admin"):
-        st.error("Access denied. Admin permissions required.")
-        st.stop()
-
-    render_html("""
-        <div class="page-title">
-            Admin Panel
-            <span class="online" style="background: rgba(37,99,235,0.12); border-color: rgba(37,99,235,0.25); color: #2563eb;">● Management</span>
-        </div>
-        <p class="subtitle">
-            Manage system users, grant/revoke permissions, and reset user credentials.
-        </p>
-    """)
-
-    admin_tabs = st.tabs(["👥 Manage Users", "➕ Create New User"])
-
-    with admin_tabs[0]:
-        users_list = get_all_users()
-        st.subheader(f"Registered Accounts ({len(users_list)})")
-
-        for u in users_list:
-            with st.expander(f"{u['name']} ({u['email']}) {'— [ADMIN]' if u['is_admin'] else ''}"):
-                c1, c2, c3 = st.columns([1.5, 1.5, 1])
-                
-                with c1:
-                    is_adm = st.checkbox("Admin Role", value=u["is_admin"], key=f"role_{u['id']}")
-                    if is_adm != u["is_admin"]:
-                        admin_toggle_role(u["id"], is_adm)
-                        st.success("User role updated!")
-                        time.sleep(0.4)
-                        st.rerun()
-
-                with c2:
-                    new_user_pwd = st.text_input("Reset Password", key=f"pwd_{u['id']}", type="password", placeholder="New password")
-                    if st.button("Update Password", key=f"btn_pwd_{u['id']}"):
-                        if new_user_pwd.strip():
-                            admin_reset_password(u["id"], new_user_pwd.strip())
-                            st.success("Password updated!")
-                        else:
-                            st.warning("Enter a valid password.")
-
-                with c3:
-                    if u["id"] != current_user["id"]:
-                        if st.button("🗑️ Delete Account", key=f"del_{u['id']}", type="secondary"):
-                            admin_delete_user(u["id"])
-                            st.success("User deleted!")
-                            time.sleep(0.4)
-                            st.rerun()
-                    else:
-                        st.caption("Cannot delete self")
-
-    with admin_tabs[1]:
-        st.subheader("Add a New User Account")
-        with st.form("admin_create_user"):
-            new_u_name = st.text_input("Full Name")
-            new_u_email = st.text_input("Email Address")
-            new_u_pass = st.text_input("Password", type="password")
-            new_u_is_admin = st.checkbox("Grant Admin Privileges")
-            
-            if st.form_submit_button("Create User", type="primary"):
-                if new_u_name and new_u_email and new_u_pass:
-                    ok, msg = register_user(new_u_name, new_u_email, new_u_pass, 1 if new_u_is_admin else 0)
-                    if ok:
-                        st.success(msg)
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-                else:
-                    st.warning("Please fill out all fields.")
-
-    st.stop()
 
 
 # ============================================================
@@ -1822,9 +1872,10 @@ with left_col:
             progress_bar.progress(65, text="Generating AI summary...")
 
             full_transcript_str = " ".join(raw_text_segments)
-            short_topic, detailed_summary = generate_fast_summary_groq(
+            short_topic, detailed_summary = generate_summaries_groq(
                 full_transcript_str,
                 selected_campaign,
+                timeline_data=timeline_data,
             )
             elapsed_time = round(time.time() - start_clock, 1)
 
@@ -1847,7 +1898,10 @@ with left_col:
     if st.session_state.file_path and os.path.exists(st.session_state.file_path):
         try:
             with open(st.session_state.file_path, "rb") as audio_file:
-                st.audio(audio_file.read(), format="audio/mp3")
+                st.audio(
+                    audio_file.read(),
+                    format="audio/wav" if st.session_state.file_path.lower().endswith(".wav") else "audio/mp3",
+                )
         except Exception:
             pass
 
