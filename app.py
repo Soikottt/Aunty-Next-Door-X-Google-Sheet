@@ -78,10 +78,6 @@ if not os.path.exists(MODEL_DIR):
         st.error(f"Failed to auto-download/extract model: {str(e)}")
 
 
-# ============================================================
-# BACKGROUND THREAD AUTOMATION WORKER
-# ============================================================
-
 def get_campaign_category(raw_campaign_text):
     """Map real Ringba campaign names to the closest QC campaign family."""
     raw = (raw_campaign_text or "").strip()
@@ -408,52 +404,28 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# GROQ API KEYS (ROUND-ROBIN ROTATION & STREAMLIT SECRETS)
+# GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
-# First two secrets remain exactly as requested with backward compatibility:
-# 1. Aunty_NEXT_DOOR_API_PRIMARY (or GROQ_API_KEY)
-# 2. GROQ_API_KEY_SECONDARY_2 (or GROQ_SECONDARY_API_KEY)
-# Additional keys (e.g., GROQ_API_KEY_3, etc.) will also be included if present.
+# API keys are intentionally NOT stored in this source file.
+# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
+# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
+# Old secret names are also supported for compatibility.
 
-GROQ_KEYS = []
 try:
-    primary_key = (
+    GROQ_API_KEY = (
         st.secrets.get("Aunty_NEXT_DOOR_API_PRIMARY", "")
         or st.secrets.get("GROQ_API_KEY", "")
     )
-    secondary_key = (
+    GROQ_SECONDARY_API_KEY = (
         st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
         or st.secrets.get("GROQ_SECONDARY_API_KEY", "")
     )
-    
-    if primary_key:
-        GROQ_KEYS.append(primary_key)
-    if secondary_key:
-        GROQ_KEYS.append(secondary_key)
-        
-    # Optional: Automatically scan for additional keys if provided (GROQ_API_KEY_3, GROQ_API_KEY_4, etc.)
-    for i in range(3, 10):
-        extra_key = st.secrets.get(f"GROQ_API_KEY_{i}", "")
-        if extra_key:
-            GROQ_KEYS.append(extra_key)
 except Exception:
-    pass
+    GROQ_API_KEY = ""
+    GROQ_SECONDARY_API_KEY = ""
 
-_api_key_lock = threading.Lock()
-_api_key_index = 0
-
-def get_next_groq_key():
-    """Returns the next Groq API key in round-robin order."""
-    global _api_key_index
-    with _api_key_lock:
-        if not GROQ_KEYS:
-            return ""
-        key = GROQ_KEYS[_api_key_index % len(GROQ_KEYS)]
-        _api_key_index += 1
-        return key
-
-if not GROQ_KEYS:
-    st.warning("No Groq API keys are configured in Streamlit Secrets.")
+if not GROQ_API_KEY:
+    st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
 
 
 # ============================================================
@@ -772,11 +744,10 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    api_key = get_next_groq_key()
-    if not api_key:
-        raise RuntimeError("No Groq API keys found. Configure credentials in Streamlit Secrets.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
 
-    client = Groq(api_key=api_key)
+    client = Groq(api_key=GROQ_API_KEY)
 
     with open(audio_file_path, "rb") as file:
         transcription = client.audio.transcriptions.create(
@@ -836,6 +807,8 @@ CALL_ANALYSIS_SCHEMA = {
         "spam_robot": {"type": "boolean"},
         "spam_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
         "qc_issue": {"type": "string"},
+        "spam_reason": {"type": "string"},
+        "qualification_reason": {"type": "string"},
         "relevant_intent": {"type": "boolean"},
         "qualification_info_present": {"type": "boolean"},
         "location_or_eligibility_present": {"type": "boolean"},
@@ -858,7 +831,8 @@ CALL_ANALYSIS_SCHEMA = {
     "required": [
         "long_summary", "main_topic", "call_type", "qualification_status",
         "caller_intent", "why_called", "service_requested", "insurance", "location",
-        "outcome", "spam_robot", "spam_confidence", "qc_issue", "relevant_intent",
+        "outcome", "spam_robot", "spam_confidence", "qc_issue", "spam_reason",
+        "qualification_reason", "relevant_intent",
         "qualification_info_present", "location_or_eligibility_present", "clear_outcome",
         "two_way_conversation", "major_qc_issue", "speaker_segments"
     ],
@@ -915,14 +889,18 @@ MAIN TOPIC RULES:
 SPAM / ROBOT RULES:
 - Do NOT use exact phrase matching only.
 - Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
-- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, repeated press-0/press-9 scripts, Yelp business-listing sales/verification/optimization calls, and Yellow Pages business-listing/advertising/verification calls.
+- Treat Yelp or Yellow Pages calls as SPAM / ROBOT when the call is about selling, verifying, optimizing, updating, claiming, advertising, or promoting a business listing, especially when scripted or automated. A normal consumer saying they found the business through Yelp or Yellow Pages is NOT spam by itself.
 - Similar wording must be recognized even when the exact words differ.
+- If a Yelp/Yellow Pages caller is clearly a business-listing/advertising solicitation, include that in spam_reason and explain what the solicitation was about.
 - A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
 - Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
 - spam_confidence must reflect the strength of the evidence from 0-100.
 
 QUALIFICATION RULES:
 - Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
+- For Rehab & Addiction Treatment: if the caller clearly states Medicaid, Medicare, state/government/public insurance, treat the caller as NON-QUALIFIED for this network rule. If the caller clearly states private, employer, employee, commercial, group, PPO, HMO, EPO, POS, Blue Cross Blue Shield, Aetna, Cigna, UnitedHealthcare, Humana, or another clearly private/commercial plan, treat the insurance as a positive qualification signal.
+- Do not infer insurance type from the agent's question; it must come from the caller's response.
 - Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
 - Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
 
@@ -975,27 +953,67 @@ def _call_structured_analysis(client, prompt):
     return json.loads(content)
 
 
+def apply_deterministic_spam_rules(analysis, full_transcript):
+    """Apply high-confidence network spam rules after AI analysis.
+
+    This is intentionally conservative: directory names such as Yelp or Yellow Pages
+    are only treated as spam when the transcript also shows business-listing,
+    advertising, verification, optimization, or similar solicitation behavior.
+    """
+    text = str(full_transcript or "").lower()
+
+    directory_terms = ["yelp", "yellow pages", "yp.com"]
+    solicitation_terms = [
+        "business listing", "listing", "advertising", "advertise", "marketing",
+        "promote", "promotion", "verification", "verify your listing",
+        "update your listing", "claim your listing", "optimize", "optimization",
+        "profile", "visibility", "search ranking", "ranking", "lead generation",
+        "featured listing", "paid listing", "upgrade", "sales",
+    ]
+
+    directory_hit = any(term in text for term in directory_terms)
+    solicitation_hit = any(term in text for term in solicitation_terms)
+
+    # A directory name + business solicitation is a strong spam signal.
+    if directory_hit and solicitation_hit:
+        analysis["spam_robot"] = True
+        analysis["spam_confidence"] = max(int(analysis.get("spam_confidence", 0) or 0), 97)
+        current_reason = str(analysis.get("spam_reason", "") or "").strip()
+        directory_name = "Yelp" if "yelp" in text else "Yellow Pages"
+        forced_reason = f"{directory_name} business-listing/advertising solicitation"
+        analysis["spam_reason"] = forced_reason if not current_reason else f"{forced_reason}; {current_reason}"
+        analysis["call_type"] = "SPAM / ROBOT"
+        analysis["major_qc_issue"] = True
+        if not str(analysis.get("qc_issue", "") or "").strip():
+            analysis["qc_issue"] = "Business directory advertising or listing solicitation"
+
+    return analysis
+
+
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
-    if not GROQ_KEYS:
-        raise RuntimeError("No Groq API keys configured.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("Primary Groq API key is not configured.")
 
     prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
-    
-    # Try using round-robin with automatic fallback through the available key pool
-    last_error = None
-    for _ in range(len(GROQ_KEYS)):
-        current_key = get_next_groq_key()
+    primary_error = None
+
+    try:
+        analysis = _call_structured_analysis(Groq(api_key=GROQ_API_KEY), prompt)
+        analysis = apply_deterministic_spam_rules(analysis, full_transcript)
+    except Exception as primary_exc:
+        primary_error = primary_exc
+        if not GROQ_SECONDARY_API_KEY:
+            raise RuntimeError(f"Primary Groq analysis failed: {primary_exc}")
         try:
-            analysis = _call_structured_analysis(Groq(api_key=current_key), prompt)
-            break
-        except Exception as e:
-            last_error = e
-            continue
-    else:
-        raise RuntimeError(f"All Groq analysis accounts/keys failed. Last error: {last_error}")
+            analysis = _call_structured_analysis(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
+            analysis = apply_deterministic_spam_rules(analysis, full_transcript)
+        except Exception as secondary_exc:
+            raise RuntimeError(
+                f"Both Groq analysis accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
+            )
 
     if timeline_data is not None:
         speaker_map = {
@@ -1008,6 +1026,8 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     analysis["main_topic"] = str(analysis.get("main_topic", "")).replace("*", "").strip()
     analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
     analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
+    analysis["spam_reason"] = str(analysis.get("spam_reason", "")).replace("*", "").strip()
+    analysis["qualification_reason"] = str(analysis.get("qualification_reason", "")).replace("*", "").strip()
     return analysis
 
 
@@ -1055,8 +1075,8 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI summary.")
 
-    if not GROQ_KEYS:
-        raise RuntimeError("No Groq API keys configured.")
+    if not GROQ_API_KEY:
+        raise RuntimeError("Primary Groq API key is not configured.")
 
     campaign_family = get_campaign_category(campaign_name)
     prompt = f"""
@@ -1080,7 +1100,7 @@ LONG SUMMARY:
 - Never invent insurance, location, qualification, appointments, transfers, or outcomes.
 - An agent's question is NOT the caller's answer. Only treat information as caller-provided when the caller clearly states or confirms it.
 - If the caller did not respond, do not invent a reason for the call.
-- If the call is clearly an automated solicitation, summarize what it was promoting or asking the recipient to do.
+- If the call is clearly an automated solicitation, summarize what it was promoting or asking the recipient to do. Yelp business-listing/advertising/verification/optimization calls and Yellow Pages business-listing/advertising/verification calls should be treated as spam when they are soliciting the business rather than acting as a normal consumer.
 - No bullets, headings, markdown, filler, or comments about the quality of the conversation.
 - Keep the wording simple and human.
 
@@ -1088,17 +1108,19 @@ TRANSCRIPT:
 {full_transcript}
 """
 
-    last_error = None
-    for _ in range(len(GROQ_KEYS)):
-        current_key = get_next_groq_key()
+    primary_error = None
+    try:
+        result = _call_fast_summary(Groq(api_key=GROQ_API_KEY), prompt)
+    except Exception as primary_exc:
+        primary_error = primary_exc
+        if not GROQ_SECONDARY_API_KEY:
+            raise RuntimeError(f"Primary Groq fast summary failed: {primary_exc}")
         try:
-            result = _call_fast_summary(Groq(api_key=current_key), prompt)
-            break
-        except Exception as e:
-            last_error = e
-            continue
-    else:
-        raise RuntimeError(f"All Groq summary accounts/keys failed. Last error: {last_error}")
+            result = _call_fast_summary(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
+        except Exception as secondary_exc:
+            raise RuntimeError(
+                f"Both Groq summary accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
+            )
 
     main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
     long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
@@ -1116,32 +1138,129 @@ def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
     return generate_fast_summary_groq(full_transcript, campaign_name)
 
 
+def _clean_report_value(value, default="None"):
+    value = str(value or "").replace("|", "/").replace("\n", " ").strip()
+    return value if value else default
+
+
+def get_rehab_insurance_status(analysis):
+    """Classify Rehab insurance for deterministic qualification scoring."""
+    insurance = str(analysis.get("insurance", "") or "").strip().lower()
+    if not insurance:
+        return None
+
+    government_terms = [
+        "medicaid", "medicare", "state insurance", "state-funded",
+        "state funded", "government insurance", "government-funded",
+        "government funded", "government plan", "government program",
+        "public insurance", "public plan", "chip",
+    ]
+    if any(term in insurance for term in government_terms):
+        return "GOVERNMENT"
+
+    private_terms = [
+        "private", "employer", "employee", "commercial", "company insurance",
+        "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
+        "blue cross", "blue shield", "bcbs", "aetna", "cigna",
+        "unitedhealth", "united healthcare", "united", "humana",
+    ]
+    if any(term in insurance for term in private_terms):
+        return "PRIVATE"
+
+    return None
+
+
+def get_decision_signal(score, analysis):
+    """Convert the numeric score into a practical operations signal."""
+    spam = bool(analysis.get("spam_robot"))
+    spam_conf = int(analysis.get("spam_confidence", 0) or 0)
+    if spam and spam_conf >= 90:
+        return "REJECT / SPAM"
+    if score >= 90:
+        return "KEEP / HIGH VALUE"
+    if score >= 80:
+        return "KEEP / GOOD"
+    if score >= 60:
+        return "REVIEW"
+    if score >= 40:
+        return "LOW QUALITY / REVIEW"
+    return "REJECT / INVESTIGATE"
+
+
+def get_score_basis(analysis):
+    """Explain the deterministic score in compact terms for future decisions."""
+    items = []
+    if analysis.get("qualification_status") == "QUALIFIED":
+        items.append("Qualification +25")
+    elif analysis.get("qualification_status") == "NOT CLEAR" and analysis.get("relevant_intent"):
+        items.append("Relevant but unclear +10")
+    if str(analysis.get("service_requested", "")).strip():
+        items.append("Service +15")
+    if analysis.get("qualification_info_present"):
+        items.append("QualInfo +15")
+    if analysis.get("location_or_eligibility_present"):
+        items.append("Location +10")
+    if analysis.get("clear_outcome"):
+        items.append("Outcome +10")
+    if analysis.get("two_way_conversation"):
+        items.append("2Way +10")
+    if not analysis.get("spam_robot"):
+        items.append("NoSpam +5")
+    if not analysis.get("major_qc_issue"):
+        items.append("NoMajorQC +10")
+    return ", ".join(items) if items else "No positive score factors"
+
+
 def build_qc_report(analysis):
+    """Build a compact but decision-oriented report for future publisher/campaign analysis."""
+    score = analysis.get("quality_score")
+    if score is None:
+        score = calculate_call_quality_score(analysis)
+    decision = get_decision_signal(int(score), analysis)
+
+    qualification = _clean_report_value(analysis.get("qualification_status"))
+    qualification_reason = _clean_report_value(analysis.get("qualification_reason"))
+    spam_reason = _clean_report_value(analysis.get("spam_reason"))
+
     parts = [
-        f"Call Type: {analysis.get('call_type', 'OTHER')}",
-        f"Caller Intent: {analysis.get('caller_intent', '').strip()}",
-        f"Why They Called: {analysis.get('why_called', '').strip()}",
-        f"Treatment/Service Interest: {analysis.get('service_requested', '').strip()}",
+        f"Call Type: {_clean_report_value(analysis.get('call_type'), 'OTHER')}",
+        f"Caller Intent: {_clean_report_value(analysis.get('caller_intent'))}",
+        f"Why Called: {_clean_report_value(analysis.get('why_called'))}",
+        f"Service Interest: {_clean_report_value(analysis.get('service_requested'))}",
+        f"Qualification: {qualification}",
+        f"Qualification Reason: {qualification_reason}",
     ]
 
-    if analysis.get("insurance", "").strip():
-        parts.append(f"Insurance: {analysis['insurance'].strip()}")
-    if analysis.get("location", "").strip():
-        parts.append(f"Location: {analysis['location'].strip()}")
-    if analysis.get("outcome", "").strip():
-        parts.append(f"Outcome: {analysis['outcome'].strip()}")
+    if str(analysis.get("insurance", "")).strip():
+        parts.append(f"Insurance: {_clean_report_value(analysis.get('insurance'))}")
+    if str(analysis.get("location", "")).strip():
+        parts.append(f"Location: {_clean_report_value(analysis.get('location'))}")
+    if str(analysis.get("outcome", "")).strip():
+        parts.append(f"Outcome: {_clean_report_value(analysis.get('outcome'))}")
+
+    evidence = (
+        f"2Way={'YES' if analysis.get('two_way_conversation') else 'NO'}, "
+        f"QualInfo={'YES' if analysis.get('qualification_info_present') else 'NO'}, "
+        f"Location={'YES' if analysis.get('location_or_eligibility_present') else 'NO'}, "
+        f"Outcome={'YES' if analysis.get('clear_outcome') else 'NO'}"
+    )
 
     parts.extend([
         f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
-        f"Spam Confidence: {int(analysis.get('spam_confidence', 0))}%",
-        f"QC Issue: {analysis.get('qc_issue', '').strip() or 'None'}",
+        f"Spam Confidence: {int(analysis.get('spam_confidence', 0) or 0)}%",
+        f"Spam Reason: {spam_reason}",
+        f"QC Issue: {_clean_report_value(analysis.get('qc_issue'))}",
+        f"Evidence: {evidence}",
+        f"Decision Signal: {decision}",
+        f"Score Basis: {get_score_basis(analysis)}",
+        f"Quality Score: {int(score)}/100",
     ])
 
-    return " | ".join(part for part in parts if part.split(": ", 1)[-1].strip())
+    return " | ".join(parts)
 
 
 def calculate_call_quality_score(analysis):
-    """Deterministic 0-100 score. AI supplies facts; Python supplies the score."""
+    """Deterministic 0-100 score. AI supplies facts; Python supplies the final score."""
     score = 0
 
     qualification_status = analysis.get("qualification_status", "NOT CLEAR")
@@ -1150,7 +1269,7 @@ def calculate_call_quality_score(analysis):
     elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
         score += 10
 
-    if analysis.get("service_requested", "").strip():
+    if str(analysis.get("service_requested", "")).strip():
         score += 15
     if analysis.get("qualification_info_present"):
         score += 15
@@ -1167,17 +1286,28 @@ def calculate_call_quality_score(analysis):
 
     call_type = analysis.get("call_type", "OTHER")
     spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+    campaign_category = str(analysis.get("campaign_category", "") or "").strip()
 
+    # Strong spam is always a very low-quality call.
     if analysis.get("spam_robot") and spam_confidence >= 90:
         return 5
     if analysis.get("spam_robot"):
         return min(score, 25)
+
     if call_type == "WRONG NUMBER":
         return min(score, 30)
     if call_type == "SILENT / NO RESPONSE":
         return min(score, 15)
     if call_type in {"NON-QUALIFIED", "INFORMATION ONLY"}:
-        return min(score, 60)
+        score = min(score, 60)
+
+    # Business rule: Rehab calls using government/state insurance are not qualified.
+    # Keep the score as the single final source of row color, so this produces a
+    # yellow-range score rather than applying a separate row color.
+    if campaign_category == "Rehab & Addiction Treatment":
+        insurance_status = get_rehab_insurance_status(analysis)
+        if insurance_status == "GOVERNMENT":
+            score = min(score, 60)
 
     return max(0, min(100, score))
 
@@ -1206,151 +1336,14 @@ def get_score_color(score, analysis):
     return SCORE_COLORS["poor"]
 
 
-def _background_is_special(background):
-    if not background:
-        return False
-
-    color = background.get("rgbColor", background)
-    if not isinstance(color, dict):
-        return False
-
-    r = 1.0 if color.get("red") is None else float(color.get("red", 1.0))
-    g = 1.0 if color.get("green") is None else float(color.get("green", 1.0))
-    b = 1.0 if color.get("blue") is None else float(color.get("blue", 1.0))
-
-    # Treat plain/near-white as the normal background.
-    return not (r >= 0.97 and g >= 0.97 and b >= 0.97)
-
-
-def get_existing_special_columns(worksheet, start_row, end_row):
-    """Read user-entered background colors so existing VOIP/special colors survive score coloring."""
-    if end_row < start_row:
-        return {}
-
-    try:
-        metadata = worksheet.spreadsheet.fetch_sheet_metadata(
-            params={
-                "includeGridData": True,
-                "ranges": [f"'{worksheet.title}'!A{start_row}:L{end_row}"],
-                "fields": "sheets/data/startRow,sheets/data/rowData/values/userEnteredFormat/backgroundColor,sheets/data/rowData/values/userEnteredFormat/backgroundColorStyle",
-            }
-        )
-    except Exception:
-        return {}
-
-    special_by_row = {}
-
-    for sheet_data in metadata.get("sheets", []):
-        for grid_data in sheet_data.get("data", []):
-            base_row = int(grid_data.get("startRow", start_row - 1)) + 1
-            for offset, row_data in enumerate(grid_data.get("rowData", [])):
-                row_number = base_row + offset
-                special_columns = set()
-
-                for col_number, cell in enumerate(row_data.get("values", []), start=1):
-                    user_format = cell.get("userEnteredFormat", {})
-                    background = user_format.get("backgroundColor")
-                    background_style = user_format.get("backgroundColorStyle")
-                    if _background_is_special(background) or _background_is_special(background_style):
-                        special_columns.add(col_number)
-
-                special_by_row[row_number] = special_columns
-
-    return special_by_row
-
-
-def _column_letter(number):
-    result = ""
-    while number:
-        number, remainder = divmod(number - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
-
-
-def _contiguous_ranges_for_row(row_number, columns):
-    if not columns:
-        return []
-
-    columns = sorted(set(columns))
-    ranges = []
-    start_col = previous_col = columns[0]
-
-    for col in columns[1:]:
-        if col == previous_col + 1:
-            previous_col = col
-            continue
-
-        ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
-        start_col = previous_col = col
-
-    ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
-    return ranges
-
-
-def get_rehab_insurance_status(analysis):
-    """Classify Rehab insurance for row coloring. Returns GREEN, YELLOW, or None."""
-    insurance = str(analysis.get("insurance", "") or "").strip().lower()
-    if not insurance:
-        return None
-
-    # Government/state insurance = not qualified for the Rehab campaign.
-    government_terms = [
-        "medicaid", "medicare", "state insurance", "state-funded",
-        "state funded", "government insurance", "government-funded",
-        "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip", "medi-cal",
-    ]
-    if any(term in insurance for term in government_terms):
-        return "YELLOW"
-
-    # Private/employer/employee insurance = qualified/green for Rehab.
-    private_terms = [
-        "private", "employer", "employee", "commercial", "company insurance",
-        "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-    ]
-    if any(term in insurance for term in private_terms):
-        return "GREEN"
-
-    return None
-
-
-REHAB_INSURANCE_COLORS = {
-    "GREEN": {"red": 0.56, "green": 0.83, "blue": 0.60},
-    "YELLOW": {"red": 1.00, "green": 0.93, "blue": 0.60},
-}
-
-
 def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
-    """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
-    special_columns = set(special_columns or [])
+    """Apply the final score color to the ENTIRE A:L row. Score is authoritative."""
     color = get_score_color(score, analysis)
+    worksheet.format(
+        f"A{row_number}:L{row_number}",
+        {"backgroundColor": color}
+    )
 
-    high_confidence_spam = analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90
-
-    if high_confidence_spam:
-        worksheet.format(
-            f"A{row_number}:L{row_number}",
-            {"backgroundColor": SCORE_COLORS["spam"]}
-        )
-        return
-
-    campaign_category = str(analysis.get("campaign_category", "") or "").strip()
-    if campaign_category == "Rehab & Addiction Treatment":
-        rehab_status = get_rehab_insurance_status(analysis)
-        if rehab_status in REHAB_INSURANCE_COLORS:
-            insurance_color = REHAB_INSURANCE_COLORS[rehab_status]
-            columns_to_color = [col for col in range(1, 13) if col not in special_columns]
-            ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
-            if ranges:
-                worksheet.format(ranges, {"backgroundColor": insurance_color})
-            return
-
-    columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
-    ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
-    ranges.append(f"L{row_number}")
-
-    if ranges:
-        worksheet.format(ranges, {"backgroundColor": color})
 
 def save_uploaded_audio(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
@@ -1426,7 +1419,17 @@ def get_google_client():
 
 
 def sync_google_sheet_batch(default_campaign_name=""):
-    """Process Ringba recordings from the shared Google Sheet."""
+    """Process Ringba recordings from the shared Google Sheet.
+
+    Sheet layout:
+    D = Campaign
+    G = Long AI Summary
+    H = Main Topic / processing flag
+    I = Recording URL
+    J = Existing carrier / VOIP data (untouched)
+    K = AI QC Report
+    L = Numeric quality score
+    """
     try:
         gc = get_google_client()
         sheet = gc.open("Ringba to Sheet QC")
@@ -1435,17 +1438,13 @@ def sync_google_sheet_batch(default_campaign_name=""):
         rows = worksheet.get_all_values()
         processed_count = 0
 
-        if len(rows) > 1:
-            special_color_map = get_existing_special_columns(worksheet, 2, len(rows))
-        else:
-            special_color_map = {}
-
         for index, row in enumerate(rows[1:], start=2):
             raw_campaign = row[3].strip() if len(row) > 3 else ""
             raw_duration = row[5].strip() if len(row) > 5 else ""
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
 
+            # Keep the existing duration formatting behavior.
             if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
                 try:
                     worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
@@ -1453,6 +1452,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
                 except Exception:
                     pass
 
+            # Existing trigger stays: recording exists + H is empty.
             if not recording_url or not recording_url.startswith("http") or existing_main_topic:
                 continue
 
@@ -1474,8 +1474,9 @@ def sync_google_sheet_batch(default_campaign_name=""):
 
                 main_topic = analysis["main_topic"]
                 detailed_summary = analysis["long_summary"]
-                qc_report = build_qc_report(analysis)
                 score = calculate_call_quality_score(analysis)
+                analysis["quality_score"] = score
+                qc_report = build_qc_report(analysis)
 
                 worksheet.update_cell(index, 7, detailed_summary)  # G
                 worksheet.update_cell(index, 8, main_topic)        # H
@@ -1487,7 +1488,6 @@ def sync_google_sheet_batch(default_campaign_name=""):
                     index,
                     score,
                     analysis,
-                    special_color_map.get(index, set()),
                 )
 
                 processed_count += 1
