@@ -807,6 +807,7 @@ CALL_ANALYSIS_SCHEMA = {
             "type": "string",
             "enum": ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"]
         },
+        "qualification_reason": {"type": "string"},
         "caller_intent": {"type": "string"},
         "why_called": {"type": "string"},
         "service_requested": {"type": "string"},
@@ -815,37 +816,21 @@ CALL_ANALYSIS_SCHEMA = {
         "outcome": {"type": "string"},
         "spam_robot": {"type": "boolean"},
         "spam_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-        "qc_issue": {"type": "string"},
-        "relevant_intent": {"type": "boolean"},
-        "qualification_info_present": {"type": "boolean"},
-        "location_or_eligibility_present": {"type": "boolean"},
-        "clear_outcome": {"type": "boolean"},
-        "two_way_conversation": {"type": "boolean"},
-        "major_qc_issue": {"type": "boolean"},
-        "speaker_segments": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "segment_id": {"type": "integer"},
-                    "speaker": {"type": "string", "enum": ["Agent", "Caller", "Unknown"]}
-                },
-                "required": ["segment_id", "speaker"],
-                "additionalProperties": False
-            }
-        }
+        "spam_reason": {"type": "string"},
+        "qc_issue": {"type": "string"}
     },
     "required": [
         "long_summary", "main_topic", "call_type", "qualification_status",
-        "caller_intent", "why_called", "service_requested", "insurance", "location",
-        "outcome", "spam_robot", "spam_confidence", "qc_issue", "relevant_intent",
-        "qualification_info_present", "location_or_eligibility_present", "clear_outcome",
-        "two_way_conversation", "major_qc_issue", "speaker_segments"
+        "qualification_reason", "caller_intent", "why_called", "service_requested",
+        "insurance", "location", "outcome", "spam_robot", "spam_confidence",
+        "spam_reason", "qc_issue"
     ],
     "additionalProperties": False
 }
+```[cite: 3]
 
-
+#### 2. Updated `_analysis_prompt`
+```python
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     qc_questions = get_qc_questions(campaign_name)
 
@@ -867,110 +852,27 @@ CAMPAIGN FAMILY:
 CAMPAIGN QC GUIDANCE:
 {qc_questions}
 
-Your job is to analyze the complete transcript and return structured call information.
+Analyze the complete transcript and return structured call information.
 
-IMPORTANT SPEAKER RULE:
-Whisper provides transcript segments but does not reliably identify speakers. You must infer whether each numbered segment is from the Agent, Caller, or Unknown using the conversation context. The agent is usually the representative asking qualification questions, explaining services, pricing, scheduling, transferring, or giving instructions. The caller is the person seeking the service, asking for help, answering qualification questions, or describing their problem.
-An Agent question is NEVER the Caller answer. Never infer caller information from an agent question.
-If the speaker cannot be determined with reasonable confidence, use Unknown instead of guessing.
-
-LONG SUMMARY RULES:
-- Write a factual, useful 2-5 sentence summary in simple natural English.
-- Describe only what actually happened in the call.
-- Include the caller's real reason for calling, requested service, important qualification information, insurance when clearly stated by the caller, location when relevant, important agent/caller actions, and the actual outcome when supported.
-- Do not add filler such as "the conversation was natural" or "there were no obvious signs of a robot" unless that fact is itself relevant to QC.
-- Do not invent facts, outcomes, appointments, insurance, or caller intent.
-- If the caller was not looking for the campaign service, explain what they actually wanted instead of simply writing "irrelevant".
-- If it was a wrong number, say what the caller was trying to reach when clear.
-- If it was spam/robot, summarize what the automated call was promoting or asking the recipient to do.
-- Never turn an Agent's question into a Caller answer.
-- Do not include unnecessary personal information such as full phone numbers or addresses.
-
-MAIN TOPIC RULES:
-- One short sentence, normally 5-15 words.
-- Answer: "What was this caller actually calling about?"
-- Do not make SPAM / ROBOT the main topic unless the call itself was an automated solicitation or spam event. In that case, describe the actual subject, such as "Automated Google listing and SEO solicitation."
-- For unrelated calls, describe the actual request and make it clear that it was unrelated.
-
-SPAM / ROBOT RULES:
-- Do NOT use exact phrase matching only.
-- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
-- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
-- Similar wording must be recognized even when the exact words differ.
-- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
-- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
-- spam_confidence must reflect the strength of the evidence from 0-100.
-
-QUALIFICATION RULES:
-- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
-- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
-- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
-
-MISSING INFORMATION:
-For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
-
-CALL TYPE:
-- QUALIFIED: relevant and clearly qualified.
-- NON-QUALIFIED: relevant but clearly not qualified.
-- WRONG NUMBER: caller was trying to reach another person/business/service.
-- SPAM / ROBOT: automated/scripted spam or marketing call.
-- INFORMATION ONLY: caller wanted information but not the campaign service/action.
-- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
-- OTHER: anything else that does not fit the categories.
-
-QC ISSUE:
-Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
-
-Read the entire transcript before deciding.
+RULES:
+- Long Summary: Write a factual, useful 2-5 sentence summary in simple natural English. Describe what happened, caller intent, insurance/location if stated, and outcome.
+- Main Topic: One short sentence describing what the caller was calling about.
+- Call Type & Qualification: Categorize accurately based on campaign requirements. Fill in qualification_reason and spam_reason where applicable.
+- Missing Information: Use empty strings `""` for text fields if information was not discussed. Do not invent values.
 
 TRANSCRIPT:
 {transcript_for_ai}
 """
+```[cite: 3]
 
-
-def _call_structured_analysis(client, prompt):
-    response = client.chat.completions.create(
-        model=GROQ_SUMMARY_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "Return only the structured call-analysis object. Do not add commentary."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.1,
-        max_tokens=1400,
-        reasoning_effort="low",
-        reasoning_format="hidden",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "call_qc_analysis",
-                "strict": True,
-                "schema": CALL_ANALYSIS_SCHEMA
-            }
-        }
-    )
-
-    # TOKEN USAGE
-    if getattr(response, "usage", None):
-        print("========== GROQ TOKEN USAGE ==========")
-        print(f"Input tokens:  {response.usage.prompt_tokens}")
-        print(f"Output tokens: {response.usage.completion_tokens}")
-        print(f"Total tokens:  {response.usage.total_tokens}")
-        print("=======================================")
-
-    content = response.choices[0].message.content or "{}"
-    return json.loads(content)
-
-
+#### 3. Updated `generate_call_analysis_groq`
+```python
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
     prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
     
-    # 3-tier API Fallback Chain (Primary -> Secondary -> Tertiary)
     keys_to_try = [
         ("Primary", GROQ_API_KEY),
         ("Secondary", GROQ_SECONDARY_API_KEY),
@@ -992,178 +894,61 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     if analysis is None:
         raise RuntimeError(f"All Groq analysis API keys failed. Errors: {'; '.join(errors)}")
 
-    if timeline_data is not None:
-        speaker_map = {
-            int(item.get("segment_id")): item.get("speaker", "Unknown")
-            for item in analysis.get("speaker_segments", [])
-        }
-        for idx, item in enumerate(timeline_data, start=1):
-            item["speaker"] = speaker_map.get(idx, "Unknown")
-
     analysis["main_topic"] = str(analysis.get("main_topic", "")).replace("*", "").strip()
     analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
     analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
     return analysis
+```[cite: 3]
 
-
-FAST_SUMMARY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "main_topic": {"type": "string"},
-        "long_summary": {"type": "string"}
-    },
-    "required": ["main_topic", "long_summary"],
-    "additionalProperties": False
-}
-
-
-def _call_fast_summary(client, prompt):
-    """Small, fast AI request used only by the manual Transcriber UI."""
-    response = client.chat.completions.create(
-        model=GROQ_SUMMARY_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "Return only the requested two-field summary object. Do not add commentary."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.1,
-        max_tokens=300,  # Optimized token budget for low consumption
-        reasoning_effort="low",
-        reasoning_format="hidden",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "fast_call_summary",
-                "strict": True,
-                "schema": FAST_SUMMARY_SCHEMA
-            }
-        }
-    )
-    content = response.choices[0].message.content or "{}"
-    return json.loads(content)
-
-
-def generate_fast_summary_groq(full_transcript, campaign_name):
-    """Fast manual summary: only Main Topic + Long Summary with 3-tier key fallback."""
-    if not full_transcript.strip():
-        raise RuntimeError("No transcription text was available for AI summary.")
-
-    campaign_family = get_campaign_category(campaign_name)
-    prompt = f"""
-You are a fast call-summary assistant for a pay-per-call network.
-
-CAMPAIGN:
-{campaign_family}
-
-Create only two outputs from the transcript: a short Main Topic and a factual Long Summary. Keep it extremely concise to save tokens.
-
-MAIN TOPIC:
-- One short sentence, 5-10 words.
-- State what the caller was actually calling about.
-
-LONG SUMMARY:
-- Write 2 concise sentences.
-- Include the caller's actual reason for calling, requested service, and outcome.
-- Use only facts clearly supported by the transcript. No markdown.
-
-TRANSCRIPT:
-{full_transcript}
-"""
-
-    keys_to_try = [
-        ("Primary", GROQ_API_KEY),
-        ("Secondary", GROQ_SECONDARY_API_KEY),
-        ("Tertiary", GROQ_TERTIARY_API_KEY)
-    ]
-    
-    errors = []
-    result = None
-    
-    for label, key in keys_to_try:
-        if not key:
-            continue
-        try:
-            result = _call_fast_summary(Groq(api_key=key), prompt)
-            break
-        except Exception as e:
-            errors.append(f"{label}: {str(e)}")
-            
-    if result is None:
-        raise RuntimeError(f"All Groq summary API keys failed. Errors: {'; '.join(errors)}")
-
-    main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
-    long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
-
-    if not main_topic:
-        main_topic = "No clear main topic identified."
-    if not long_summary:
-        long_summary = "No summary could be generated from the transcript."
-
-    return main_topic, long_summary
-
-
-def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
-    """Compatibility wrapper for the existing UI; uses the fast summary path."""
-    return generate_fast_summary_groq(full_transcript, campaign_name)
-
-
-def build_qc_report(analysis):
-    parts = [
-        f"Call Type: {analysis.get('call_type', 'OTHER')}",
-        f"Caller Intent: {analysis.get('caller_intent', '').strip()}",
-        f"Why They Called: {analysis.get('why_called', '').strip()}",
-        f"Treatment/Service Interest: {analysis.get('service_requested', '').strip()}",
-    ]
-
-    if analysis.get("insurance", "").strip():
-        parts.append(f"Insurance: {analysis['insurance'].strip()}")
-    if analysis.get("location", "").strip():
-        parts.append(f"Location: {analysis['location'].strip()}")
-    if analysis.get("outcome", "").strip():
-        parts.append(f"Outcome: {analysis['outcome'].strip()}")
-
-    parts.extend([
-        f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
-        f"Spam Confidence: {int(analysis.get('spam_confidence', 0))}%",
-        f"QC Issue: {analysis.get('qc_issue', '').strip() or 'None'}",
-    ])
-
-    return " | ".join(part for part in parts if part.split(": ", 1)[-1].strip())
-
-
+#### 4. Updated Python-Side `calculate_call_quality_score`
+```python
 def calculate_call_quality_score(analysis):
-    """Deterministic 0-100 score. AI supplies facts; Python supplies the score."""
+    """Deterministic 0-100 score derived from compact AI outputs."""
     score = 0
 
     qualification_status = analysis.get("qualification_status", "NOT CLEAR")
+    caller_intent = str(analysis.get("caller_intent", "")).strip()
+    why_called = str(analysis.get("why_called", "")).strip()
+    service_requested = str(analysis.get("service_requested", "")).strip()
+    insurance = str(analysis.get("insurance", "")).strip()
+    location = str(analysis.get("location", "")).strip()
+    outcome = str(analysis.get("outcome", "")).strip()
+    call_type = analysis.get("call_type", "OTHER")
+    spam_robot = analysis.get("spam_robot", False)
+    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+    qc_issue = str(analysis.get("qc_issue", "")).strip()
+
+    # Derived flags for scoring
+    relevant_intent = bool(caller_intent or why_called) and call_type not in {"WRONG NUMBER", "SPAM / ROBOT"}
+    qualification_info_present = bool(analysis.get("qualification_reason") or service_requested or insurance)
+    location_or_eligibility_present = bool(location or insurance)
+    clear_outcome = bool(outcome)
+    two_way_conversation = call_type != "SILENT / NO RESPONSE"
+    major_qc_issue = bool(qc_issue) or (spam_robot and spam_confidence >= 80)
+
     if qualification_status == "QUALIFIED":
         score += 25
-    elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
+    elif qualification_status == "NOT CLEAR" and relevant_intent:
         score += 10
 
-    if analysis.get("service_requested", "").strip():
+    if service_requested:
         score += 15
-    if analysis.get("qualification_info_present"):
+    if qualification_info_present:
         score += 15
-    if analysis.get("location_or_eligibility_present"):
+    if location_or_eligibility_present:
         score += 10
-    if analysis.get("clear_outcome"):
+    if clear_outcome:
         score += 10
-    if analysis.get("two_way_conversation"):
+    if two_way_conversation:
         score += 10
-    if not analysis.get("spam_robot"):
+    if not spam_robot:
         score += 5
-    if not analysis.get("major_qc_issue"):
+    if not major_qc_issue:
         score += 10
 
-    call_type = analysis.get("call_type", "OTHER")
-    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
-
-    if analysis.get("spam_robot") and spam_confidence >= 90:
+    if spam_robot and spam_confidence >= 90:
         return 5
-    if analysis.get("spam_robot"):
+    if spam_robot:
         return min(score, 25)
     if call_type == "WRONG NUMBER":
         return min(score, 30)
@@ -1173,6 +958,7 @@ def calculate_call_quality_score(analysis):
         return min(score, 60)
 
     return max(0, min(100, score))
+```[cite: 3]
 
 
 SCORE_COLORS = {
