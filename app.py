@@ -913,6 +913,25 @@ TRANSCRIPT:
 """
 
 #### 3. Updated `generate_call_analysis_groq`
+def _call_structured_analysis(client, prompt):
+    """Helper function to call Groq API using the openai/gpt-oss-20b model."""
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {
+                "role": "system", 
+                "content": "You are a precise data extraction and call-analysis engine. You must output valid JSON matching the requested schema precisely."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1
+    )
+    
+    content = response.choices[0].message.content
+    return json.loads(content)
+
+
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
