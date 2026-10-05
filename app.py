@@ -930,29 +930,38 @@ TRANSCRIPT:
 
 def _call_structured_analysis(client, prompt):
     response = client.chat.completions.create(
-        model=GROQ_SUMMARY_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "Return only the structured call-analysis object. Do not add commentary."
-            },
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.1,
-        max_tokens=4000,  # Optimized token budget
-        reasoning_effort="low",
-        reasoning_format="hidden",
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-                "name": "call_qc_analysis",
-                "strict": True,
-                "schema": CALL_ANALYSIS_SCHEMA
-            }
+    model=GROQ_SUMMARY_MODEL,
+    messages=[
+        {
+            "role": "system",
+            "content": "Return only the structured call-analysis object. Do not add commentary."
+        },
+        {"role": "user", "content": prompt}
+    ],
+    temperature=0.1,
+    max_tokens=1400,
+    reasoning_effort="low",
+    reasoning_format="hidden",
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "call_qc_analysis",
+            "strict": True,
+            "schema": CALL_ANALYSIS_SCHEMA
         }
-    )
-    content = response.choices[0].message.content or "{}"
-    return json.loads(content)
+    }
+)
+
+# TOKEN USAGE
+if getattr(response, "usage", None):
+    print("========== GROQ TOKEN USAGE ==========")
+    print(f"Input tokens:  {response.usage.prompt_tokens}")
+    print(f"Output tokens: {response.usage.completion_tokens}")
+    print(f"Total tokens:  {response.usage.total_tokens}")
+    print("=======================================")
+
+content = response.choices[0].message.content or "{}"
+return json.loads(content)
 
 
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
