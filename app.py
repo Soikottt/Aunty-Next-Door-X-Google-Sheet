@@ -1189,7 +1189,7 @@ def get_rehab_insurance_status(analysis):
         "medicaid", "medicare", "state insurance", "state-funded",
         "state funded", "government insurance", "government-funded",
         "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip",
+        "public insurance", "public plan", "chip", "medi-cal",
     ]
     if any(term in insurance for term in government_terms):
         return "GOVERNMENT"
@@ -1197,8 +1197,6 @@ def get_rehab_insurance_status(analysis):
     private_terms = [
         "private", "employer", "employee", "commercial", "company insurance",
         "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-        "blue cross", "blue shield", "bcbs", "aetna", "cigna",
-        "unitedhealth", "united healthcare", "united", "humana",
     ]
     if any(term in insurance for term in private_terms):
         return "PRIVATE"
