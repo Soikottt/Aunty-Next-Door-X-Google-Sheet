@@ -829,7 +829,6 @@ CALL_ANALYSIS_SCHEMA = {
 }
 
 #### 2. Updated `_analysis_prompt`
-```python
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     qc_questions = get_qc_questions(campaign_name)
 
@@ -914,7 +913,6 @@ TRANSCRIPT:
 """
 
 #### 3. Updated `generate_call_analysis_groq`
-```python
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
@@ -949,7 +947,6 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
 ```
 
 #### 4. Updated Python-Side `calculate_call_quality_score`
-```python
 def calculate_call_quality_score(analysis):
     """Deterministic 0-100 score derived from compact AI outputs."""
     score = 0
