@@ -172,41 +172,44 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
 # API keys are intentionally NOT stored in this source file.
-# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
-# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
-# Old secret names are also supported for compatibility.
+#
+# Active priority:
+# 1. GROQ_API_KEY
+# 2. GROQ_SECONDARY_API_KEY
+# 3. GROQ_API_KEY_3
+#
+# These are read from Streamlit Secrets / environment variables.
+
 
 def _discover_groq_keys():
-    """Primary first, then secondary, then any other Groq key found in Secrets/env (tertiary, etc.)."""
+    """Discover Groq API keys in fixed priority order."""
     found = []
 
-    def add(value, require_prefix=False):
+    def add(value):
         value = str(value or "").strip()
-        if value and value not in found and (not require_prefix or value.startswith("gsk_")):
+        if value and value not in found:
             found.append(value)
 
-    add(get_secret("Aunty_NEXT_DOOR_API_PRIMARY") or get_secret("GROQ_API_KEY"))
-    add(get_secret("GROQ_API_KEY_SECONDARY_2") or get_secret("GROQ_SECONDARY_API_KEY"))
+    # --------------------------------------------------------
+    # Fixed priority: Primary → Secondary → Tertiary
+    # --------------------------------------------------------
+    add(get_secret("GROQ_API_KEY"))
+    add(get_secret("GROQ_SECONDARY_API_KEY"))
+    add(get_secret("GROQ_API_KEY_3"))
 
-    names = set(os.environ.keys())
-    try:
-        names |= set(st.secrets.keys())
-    except Exception:
-        pass
-    for name in sorted(names):
-        upper = name.upper()
-        if ("GROQ" in upper and "KEY" in upper) or upper.startswith("AUNTY_NEXT_DOOR_API"):
-            add(get_secret(name), require_prefix=True)
     return found
 
 
 GROQ_API_KEYS = _discover_groq_keys()
-GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+
+# Individual keys for compatibility with existing code
+GROQ_API_KEY = GROQ_API_KEYS[0] if len(GROQ_API_KEYS) > 0 else ""
 GROQ_SECONDARY_API_KEY = GROQ_API_KEYS[1] if len(GROQ_API_KEYS) > 1 else ""
+GROQ_TERTIARY_API_KEY = GROQ_API_KEYS[2] if len(GROQ_API_KEYS) > 2 else ""
 
 if not GROQ_API_KEY:
     st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
-
+    
 
 # ============================================================
 # ACTIVE SESSION STORAGE
