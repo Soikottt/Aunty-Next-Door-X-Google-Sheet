@@ -118,71 +118,6 @@ def format_seconds_to_hms(total_seconds_str):
     except Exception:
         return str(total_seconds_str)
 
-def background_sheet_watcher():
-    """Continuously watches Ringba to Sheet QC for new recordings."""
-    # Give the Streamlit script time to finish defining the processing functions.
-    time.sleep(8)
-
-    while True:
-        try:
-            gc = get_google_client()
-            sheet = gc.open("Ringba to Sheet QC")
-            worksheet = sheet.worksheet("Sheet1")
-            rows = worksheet.get_all_values()
-
-            special_color_map = get_existing_special_columns(worksheet, 2, len(rows)) if len(rows) > 1 else {}
-
-            for index, row in enumerate(rows[1:], start=2):
-                raw_duration = row[5].strip() if len(row) > 5 else ""
-                raw_campaign = row[3].strip() if len(row) > 3 else ""
-                recording_url = row[8].strip() if len(row) > 8 else ""
-                existing_main_topic = row[7].strip() if len(row) > 7 else ""
-
-                if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
-                    try:
-                        worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
-                    except Exception:
-                        pass
-
-                if not raw_campaign or not recording_url or not recording_url.startswith("http") or existing_main_topic:
-                    continue
-
-                try:
-                    campaign_name = get_campaign_category(raw_campaign)
-                    load_audio_url(recording_url)
-                    timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
-                    full_transcript_str = " ".join(raw_text_segments).strip()
-
-                    analysis = generate_call_analysis_groq(
-                        full_transcript_str,
-                        campaign_name,
-                        timeline_data=timeline_data,
-                    )
-                    score = calculate_call_quality_score(analysis)
-
-                    worksheet.update_cell(index, 7, analysis["long_summary"])
-                    worksheet.update_cell(index, 8, analysis["main_topic"])
-                    worksheet.update_cell(index, 11, build_qc_report(analysis))
-                    worksheet.update_cell(index, 12, score)
-                    apply_row_score_color(worksheet, index, score, analysis, special_color_map.get(index, set()))
-                except Exception as err:
-                    try:
-                        worksheet.update_cell(index, 7, f"Processing error: {str(err)}")
-                        worksheet.update_cell(index, 11, f"Processing error: {str(err)}")
-                    except Exception:
-                        pass
-
-        except Exception:
-            pass
-
-        time.sleep(30)
-
-if "worker_started" not in st.session_state:
-    st.session_state.worker_started = True
-    t = threading.Thread(target=background_sheet_watcher, daemon=True)
-    t.start()
-
-
 # ============================================================
 # DATABASE & AUTHENTICATION SETUP (SQLite)
 # ============================================================
@@ -1330,6 +1265,41 @@ def _contiguous_ranges_for_row(row_number, columns):
     return ranges
 
 
+def get_rehab_insurance_status(analysis):
+    """Classify Rehab insurance for row coloring. Returns GREEN, YELLOW, or None."""
+    insurance = str(analysis.get("insurance", "") or "").strip().lower()
+    if not insurance:
+        return None
+
+    # Government/state insurance = not qualified for the Rehab campaign.
+    government_terms = [
+        "medicaid", "medicare", "state insurance", "state-funded",
+        "state funded", "government insurance", "government-funded",
+        "government funded", "government plan", "government program",
+        "public insurance", "public plan", "chip",
+    ]
+    if any(term in insurance for term in government_terms):
+        return "YELLOW"
+
+    # Private/employer/employee insurance = qualified/green for Rehab.
+    private_terms = [
+        "private", "employer", "employee", "commercial", "company insurance",
+        "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
+        "blue cross", "blue shield", "bcbs", "aetna", "cigna",
+        "unitedhealth", "united healthcare", "united", "humana",
+    ]
+    if any(term in insurance for term in private_terms):
+        return "GREEN"
+
+    return None
+
+
+REHAB_INSURANCE_COLORS = {
+    "GREEN": {"red": 0.56, "green": 0.83, "blue": 0.60},
+    "YELLOW": {"red": 1.00, "green": 0.93, "blue": 0.60},
+}
+
+
 def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
     """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
     special_columns = set(special_columns or [])
@@ -1343,6 +1313,20 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
             {"backgroundColor": SCORE_COLORS["spam"]}
         )
         return
+
+    # Rehab insurance has a business rule that takes priority over the normal
+    # score colors: government/state insurance = yellow (not qualified),
+    # private/employer insurance = green.
+    campaign_category = str(analysis.get("campaign_category", "") or "").strip()
+    if campaign_category == "Rehab & Addiction Treatment":
+        rehab_status = get_rehab_insurance_status(analysis)
+        if rehab_status in REHAB_INSURANCE_COLORS:
+            insurance_color = REHAB_INSURANCE_COLORS[rehab_status]
+            columns_to_color = [col for col in range(1, 13) if col not in special_columns]
+            ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
+            if ranges:
+                worksheet.format(ranges, {"backgroundColor": insurance_color})
+            return
 
     # L (score) always gets the score color, even if it previously had a color.
     columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
@@ -1482,6 +1466,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
                     campaign_to_use,
                     timeline_data=timeline_data,
                 )
+                analysis["campaign_category"] = campaign_to_use
 
                 main_topic = analysis["main_topic"]
                 detailed_summary = analysis["long_summary"]
