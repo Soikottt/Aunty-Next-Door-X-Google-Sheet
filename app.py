@@ -827,7 +827,6 @@ CALL_ANALYSIS_SCHEMA = {
     ],
     "additionalProperties": False
 }
-```[cite: 3]
 
 #### 2. Updated `_analysis_prompt`
 ```python
@@ -913,7 +912,6 @@ Read the entire transcript before deciding.
 TRANSCRIPT:
 {transcript_for_ai}
 """
-```[cite: 3]
 
 #### 3. Updated `generate_call_analysis_groq`
 ```python
@@ -948,7 +946,7 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
     analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
     return analysis
-```[cite: 3]
+```
 
 #### 4. Updated Python-Side `calculate_call_quality_score`
 ```python
@@ -1008,7 +1006,7 @@ def calculate_call_quality_score(analysis):
         return min(score, 60)
 
     return max(0, min(100, score))
-```[cite: 3]
+```
 
 
 SCORE_COLORS = {
