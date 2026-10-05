@@ -1,12 +1,6 @@
-import sqlite3
-import hashlib
-import hmac
-import secrets
 import ipaddress
 import socket
 import logging
-from contextlib import contextmanager
-from datetime import datetime, timedelta
 import json
 import os
 import re
@@ -17,9 +11,6 @@ import time
 import urllib.request
 import urllib.parse
 import html
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -103,251 +94,6 @@ def format_seconds_to_hms(total_seconds_str):
         return str(total_seconds_str)
 
 
-# ============================================================
-# DATABASE & AUTHENTICATION SETUP (SQLite)
-# ============================================================
-
-DB_PATH = Path(get_secret("USERS_DB_PATH", "users.db"))
-
-SMTP_SERVER = get_secret("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = _get_int_setting("SMTP_PORT", 587)
-SMTP_EMAIL = get_secret("SMTP_EMAIL", "")
-SMTP_PASSWORD = get_secret("SMTP_PASSWORD", "")
-
-AUTO_APPROVE_SIGNUPS = get_secret("AUTO_APPROVE_SIGNUPS", "0").strip().lower() in {"1", "true", "yes"}
-
-MIN_PASSWORD_LENGTH = 8
-MAX_FAILED_LOGINS = 5
-LOCKOUT_MINUTES = 15
-PBKDF2_ITERATIONS = 310_000
-
-
-@contextmanager
-def db():
-    """Open a SQLite connection that commits on success, rolls back on error, and always closes."""
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-# ---------- password helpers ----------
-
-def hash_password(password: str) -> str:
-    """Salted PBKDF2-SHA256 hash."""
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
-
-
-def is_legacy_hash(stored: str) -> bool:
-    return bool(stored) and not stored.startswith("pbkdf2_sha256$")
-
-
-def verify_password(password: str, stored: str) -> bool:
-    if not stored:
-        return False
-    if stored.startswith("pbkdf2_sha256$"):
-        try:
-            _, iterations, salt_hex, digest_hex = stored.split("$")
-            digest = hashlib.pbkdf2_hmac(
-                "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
-            )
-            return hmac.compare_digest(digest.hex(), digest_hex)
-        except (ValueError, TypeError):
-            return False
-    legacy = hashlib.sha256(password.encode()).hexdigest()
-    return hmac.compare_digest(legacy, stored)
-
-
-def validate_password(password: str):
-    if len(password or "") < MIN_PASSWORD_LENGTH:
-        return False, f"Password must be at least {MIN_PASSWORD_LENGTH} characters long."
-    return True, ""
-
-
-def validate_email(email: str) -> bool:
-    email = (email or "").strip()
-    if " " in email or email.count("@") != 1:
-        return False
-    local, domain = email.split("@")
-    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
-
-
-# ---------- schema ----------
-
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                is_admin INTEGER DEFAULT 0,
-                is_approved INTEGER DEFAULT 1
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS login_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL,
-                attempted_at REAL NOT NULL
-            )
-        """)
-
-        c.execute("PRAGMA table_info(users)")
-        user_cols = [col[1] for col in c.fetchall()]
-        if "is_admin" not in user_cols:
-            c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-        if "is_approved" not in user_cols:
-            c.execute("ALTER TABLE users ADD COLUMN is_approved INTEGER DEFAULT 1")
-
-        c.execute("SELECT COUNT(*) FROM users")
-        if c.fetchone()[0] == 0:
-            admin_email = get_secret("ADMIN_EMAIL", "admin@domain.com").lower().strip()
-            admin_password = get_secret("ADMIN_PASSWORD", "")
-            generated = False
-            if len(admin_password) < MIN_PASSWORD_LENGTH:
-                admin_password = secrets.token_urlsafe(12)
-                generated = True
-            c.execute(
-                "INSERT INTO users (name, email, password_hash, is_admin, is_approved) VALUES (?, ?, ?, 1, 1)",
-                ("System Admin", admin_email, hash_password(admin_password)),
-            )
-            if generated:
-                logger.warning(
-                    "FIRST-RUN ADMIN CREATED. Email: %s | Temporary password: %s | "
-                    "Set ADMIN_EMAIL and ADMIN_PASSWORD in Secrets to choose your own.",
-                    admin_email, admin_password,
-                )
-            else:
-                logger.info("First-run admin created for %s", admin_email)
-
-
-# ---------- login throttling ----------
-
-def _failed_login_count(email_clean: str) -> int:
-    cutoff = time.time() - LOCKOUT_MINUTES * 60
-    with db() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM login_attempts WHERE email = ? AND attempted_at > ?",
-            (email_clean, cutoff),
-        ).fetchone()
-    return row[0] if row else 0
-
-
-def record_failed_login(email_clean: str):
-    now = time.time()
-    with db() as conn:
-        conn.execute("INSERT INTO login_attempts (email, attempted_at) VALUES (?, ?)", (email_clean, now))
-        conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (now - LOCKOUT_MINUTES * 60,))
-
-
-def clear_failed_logins(email_clean: str):
-    with db() as conn:
-        conn.execute("DELETE FROM login_attempts WHERE email = ?", (email_clean,))
-
-
-# ---------- users ----------
-
-def register_user(name: str, email: str, password: str, is_admin: int = 0, is_approved: int = 1):
-    name = (name or "").strip()
-    email_clean = (email or "").lower().strip()
-
-    if not name:
-        return False, "Please enter your name."
-    if not validate_email(email_clean):
-        return False, "Please enter a valid email address."
-    ok, msg = validate_password(password)
-    if not ok:
-        return False, msg
-
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO users (name, email, password_hash, is_admin, is_approved) VALUES (?, ?, ?, ?, ?)",
-                (name, email_clean, hash_password(password), int(is_admin), int(is_approved)),
-            )
-    except sqlite3.IntegrityError:
-        return False, "An account with this email already exists."
-
-    if is_approved:
-        return True, "Account created successfully! Please log in."
-    return True, "Account created! An admin needs to approve it before you can log in."
-
-
-def authenticate_user(email: str, password: str):
-    """Returns (user_dict, "") on success or (None, error_message) on failure."""
-    email_clean = (email or "").lower().strip()
-
-    if _failed_login_count(email_clean) >= MAX_FAILED_LOGINS:
-        return None, f"Too many failed attempts. Please try again in {LOCKOUT_MINUTES} minutes."
-
-    with db() as conn:
-        row = conn.execute(
-            "SELECT id, name, email, is_admin, password_hash, is_approved FROM users WHERE lower(email) = ?",
-            (email_clean,),
-        ).fetchone()
-
-        if not row or not verify_password(password, row[4]):
-            failed = True
-        else:
-            failed = False
-            if is_legacy_hash(row[4]):
-                conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(password), row[0]))
-
-    if failed:
-        record_failed_login(email_clean)
-        return None, "Invalid email or password."
-
-    if not row[5]:
-        return None, "Your account is waiting for admin approval."
-
-    clear_failed_logins(email_clean)
-    return {"id": row[0], "name": row[1], "email": row[2], "is_admin": bool(row[3])}, ""
-
-
-def get_user_by_id(user_id: int):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT id, name, email, is_admin, is_approved FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-    if not row:
-        return None
-    return {"id": row[0], "name": row[1], "email": row[2], "is_admin": bool(row[3]), "is_approved": bool(row[4])}
-
-
-def update_user_profile(user_id: int, new_name: str, new_email: str):
-    new_name = (new_name or "").strip()
-    email_clean = (new_email or "").lower().strip()
-
-    if not new_name:
-        return False, "Name cannot be empty."
-    if not validate_email(email_clean):
-        return False, "Please enter a valid email address."
-
-    try:
-        with db() as conn:
-            conn.execute(
-                "UPDATE users SET name = ?, email = ? WHERE id = ?",
-                (new_name, email_clean, user_id),
-            )
-    except sqlite3.IntegrityError:
-        return False, "Email address is already in use by another account."
-    return True, "Profile updated successfully!"
-
-
-init_db()
-
-
 def render_html(content):
     st.html(textwrap.dedent(content))
 
@@ -425,8 +171,13 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # ============================================================
 # GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
+# API keys are intentionally NOT stored in this source file.
+# Primary preferred secret: Aunty_NEXT_DOOR_API_PRIMARY
+# Secondary preferred secret: GROQ_API_KEY_SECONDARY_2
+# Old secret names are also supported for compatibility.
 
 def _discover_groq_keys():
+    """Primary first, then secondary, then any other Groq key found in Secrets/env (tertiary, etc.)."""
     found = []
 
     def add(value, require_prefix=False):
@@ -462,7 +213,6 @@ if not GROQ_API_KEY:
 # ============================================================
 
 DEFAULT_SESSION = {
-    "logged_in_user": None,
     "current_view": "transcriber",
     "theme_mode": "dark",
     "source_name": "No file loaded",
@@ -765,11 +515,14 @@ def transcribe_groq_whisper(audio_file_path):
 # ------------------------------------------------------------
 # AI CALL ANALYSIS (token-optimised)
 # ------------------------------------------------------------
+# Token budget per call is roughly: ~450 instruction tokens + ~250 schema tokens
+# + transcript (capped) + <=800 output tokens.  Typical total: 2,000-4,500 tokens.
 
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
-MAX_TRANSCRIPT_CHARS = _get_int_setting("MAX_TRANSCRIPT_CHARS", 9000)
+MAX_TRANSCRIPT_CHARS = _get_int_setting("MAX_TRANSCRIPT_CHARS", 9000)   # ~2,200 tokens
 ANALYSIS_MAX_OUTPUT_TOKENS = _get_int_setting("ANALYSIS_MAX_OUTPUT_TOKENS", 800)
-MIN_WORDS_FOR_AI = 12
+MIN_WORDS_FOR_AI = 12   # shorter transcripts are handled without calling the AI at all
+# Set USE_FULL_QC_QUESTIONS=1 to send your long original QC question text instead of the compact guidance.
 USE_FULL_QC_QUESTIONS = get_secret("USE_FULL_QC_QUESTIONS", "0").strip().lower() in {"1", "true", "yes"}
 
 ANALYSIS_GUIDANCE = {
@@ -846,6 +599,7 @@ def _build_schema(include_speakers):
 
 
 def _shorten_transcript(text):
+    """Keep the opening and the ending of very long calls; that is where QC facts usually are."""
     text = text.strip()
     if len(text) <= MAX_TRANSCRIPT_CHARS:
         return text
@@ -902,6 +656,7 @@ def _call_structured_analysis(client, prompt, schema):
 
 
 def _trivial_analysis(text):
+    """Calls with (almost) no speech do not need an AI call at all."""
     text = text.strip()
     if text:
         summary = f'The call had almost no speech. The transcript only shows: "{text}".'
@@ -923,6 +678,7 @@ def _trivial_analysis(text):
 
 
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None, include_speakers=False):
+    """include_speakers=True labels each transcript line Agent/Caller (UI only; costs a few extra tokens)."""
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
@@ -976,6 +732,7 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
 
 
 def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
+    """Compatibility wrapper for the existing UI: returns (main_topic, long_summary)."""
     analysis = generate_call_analysis_groq(
         full_transcript,
         get_campaign_category(campaign_name),
@@ -1010,6 +767,7 @@ def build_qc_report(analysis):
 
 
 def calculate_call_quality_score(analysis):
+    """Deterministic 0-100 score. AI supplies facts; Python supplies the score."""
     score = 0
 
     qualification_status = analysis.get("qualification_status", "NOT CLEAR")
@@ -1086,10 +844,12 @@ def _background_is_special(background):
     g = 1.0 if color.get("green") is None else float(color.get("green", 1.0))
     b = 1.0 if color.get("blue") is None else float(color.get("blue", 1.0))
 
+    # Treat plain/near-white as the normal background.
     return not (r >= 0.97 and g >= 0.97 and b >= 0.97)
 
 
 def get_existing_special_columns(worksheet, start_row, end_row):
+    """Read user-entered background colors so existing VOIP/special colors survive score coloring."""
     if end_row < start_row:
         return {}
 
@@ -1154,6 +914,7 @@ def _contiguous_ranges_for_row(row_number, columns):
 
 
 def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
+    """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
     special_columns = set(special_columns or [])
     color = get_score_color(score, analysis)
 
@@ -1166,6 +927,7 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
         )
         return
 
+    # L (score) always gets the score color, even if it previously had a color.
     columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
     ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
     ranges.append(f"L{row_number}")
@@ -1173,12 +935,12 @@ def apply_row_score_color(worksheet, row_number, score, analysis, special_column
     if ranges:
         worksheet.format(ranges, {"backgroundColor": color})
 
-
 ALLOWED_AUDIO_EXTS = {".mp3", ".wav"}
 UPLOAD_MAX_AGE_SEC = 6 * 3600
 
 
 def cleanup_old_uploads(max_age_sec=UPLOAD_MAX_AGE_SEC):
+    """Delete old audio files so the uploads folder cannot fill the disk."""
     cutoff = time.time() - max_age_sec
     try:
         for file in UPLOAD_DIR.iterdir():
@@ -1192,6 +954,7 @@ def cleanup_old_uploads(max_age_sec=UPLOAD_MAX_AGE_SEC):
 
 
 def _host_is_public(hostname):
+    """True only if every address the hostname resolves to is a public IP."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
@@ -1217,6 +980,10 @@ def validate_audio_url(url):
 
 
 def download_audio(url):
+    """Download a recording to uploads/. Pure function: no Streamlit session state, safe for threads.
+
+    Returns (Path, original_filename). The caller is responsible for deleting the file.
+    """
     url = (url or "").strip()
     if not url:
         raise ValueError("URL is required.")
@@ -1294,6 +1061,7 @@ def save_uploaded_audio(uploaded_file):
 
 
 def load_audio_url(url):
+    """Interactive (UI) loader: downloads the recording and stores it in the user's session."""
     path, filename = download_audio(url)
 
     try:
@@ -1317,6 +1085,7 @@ def load_audio_url(url):
 
 
 def get_google_client():
+    """Connect to Google Sheets using the local service account or Streamlit Secrets."""
     if os.path.exists("service_account.json"):
         return gspread.service_account(filename="service_account.json")
 
@@ -1340,6 +1109,11 @@ def _chunks(items, size):
 
 
 def _process_sheet_locked(shared, fallback_campaign):
+    """One pass over the sheet. Caller must hold shared['lock'].
+
+    fallback_campaign: campaign to use for rows with a blank Campaign cell.
+    None means rows without a campaign are skipped (background worker behaviour).
+    """
     attempts = shared["attempts"]
     gc = get_google_client()
     worksheet = gc.open(SHEET_NAME).worksheet(WORKSHEET_NAME)
@@ -1348,6 +1122,7 @@ def _process_sheet_locked(shared, fallback_campaign):
     if len(rows) < 2:
         return 0
 
+    # 1) Duration cleanup (seconds -> H:MM:SS) in batched writes instead of one call per cell.
     duration_updates = []
     pending = []
 
@@ -1387,6 +1162,7 @@ def _process_sheet_locked(shared, fallback_campaign):
     processed = 0
 
     for index, recording_url, campaign_name in pending:
+        # Re-read the row: if someone sorted/inserted rows meanwhile, do not write into the wrong row.
         try:
             current = worksheet.row_values(index)
         except Exception as exc:
@@ -1398,6 +1174,7 @@ def _process_sheet_locked(shared, fallback_campaign):
         if current_url != recording_url or current_topic:
             continue
 
+        # Claim the row so nothing else picks it up.
         try:
             worksheet.update_cell(index, 8, PROCESSING_MARKER)
         except Exception as exc:
@@ -1438,7 +1215,7 @@ def _process_sheet_locked(shared, fallback_campaign):
             shared["paused_until"] = time.time() + wait
             logger.warning("Groq limit reached; pausing the sheet worker for ~%s min", int(wait // 60))
             try:
-                worksheet.update_cell(index, 8, "")
+                worksheet.update_cell(index, 8, "")  # release the claim; NOT an error, retried after the pause
             except Exception as write_exc:
                 logger.warning("Could not release row %s: %s", index, write_exc)
             break
@@ -1449,6 +1226,7 @@ def _process_sheet_locked(shared, fallback_campaign):
             error_text = f"Processing error: {exc}"
             try:
                 if count >= MAX_ROW_ATTEMPTS:
+                    # Give up so the row is not retried (and billed) forever.
                     worksheet.batch_update(
                         [
                             {"range": f"G{index}:H{index}", "values": [[error_text, ERROR_MARKER]]},
@@ -1458,7 +1236,7 @@ def _process_sheet_locked(shared, fallback_campaign):
                     )
                     attempts.pop(recording_url, None)
                 else:
-                    worksheet.update_cell(index, 8, "")
+                    worksheet.update_cell(index, 8, "")  # release the claim; retried on the next cycle
             except Exception as write_exc:
                 logger.warning("Could not record error for row %s: %s", index, write_exc)
         finally:
@@ -1471,6 +1249,7 @@ def _process_sheet_locked(shared, fallback_campaign):
 
 
 def process_sheet_once(shared, fallback_campaign=None, blocking=False):
+    """Run one pass if nobody else is. Returns (processed_count, state) with state 'ok', 'busy' or 'paused'."""
     if shared.get("paused_until", 0) > time.time():
         return 0, "paused"
     if not shared["lock"].acquire(blocking=blocking):
@@ -1482,6 +1261,7 @@ def process_sheet_once(shared, fallback_campaign=None, blocking=False):
 
 
 def _clear_stale_claims(shared):
+    """If the app crashed mid-row, a 'Processing...' marker can be left behind. Clear them on startup."""
     with shared["lock"]:
         worksheet = get_google_client().open(SHEET_NAME).worksheet(WORKSHEET_NAME)
         column_h = worksheet.col_values(8)
@@ -1496,6 +1276,7 @@ def _clear_stale_claims(shared):
 
 
 def background_sheet_watcher(shared):
+    """Continuously watches the Ringba sheet for new recordings."""
     time.sleep(5)
 
     try:
@@ -1513,6 +1294,7 @@ def background_sheet_watcher(shared):
 
 @st.cache_resource
 def start_background_worker():
+    """Starts exactly ONE watcher thread per server process (not one per browser session)."""
     shared = {"lock": threading.Lock(), "attempts": {}}
     thread = threading.Thread(
         target=background_sheet_watcher, args=(shared,), daemon=True, name="sheet-watcher"
@@ -1522,6 +1304,17 @@ def start_background_worker():
 
 
 def sync_google_sheet_batch(default_campaign_name=""):
+    """Process Ringba recordings from the shared Google Sheet (manual button).
+
+    Sheet layout:
+    D = Campaign
+    G = Long AI Summary
+    H = Main Topic / processing flag
+    I = Recording URL
+    J = Existing carrier / VOIP data (untouched)
+    K = AI QC Report
+    L = Numeric quality score
+    """
     shared = start_background_worker()
     try:
         count, state = process_sheet_once(
@@ -1540,6 +1333,7 @@ def sync_google_sheet_batch(default_campaign_name=""):
     return True, f"Successfully processed {count} new recordings!"
 
 
+# Start the single background worker (all helper functions above are defined by this point).
 start_background_worker()
 
 
@@ -1636,63 +1430,8 @@ div.stButton > button[kind="primary"] {{ background: #2563eb !important; color: 
 
 
 # ============================================================
-# AUTHENTICATION SCREEN (LOGIN / SIGN UP)
+# SIDEBAR & ROUTING
 # ============================================================
-
-if not st.session_state.logged_in_user:
-    st.markdown("## Welcome to **Aunty Next DOOR**")
-    st.markdown("Please log in or create an account.")
-
-    auth_tab1, auth_tab2 = st.tabs(["🔐 Login", "📝 Sign Up"])
-
-    with auth_tab1:
-        st.subheader("Login to your account")
-        login_email = st.text_input("Email Address", key="login_email")
-        login_password = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Log In", type="primary", use_container_width=True):
-            user, login_error = authenticate_user(login_email, login_password)
-            if user:
-                st.session_state.logged_in_user = user
-                st.session_state.current_view = "transcriber"
-                st.success(f"Welcome back, {user['name']}!")
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.error(login_error)
-
-    with auth_tab2:
-        st.subheader("Create a public account")
-        signup_name = st.text_input("Full Name", key="signup_name")
-        signup_email = st.text_input("Email Address", key="signup_email")
-        signup_password = st.text_input("Create Password", type="password", key="signup_pass")
-        if st.button("Create Account", type="primary", use_container_width=True):
-            if signup_name and signup_email and signup_password:
-                ok, msg = register_user(
-                    signup_name, signup_email, signup_password,
-                    is_admin=0, is_approved=1 if AUTO_APPROVE_SIGNUPS else 0,
-                )
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-            else:
-                st.warning("Please fill out all fields.")
-
-    st.stop()
-
-
-# ============================================================
-# LOGGED IN SIDEBAR & ROUTING
-# ============================================================
-
-current_user = st.session_state.logged_in_user
-
-_fresh_user = get_user_by_id(current_user["id"])
-if not _fresh_user or not _fresh_user["is_approved"]:
-    st.session_state.logged_in_user = None
-    st.rerun()
-current_user = {k: _fresh_user[k] for k in ("id", "name", "email", "is_admin")}
-st.session_state.logged_in_user = current_user
 
 with st.sidebar:
     render_html("""
@@ -1741,43 +1480,8 @@ with st.sidebar:
             else:
                 st.error(message)
 
-    render_html("""
-        <div class="sidebar-divider"></div>
-        <div class="sidebar-label">User Account Profile</div>
-    """)
-
-    with st.form("profile_update_form"):
-        new_name = st.text_input("Name", value=current_user["name"])
-        new_email = st.text_input("Email", value=current_user["email"])
-
-        save_profile = st.form_submit_button("Save Profile Changes", use_container_width=True, type="primary")
-
-        if save_profile:
-            ok, msg = update_user_profile(current_user["id"], new_name, new_email)
-            if ok:
-                st.session_state.logged_in_user["name"] = new_name
-                st.session_state.logged_in_user["email"] = new_email
-                st.success(msg)
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.error(msg)
-
-    if st.button("Logout", use_container_width=True):
-        st.session_state.logged_in_user = None
-        st.rerun()
-
-    initials = "".join([part[0].upper() for part in current_user['name'].split()[:2]]) or "U"
-    render_html(f"""
-        <div class="sidebar-user">
-            <div class="avatar">{initials}</div>
-            <div style="flex:1">{html.escape(current_user['name'])}</div>
-        </div>
-    """)
-
-
 # ============================================================
-# MAIN TRANSCRIBER INTERFACE (PROTECTED)
+# MAIN TRANSCRIBER INTERFACE
 # ============================================================
 
 render_html("""
