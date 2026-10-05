@@ -939,7 +939,7 @@ def _call_structured_analysis(client, prompt):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=600,  # Optimized token budget
+        max_tokens=4000,  # Optimized token budget
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={
