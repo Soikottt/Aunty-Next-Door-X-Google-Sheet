@@ -1307,8 +1307,6 @@ def get_rehab_insurance_status(analysis):
     private_terms = [
         "private", "employer", "employee", "commercial", "company insurance",
         "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-        "blue cross", "blue shield", "bcbs", "aetna", "cigna",
-        "unitedhealth", "united healthcare", "united", "humana",
     ]
     if any(term in insurance for term in private_terms):
         return "GREEN"
