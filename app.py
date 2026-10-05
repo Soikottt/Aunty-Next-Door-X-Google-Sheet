@@ -1276,7 +1276,7 @@ def get_rehab_insurance_status(analysis):
         "medicaid", "medicare", "state insurance", "state-funded",
         "state funded", "government insurance", "government-funded",
         "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip",
+        "public insurance", "public plan", "chip", "medi-cal",
     ]
     if any(term in insurance for term in government_terms):
         return "YELLOW"
