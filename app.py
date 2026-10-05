@@ -168,6 +168,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 
+
 # ============================================================
 # GROQ API KEYS (STREAMLIT SECRETS ONLY)
 # ============================================================
@@ -209,7 +210,7 @@ GROQ_TERTIARY_API_KEY = GROQ_API_KEYS[2] if len(GROQ_API_KEYS) > 2 else ""
 
 if not GROQ_API_KEY:
     st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
-    
+
 
 # ============================================================
 # ACTIVE SESSION STORAGE
@@ -1106,6 +1107,9 @@ PROCESSING_MARKER = "⏳ Processing..."
 ERROR_MARKER = "ERROR - clear this cell to retry"
 MAX_ROW_ATTEMPTS = 3
 WATCHER_INTERVAL_SEC = 30
+# The automatic background worker is OFF by default: sheets are processed only when you press
+# "Sync & Process Sheet". Set AUTO_WORKER=1 in Secrets to turn automatic processing back on.
+AUTO_WORKER = get_secret("AUTO_WORKER", "0").strip().lower() in {"1", "true", "yes"}
 
 
 def _chunks(items, size):
@@ -1314,12 +1318,14 @@ def background_sheet_watcher(shared):
 
 @st.cache_resource
 def start_background_worker():
-    """Starts exactly ONE watcher thread per server process (not one per browser session)."""
+    """Shared state for sheet processing. Starts the watcher thread (ONE per server process)
+    only when AUTO_WORKER is enabled; otherwise nothing runs in the background."""
     shared = {"lock": threading.Lock(), "attempts": {}}
-    thread = threading.Thread(
-        target=background_sheet_watcher, args=(shared,), daemon=True, name="sheet-watcher"
-    )
-    thread.start()
+    if AUTO_WORKER:
+        thread = threading.Thread(
+            target=background_sheet_watcher, args=(shared,), daemon=True, name="sheet-watcher"
+        )
+        thread.start()
     return shared
 
 
@@ -1353,8 +1359,9 @@ def sync_google_sheet_batch(default_campaign_name=""):
     return True, f"Successfully processed {count} new recordings!"
 
 
-# Start the single background worker (all helper functions above are defined by this point).
-start_background_worker()
+# Start the single background worker if AUTO_WORKER=1 (all helper functions above are defined by this point).
+if AUTO_WORKER:
+    start_background_worker()
 
 
 # ============================================================
