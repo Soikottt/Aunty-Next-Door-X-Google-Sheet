@@ -169,7 +169,7 @@ PROVIDER_MODELS={
     "Groq-1":GROQ_SUMMARY_MODEL,
     "Groq-2":GROQ_SUMMARY_MODEL,
     "Groq-3":GROQ_SUMMARY_MODEL,
-    "Groq-4":GROQ_SUMMARY_MODEL
+    "Groq-4":GROQ_SUMMARY_MODEL,
     "Gemini":"gemini-2.5-flash",
     "Cerebras":"gpt-oss-120b",
     "OpenRouter":"openai/gpt-oss-20b:free",
