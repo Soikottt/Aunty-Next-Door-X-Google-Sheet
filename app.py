@@ -420,9 +420,17 @@ try:
         st.secrets.get("GROQ_API_KEY_SECONDARY_2", "")
         or st.secrets.get("GROQ_SECONDARY_API_KEY", "")
     )
+    GROQ_API_KEY_3 = st.secrets.get("GROQ_API_KEY_3", "")
+    GROQ_API_KEY_4 = st.secrets.get("GROQ_API_KEY_4", "")
 except Exception:
     GROQ_API_KEY = ""
     GROQ_SECONDARY_API_KEY = ""
+    GROQ_API_KEY_3 = ""
+    GROQ_API_KEY_4 = ""
+
+GROQ_API_KEYS = [k for k in [
+    GROQ_API_KEY, GROQ_SECONDARY_API_KEY, GROQ_API_KEY_3, GROQ_API_KEY_4
+] if k]
 
 if not GROQ_API_KEY:
     st.warning("Primary Groq API key is not configured in Streamlit Secrets.")
@@ -829,13 +837,13 @@ Use empty strings for unknown string values. spam_robot must be true/false. spam
 RULES:
 - Use only facts supported by the transcript. Never guess or invent.
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
-- Write a natural 5-10 sentence long_summary and a 10-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and how the call ended.
+- Write a natural 2-8 sentence long_summary and a 5-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and how the call ended.
 - If the caller is unrelated, explain what they actually wanted.
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
 - If spam/robot, describe what the call was promoting or asking the recipient to do.
 - Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
-- Yelp or Yellow Pages is NOT spam merely because a consumer mentions the site. It IS spam when the caller is selling, verifying, optimizing, updating, claiming, advertising, or promoting a business listing.
+- If the caller mentions Yelp or Yellow Pages in any context, mark the call as spam.
 - A normal irrelevant or non-qualified caller is not automatically spam.
 - For Rehab, Medicaid/Medicare/state/government/public insurance means NON-QUALIFIED. Private/commercial plans such as BCBS, Aetna, Cigna, UnitedHealthcare, Humana, PPO/HMO/EPO/POS are positive qualification signals when clearly stated by the caller.
 - qualification_reason should briefly explain why the qualification status was chosen.
@@ -884,7 +892,7 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=1000,
+        max_tokens=900,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={"type": "json_object"}
@@ -994,8 +1002,8 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     )
     return analysis
 
-TPM_TARGET = 7500
-ANALYSIS_MAX_OUT = 1000      # same as max_tokens in _call_structured_analysis
+TPM_TARGET = 7400
+ANALYSIS_MAX_OUT = 900      # same as max_tokens in _call_structured_analysis
 CHARS_PER_TOKEN = 3.5       # conservative estimate, no extra library needed
 
 def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
@@ -1011,31 +1019,34 @@ def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
     tail = max_chars - head
     return transcript[:head] + " ... [middle of call omitted] ... " + transcript[-tail:]
 
+def _with_key_fallback(call_fn, label):
+    """Try each configured Groq key in order until one succeeds."""
+    if not GROQ_API_KEYS:
+        raise RuntimeError("No Groq API keys are configured.")
+    errors = []
+    for i, key in enumerate(GROQ_API_KEYS, start=1):
+        try:
+            return call_fn(Groq(api_key=key), f"{label} KEY {i}")
+        except Exception as exc:
+            errors.append(f"Key {i}: {exc}")
+            if "413" in str(exc):
+                break  # request too large: every key would fail the same way
+    raise RuntimeError("All Groq accounts failed. " + " | ".join(errors))
+
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI analysis.")
 
-    if not GROQ_API_KEY:
-        raise RuntimeError("Primary Groq API key is not configured.")
+    if not GROQ_API_KEYS:
+        raise RuntimeError("No Groq API keys are configured.")
 
     ai_transcript = _trim_for_token_limit(full_transcript, campaign_name, timeline_data)
     prompt = _analysis_prompt(ai_transcript, campaign_name, timeline_data)
-    primary_error = None
 
-    try:
-        analysis = _call_structured_analysis(Groq(api_key=GROQ_API_KEY), prompt, "PRIMARY ANALYSIS")
-        analysis = apply_deterministic_spam_rules(analysis, full_transcript)
-    except Exception as primary_exc:
-        primary_error = primary_exc
-        if not GROQ_SECONDARY_API_KEY:
-            raise RuntimeError(f"Primary Groq analysis failed: {primary_exc}")
-        try:
-            analysis = _call_structured_analysis(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt, "SECONDARY ANALYSIS")
-            analysis = apply_deterministic_spam_rules(analysis, full_transcript)
-        except Exception as secondary_exc:
-            raise RuntimeError(
-                f"Both Groq analysis accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
-            )
+    analysis = _with_key_fallback(
+        lambda c, lbl: _call_structured_analysis(c, prompt, lbl), "ANALYSIS"
+    )
+    analysis = apply_deterministic_spam_rules(analysis, full_transcript)
 
     return _derive_analysis_flags(analysis, full_transcript, timeline_data)
 
@@ -1066,8 +1077,8 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
     if not full_transcript.strip():
         raise RuntimeError("No transcription text was available for AI summary.")
 
-    if not GROQ_API_KEY:
-        raise RuntimeError("Primary Groq API key is not configured.")
+    if not GROQ_API_KEYS:
+        raise RuntimeError("No Groq API keys are configured.")
 
     campaign_family = get_campaign_category(campaign_name)
     prompt = f"""
@@ -1079,13 +1090,13 @@ CAMPAIGN:
 Create only two outputs from the transcript: a short Main Topic and a factual Long Summary.
 
 MAIN TOPIC:
-- One short sentence, normally 5-15 words.
+- One short sentence, normally 5-25 words.
 - State what the caller was actually calling about.
 - If unrelated, describe what they actually wanted.
 - If spam/robot, describe the actual subject of the spam, such as a Google listing or SEO solicitation.
 
 LONG SUMMARY:
-- Write 2-10 short, natural sentences.
+- Write 2-8 short, natural sentences.
 - Include the caller's actual reason for calling, requested service, important information clearly provided, and the actual outcome when supported.
 - Use only facts clearly supported by the transcript.
 - Never invent insurance, location, qualification, appointments, transfers, or outcomes.
@@ -1099,19 +1110,10 @@ TRANSCRIPT:
 {full_transcript}
 """
 
-    primary_error = None
-    try:
-        result = _call_fast_summary(Groq(api_key=GROQ_API_KEY), prompt)
-    except Exception as primary_exc:
-        primary_error = primary_exc
-        if not GROQ_SECONDARY_API_KEY:
-            raise RuntimeError(f"Primary Groq fast summary failed: {primary_exc}")
-        try:
-            result = _call_fast_summary(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
-        except Exception as secondary_exc:
-            raise RuntimeError(
-                f"Both Groq summary accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
-            )
+    result = _with_key_fallback(
+        lambda c, lbl: _call_fast_summary(c, prompt, lbl), "FAST SUMMARY"
+    )
+    
 
     main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
     long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
