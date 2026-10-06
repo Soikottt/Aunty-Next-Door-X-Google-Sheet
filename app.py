@@ -829,7 +829,7 @@ Use empty strings for unknown string values. spam_robot must be true/false. spam
 RULES:
 - Use only facts supported by the transcript. Never guess or invent.
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
-- Write a natural 2-5 sentence long_summary and a 5-15 word main_topic.
+- Write a natural 5-10 sentence long_summary and a 10-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and how the call ended.
 - If the caller is unrelated, explain what they actually wanted.
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
@@ -884,7 +884,7 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=650,
+        max_tokens=1000,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={"type": "json_object"}
@@ -994,8 +994,8 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     )
     return analysis
 
-TPM_TARGET = 7000
-ANALYSIS_MAX_OUT = 650      # same as max_tokens in _call_structured_analysis
+TPM_TARGET = 7500
+ANALYSIS_MAX_OUT = 1000      # same as max_tokens in _call_structured_analysis
 CHARS_PER_TOKEN = 3.5       # conservative estimate, no extra library needed
 
 def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
@@ -1052,7 +1052,7 @@ def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=350,
+        max_tokens=750,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={"type": "json_object"}
@@ -1085,7 +1085,7 @@ MAIN TOPIC:
 - If spam/robot, describe the actual subject of the spam, such as a Google listing or SEO solicitation.
 
 LONG SUMMARY:
-- Write 2-4 short, natural sentences.
+- Write 2-10 short, natural sentences.
 - Include the caller's actual reason for calling, requested service, important information clearly provided, and the actual outcome when supported.
 - Use only facts clearly supported by the transcript.
 - Never invent insurance, location, qualification, appointments, transfers, or outcomes.
@@ -1144,7 +1144,7 @@ def get_rehab_insurance_status(analysis):
         "medicaid", "medicare", "state insurance", "state-funded",
         "state funded", "government insurance", "government-funded",
         "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip",
+        "public insurance", "public plan", "chip", "marketplace",
     ]
     if any(term in insurance for term in government_terms):
         return "GOVERNMENT"
@@ -1152,8 +1152,7 @@ def get_rehab_insurance_status(analysis):
     private_terms = [
         "private", "employer", "employee", "commercial", "company insurance",
         "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-        "blue cross", "blue shield", "bcbs", "aetna", "cigna",
-        "unitedhealth", "united healthcare", "united", "humana",
+        "insurance through work",
     ]
     if any(term in insurance for term in private_terms):
         return "PRIVATE"
