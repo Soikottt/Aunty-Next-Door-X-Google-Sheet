@@ -150,8 +150,9 @@ def secret(name, default=""):
         return value if value is not None else default
     except Exception: return default
 
-GROQ_API_KEY=secret("GROQ_API_KEY")
-GROQ_SECONDARY_API_KEY=secret("GROQ_SECONDARY_API_KEY")
+# New preferred secret names + backward-compatible old names.
+GROQ_API_KEY=secret("Aunty_NEXT_DOOR_API_PRIMARY") or secret("GROQ_API_KEY")
+GROQ_SECONDARY_API_KEY=secret("GROQ_API_KEY_SECONDARY_2") or secret("GROQ_SECONDARY_API_KEY")
 GROQ_API_KEY_3=secret("GROQ_API_KEY_3")
 GROQ_API_KEY_4=secret("GROQ_API_KEY_4")
 GEMINI_API_KEY=secret("GEMINI_API_KEY")
@@ -168,7 +169,7 @@ PROVIDER_MODELS={
     "Groq-1":GROQ_SUMMARY_MODEL,
     "Groq-2":GROQ_SUMMARY_MODEL,
     "Groq-3":GROQ_SUMMARY_MODEL,
-    "Groq-4":GROQ_SUMMARY_MODEL,
+    "Groq-4":GROQ_SUMMARY_MODEL
     "Gemini":"gemini-2.5-flash",
     "Cerebras":"gpt-oss-120b",
     "OpenRouter":"openai/gpt-oss-20b:free",
@@ -278,17 +279,61 @@ def normalize_analysis(data):
     return out
 
 def usage_from_obj(usage):
-    if usage is None: return {"input":None,"output":None,"total":None}
-    def get(*names):
-        for n in names:
-            v=usage.get(n) if isinstance(usage,dict) else getattr(usage,n,None)
-            if v is not None: return v
+    """Normalize token usage from Groq/Pydantic/dict/OpenAI-compatible APIs."""
+    if usage is None:
+        return {"input": None, "output": None, "total": None}
+
+    # Groq's SDK returns a Pydantic CompletionUsage object. Convert it first.
+    if not isinstance(usage, dict):
+        try:
+            if hasattr(usage, "model_dump"):
+                usage = usage.model_dump()
+        except Exception:
+            pass
+        if not isinstance(usage, dict):
+            try:
+                if hasattr(usage, "dict"):
+                    usage = usage.dict()
+            except Exception:
+                pass
+        if not isinstance(usage, dict):
+            try:
+                usage = vars(usage)
+            except Exception:
+                usage = {}
+
+    if not isinstance(usage, dict):
+        usage = {}
+
+    def get_value(*names):
+        for name in names:
+            value = usage.get(name)
+            if value is not None:
+                return value
         return None
-    return {"input":get("prompt_tokens","input_tokens","promptTokenCount"),"output":get("completion_tokens","output_tokens","candidatesTokenCount"),"total":get("total_tokens","totalTokenCount")}
+
+    input_tokens = get_value("prompt_tokens", "input_tokens", "promptTokenCount")
+    output_tokens = get_value("completion_tokens", "output_tokens", "candidatesTokenCount")
+    total_tokens = get_value("total_tokens", "totalTokenCount")
+
+    # Some providers omit total even though input/output are present.
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        try:
+            total_tokens = int(input_tokens) + int(output_tokens)
+        except Exception:
+            total_tokens = None
+
+    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
 
 def usage_text(provider, model, usage):
     u=usage_from_obj(usage)
-    def v(x): return str(x) if x is not None else "N/A"
+    def v(x):
+        if x is None:
+            return "N/A"
+        try:
+            return f"{int(x):,}"
+        except Exception:
+            return str(x)
     return f"{provider} | {model} | In: {v(u['input'])} | Out: {v(u['output'])} | Total: {v(u['total'])}"
 
 def provider_specs():
@@ -338,9 +383,33 @@ def cohere_analysis(api_key, model, prompt):
 def groq_analysis(api_key, model, prompt):
     client=Groq(api_key=api_key)
     # json_object is used for portability with gpt-oss-20b; Python validates the final JSON.
-    resp=client.chat.completions.create(model=model,messages=[{"role":"system","content":"Return only valid JSON matching the requested fields."},{"role":"user","content":prompt}],temperature=0.1,max_tokens=1600,reasoning_effort="low",response_format={"type":"json_object"})
+    resp=client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role":"system","content":"Return only valid JSON matching the requested fields."},
+            {"role":"user","content":prompt}
+        ],
+        temperature=0.1,
+        max_tokens=1600,
+        reasoning_effort="low",
+        response_format={"type":"json_object"}
+    )
     content=resp.choices[0].message.content or ""
-    return parse_json_response(content), getattr(resp,"usage",None)
+
+    # Groq SDK normally exposes resp.usage directly. Keep fallbacks for SDK/version differences.
+    usage=getattr(resp,"usage",None)
+    if usage is None:
+        try:
+            usage=resp.model_dump().get("usage")
+        except Exception:
+            pass
+    if usage is None:
+        try:
+            usage=resp.dict().get("usage")
+        except Exception:
+            pass
+
+    return parse_json_response(content), usage
 
 def run_provider(name, kind, key, model, prompt):
     if kind=="groq": return groq_analysis(key,model,prompt)
