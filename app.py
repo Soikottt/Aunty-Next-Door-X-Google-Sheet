@@ -1,7 +1,3 @@
-# Aunty Next DOOR - Call Transcription & Google Sheets Sync
-# Updated: multi-provider AI fallback, structured QC, deterministic scoring,
-# Q-column token tracking, Yelp/Yellow Pages spam rule, and safe provider skipping.
-
 import sqlite3
 import hashlib
 from datetime import datetime, timedelta
@@ -9,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import textwrap
+import tempfile
 import uuid
 import time
 import urllib.request
@@ -17,129 +14,359 @@ import random
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import re
 
 import streamlit as st
 import streamlit.components.v1 as components
 from groq import Groq
 from pydub import AudioSegment
-import gspread
+import gspread  
+import threading
+import zipfile
 import requests
 
+
+
 # ============================================================
-# DATABASE & AUTHENTICATION
+# GOOGLE DRIVE MODEL AUTO-DOWNLOAD & EXTRACTION
 # ============================================================
+
+MODEL_DIR = "model"  # Target directory for your model
+ZIP_PATH = "model.zip"
+FILE_ID = "1TdPphBAbdnx8uKDDZyeDIP_udGyOhzWC"
+
+def download_file_from_google_drive(file_id, destination):
+    URL = "https://docs.google.com/uc?export=download"
+    session = requests.Session()
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    response = session.get(URL, params={'id': file_id}, headers=headers, stream=True)
+    
+    token = get_confirm_token(response)
+    if token:
+        params = {'id': file_id, 'confirm': token}
+        response = session.get(URL, params=params, headers=headers, stream=True)
+        
+    save_response_content(response, destination)
+
+def get_confirm_token(response):
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            return value
+    return None
+
+def save_response_content(response, destination):
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+# Check and extract on first boot if missing
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    try:
+        with st.spinner("Downloading model from Google Drive..."):
+            download_file_from_google_drive(FILE_ID, ZIP_PATH)
+        
+        with st.spinner("Extracting model files..."):
+            with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
+                zip_ref.extractall(MODEL_DIR)
+                
+        if os.path.exists(ZIP_PATH):
+            os.remove(ZIP_PATH)
+        st.success("Model setup complete!")
+    except Exception as e:
+        st.error(f"Failed to auto-download/extract model: {str(e)}")
+
+
+
+# ============================================================
+# DATABASE & AUTHENTICATION SETUP (SQLite)
+# ============================================================
+
 DB_PATH = Path("users.db")
+
 SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
 SMTP_EMAIL = os.environ.get("SMTP_EMAIL", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-        is_admin INTEGER DEFAULT 0)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS reset_tokens (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL,
-        code TEXT NOT NULL, expires_at DATETIME NOT NULL)""")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            code TEXT NOT NULL,
+            expires_at DATETIME NOT NULL
+        )
+    """)
+    conn.commit()
+
     c.execute("PRAGMA table_info(users)")
-    if "is_admin" not in [x[1] for x in c.fetchall()]:
+    columns = [col[1] for col in c.fetchall()]
+    if "is_admin" not in columns:
         c.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        conn.commit()
+
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO users (name,email,password_hash,is_admin) VALUES (?,?,?,1)",
-                  ("System Admin", "admin@domain.com", hash_password("admin123")))
-    conn.commit(); conn.close()
+        admin_pwd = hash_password("admin123")
+        c.execute(
+            "INSERT INTO users (name, email, password_hash, is_admin) VALUES (?, ?, ?, 1)",
+            ("System Admin", "admin@domain.com", admin_pwd)
+        )
+        conn.commit()
 
-def register_user(name, email, password, is_admin=0):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(name: str, email: str, password: str, is_admin: int = 0):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (name,email,password_hash,is_admin) VALUES (?,?,?,?)",
-                  (name, email.lower().strip(), hash_password(password), is_admin))
-        conn.commit(); return True, "Account created successfully! Please log in."
+        pwd_hash = hash_password(password)
+        c.execute(
+            "INSERT INTO users (name, email, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+            (name, email.lower().strip(), pwd_hash, is_admin)
+        )
+        conn.commit()
+        return True, "Account created successfully! Please log in."
     except sqlite3.IntegrityError:
         return False, "An account with this email already exists."
-    finally: conn.close()
+    finally:
+        conn.close()
 
-def authenticate_user(email, password):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("SELECT id,name,email,is_admin FROM users WHERE lower(email)=? AND password_hash=?",
-              (email.lower().strip(), hash_password(password)))
-    u = c.fetchone(); conn.close()
-    return {"id":u[0],"name":u[1],"email":u[2],"is_admin":bool(u[3])} if u else None
+def authenticate_user(email: str, password: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    pwd_hash = hash_password(password)
+    c.execute(
+        "SELECT id, name, email, is_admin FROM users WHERE lower(email) = ? AND password_hash = ?",
+        (email.lower().strip(), pwd_hash)
+    )
+    user = c.fetchone()
+    conn.close()
+    if user:
+        return {"id": user[0], "name": user[1], "email": user[2], "is_admin": bool(user[3])}
+    return None
 
-def update_user_profile(user_id, new_name, new_email, new_password=""):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+def update_user_profile(user_id: int, new_name: str, new_email: str, new_password: str = ""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     try:
         if new_password.strip():
-            c.execute("UPDATE users SET name=?,email=?,password_hash=? WHERE id=?",
-                      (new_name,new_email.lower().strip(),hash_password(new_password),user_id))
+            pwd_hash = hash_password(new_password)
+            c.execute("UPDATE users SET name = ?, email = ?, password_hash = ? WHERE id = ?", (new_name, new_email.lower().strip(), pwd_hash, user_id))
         else:
-            c.execute("UPDATE users SET name=?,email=? WHERE id=?",
-                      (new_name,new_email.lower().strip(),user_id))
-        conn.commit(); return True, "Profile updated successfully!"
+            c.execute("UPDATE users SET name = ?, email = ? WHERE id = ?", (new_name, new_email.lower().strip(), user_id))
+        conn.commit()
+        return True, "Profile updated successfully!"
     except sqlite3.IntegrityError:
         return False, "Email address is already in use by another account."
-    finally: conn.close()
+    finally:
+        conn.close()
 
 def get_all_users():
-    conn=sqlite3.connect(DB_PATH); c=conn.cursor(); c.execute("SELECT id,name,email,is_admin FROM users ORDER BY id ASC")
-    rows=c.fetchall(); conn.close()
-    return [{"id":x[0],"name":x[1],"email":x[2],"is_admin":bool(x[3])} for x in rows]
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, name, email, is_admin FROM users ORDER BY id ASC")
+    users = c.fetchall()
+    conn.close()
+    return [{"id": u[0], "name": u[1], "email": u[2], "is_admin": bool(u[3])} for u in users]
 
-def admin_toggle_role(user_id, make_admin):
-    conn=sqlite3.connect(DB_PATH); conn.execute("UPDATE users SET is_admin=? WHERE id=?",(1 if make_admin else 0,user_id)); conn.commit(); conn.close()
+def admin_toggle_role(user_id: int, make_admin: bool):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if make_admin else 0, user_id))
+    conn.commit()
+    conn.close()
 
-def admin_reset_password(user_id, new_password):
-    conn=sqlite3.connect(DB_PATH); conn.execute("UPDATE users SET password_hash=? WHERE id=?",(hash_password(new_password),user_id)); conn.commit(); conn.close()
+def admin_reset_password(user_id: int, new_password: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    pwd_hash = hash_password(new_password)
+    c.execute("UPDATE users SET password_hash = ? WHERE id = ?", (pwd_hash, user_id))
+    conn.commit()
+    conn.close()
 
-def admin_delete_user(user_id):
-    conn=sqlite3.connect(DB_PATH); conn.execute("DELETE FROM users WHERE id=?",(user_id,)); conn.commit(); conn.close()
+def admin_delete_user(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
-def send_reset_code_email(email, code):
+def send_reset_code_email(email: str, code: str):
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print(f"[TESTING MODE] Reset Code for {email}: {code}")
         return True, f"Demo Mode: Credentials not configured. Your code is: {code}"
+
     try:
-        msg=MIMEMultipart(); msg['From']=SMTP_EMAIL; msg['To']=email; msg['Subject']="Password Reset Code - Aunty Next DOOR"
-        msg.attach(MIMEText(f"Hello,\n\nYour 6-digit verification code is: {code}\n\nThis code will expire in 15 minutes.\n\nRegards,\nAunty Next DOOR Team",'plain'))
-        server=smtplib.SMTP(SMTP_SERVER,SMTP_PORT); server.starttls(); server.login(SMTP_EMAIL,SMTP_PASSWORD); server.send_message(msg); server.quit()
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_EMAIL
+        msg['To'] = email
+        msg['Subject'] = "Password Reset Code - Aunty Next DOOR"
+
+        body = f"""
+        Hello,
+
+        We received a request to reset your password for your Aunty Next DOOR account.
+
+        Your 6-digit verification code is: {code}
+
+        This code will expire in 15 minutes. If you did not request a password reset, please ignore this email.
+
+        Regards,
+        Aunty Next DOOR Team
+        """
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
         return True, f"Reset code sent to {email}. Please check your inbox."
-    except Exception as e: return False, f"Failed to send email: {e}"
+    except Exception as e:
+        return False, f"Failed to send email: {str(e)}"
 
-def generate_reset_code(email):
-    email=email.lower().strip(); conn=sqlite3.connect(DB_PATH); c=conn.cursor(); c.execute("SELECT id FROM users WHERE lower(email)=?",(email,))
-    if not c.fetchone(): conn.close(); return False,"No account found with that email address."
-    code=f"{random.randint(100000,999999)}"; expires=datetime.now()+timedelta(minutes=15)
-    c.execute("DELETE FROM reset_tokens WHERE lower(email)=?",(email,)); c.execute("INSERT INTO reset_tokens(email,code,expires_at) VALUES(?,?,?)",(email,code,expires)); conn.commit(); conn.close()
-    return send_reset_code_email(email,code)
+def generate_reset_code(email: str):
+    email_clean = email.lower().strip()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE lower(email) = ?", (email_clean,))
+    user = c.fetchone()
+    
+    if not user:
+        conn.close()
+        return False, "No account found with that email address."
 
-def reset_password_with_code(email, code, new_password):
-    email=email.lower().strip(); conn=sqlite3.connect(DB_PATH); c=conn.cursor(); c.execute("SELECT expires_at FROM reset_tokens WHERE lower(email)=? AND code=?",(email,code.strip())); r=c.fetchone()
-    if not r: conn.close(); return False,"Invalid verification code or email address."
-    try: expires=datetime.fromisoformat(r[0])
-    except Exception: expires=datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
-    if datetime.now()>expires:
-        c.execute("DELETE FROM reset_tokens WHERE lower(email)=?",(email,)); conn.commit(); conn.close(); return False,"Verification code has expired. Please request a new one."
-    c.execute("UPDATE users SET password_hash=? WHERE lower(email)=?",(hash_password(new_password),email)); c.execute("DELETE FROM reset_tokens WHERE lower(email)=?",(email,)); conn.commit(); conn.close()
-    return True,"Password reset successfully! You can now log in with your new password."
+    code = f"{random.randint(100000, 999999)}"
+    expires_at = datetime.now() + timedelta(minutes=15)
+
+    c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
+    c.execute("INSERT INTO reset_tokens (email, code, expires_at) VALUES (?, ?, ?)", (email_clean, code, expires_at))
+    conn.commit()
+    conn.close()
+
+    return send_reset_code_email(email_clean, code)
+
+def reset_password_with_code(email: str, code: str, new_password: str):
+    email_clean = email.lower().strip()
+    code_clean = code.strip()
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT expires_at FROM reset_tokens WHERE lower(email) = ? AND code = ?", (email_clean, code_clean))
+    record = c.fetchone()
+
+    if not record:
+        conn.close()
+        return False, "Invalid verification code or email address."
+
+    expires_at = datetime.strptime(record[0], "%Y-%m-%d %H:%M:%S.%f") if "." in record[0] else datetime.strptime(record[0], "%Y-%m-%d %H:%M:%S")
+    
+    if datetime.now() > expires_at:
+        c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
+        conn.commit()
+        conn.close()
+        return False, "Verification code has expired. Please request a new one."
+
+    pwd_hash = hash_password(new_password)
+    c.execute("UPDATE users SET password_hash = ? WHERE lower(email) = ?", (pwd_hash, email_clean))
+    c.execute("DELETE FROM reset_tokens WHERE lower(email) = ?", (email_clean,))
+    conn.commit()
+    conn.close()
+
+    return True, "Password reset successfully! You can now log in with your new password."
 
 init_db()
 
-def render_html(content): st.html(textwrap.dedent(content))
+
+def render_html(content):
+    st.html(textwrap.dedent(content))
+
+
+# ============================================================
+# HELPER: JS CLIPBOARD COPY BUTTON
+# ============================================================
 
 def render_copy_icon_button(text_to_copy, button_id):
-    escaped=json.dumps(text_to_copy)
-    components.html(f'''<div style="display:flex;justify-content:center;width:100%;margin-top:6px"><button id="{button_id}" onclick="copyText_{button_id}()" style="background:#ff4d4d;color:#fff;border:0;border-radius:8px;padding:0 16px;height:34px;cursor:pointer;font-size:13px;font-weight:700;width:100%">Copy text</button></div><script>function copyText_{button_id}(){{const t={escaped};navigator.clipboard.writeText(t).then(()=>{{const b=document.getElementById('{button_id}');b.innerText='â Copied!';b.style.background='#10b981';setTimeout(()=>{{b.innerText='Copy text';b.style.background='#ff4d4d'}},2000)}})}}</script>''',height=42)
+    escaped_text = json.dumps(text_to_copy)
+    button_html = f"""
+    <div style="display: flex; justify-content: center; width: 100%; margin-top: 6px;">
+        <button id="{button_id}" onclick="copyText_{button_id}()" title="Copy text" style="
+            background: #ff4d4d;
+            color: #ffffff;
+            border: none;
+            border-radius: 8px;
+            padding: 0 16px;
+            min-height: 34px;
+            height: 34px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 700;
+            transition: all 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            box-sizing: border-box;
+            box-shadow: 0 4px 12px rgba(255, 77, 77, 0.25);
+        ">Copy text</button>
+    </div>
+    <script>
+        function copyText_{button_id}() {{
+            const text = {escaped_text};
+            navigator.clipboard.writeText(text).then(function() {{
+                const btn = document.getElementById('{button_id}');
+                btn.innerText = '✓ Copied!';
+                btn.style.background = '#10b981';
+                btn.style.boxShadow = '0 4px 12px rgba(16, 185, 129, 0.25)';
+                setTimeout(function() {{
+                    btn.innerText = 'Copy text';
+                    btn.style.background = '#ff4d4d';
+                    btn.style.boxShadow = '0 4px 12px rgba(255, 77, 77, 0.25);';
+                }}, 2000);
+            }}).catch(function(err) {{
+                console.error('Copy error: ', err);
+            }});
+        }}
+    </script>
+    """
+    components.html(button_html, height=42)
 
-st.set_page_config(page_title="Aunty Next DOOR â¢ Transcriber", page_icon="ðï¸", layout="wide", initial_sidebar_state="expanded")
-UPLOAD_DIR=Path("uploads"); UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# STREAMLIT CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Aunty Next DOOR • Transcriber",
+    page_icon="🎙️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# UPLOAD CONFIGURATION
+# ============================================================
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
 
 # ============================================================
 # SECRETS / API CONFIG
@@ -154,6 +381,7 @@ def secret(name, default=""):
 GROQ_API_KEY=secret("Aunty_NEXT_DOOR_API_PRIMARY") or secret("GROQ_API_KEY")
 GROQ_SECONDARY_API_KEY=secret("GROQ_API_KEY_SECONDARY_2") or secret("GROQ_SECONDARY_API_KEY")
 GROQ_API_KEY_3=secret("GROQ_API_KEY_3")
+GROQ_API_KEY_4=secret("GROQ_API_KEY_4")
 GEMINI_API_KEY=secret("GEMINI_API_KEY")
 CEREBRAS_API_KEY=secret("CEREBRAS_API_KEY")
 OPENROUTER_API_KEY=secret("OPENROUTER_API_KEY")
@@ -168,6 +396,7 @@ PROVIDER_MODELS={
     "Groq-1":GROQ_SUMMARY_MODEL,
     "Groq-2":GROQ_SUMMARY_MODEL,
     "Groq-3":GROQ_SUMMARY_MODEL,
+    "Groq-4":GROQ_SUMMARY_MODEL,
     "Gemini":"gemini-2.5-flash",
     "Cerebras":"gpt-oss-120b",
     "OpenRouter":"openai/gpt-oss-20b:free",
@@ -178,660 +407,1482 @@ PROVIDER_MODELS={
 
 if not GROQ_API_KEY: st.warning("GROQ_API_KEY is not configured in Streamlit Secrets. Transcription requires Groq.")
 
-DEFAULT_SESSION={"logged_in_user":None,"current_view":"transcriber","theme_mode":"dark","source_name":"No file loaded","file_path":None,"duration_sec":0,"est_proc_sec":0,"source_type":"Awaiting input","transcript":[],"full_text":"","short_topic":"","detailed_summary":"","transcribed":False,"status":"Ready for audio","elapsed":0,"last_analysis_provider":"","last_analysis_usage":{},"last_analysis_error":""}
-for k,v in DEFAULT_SESSION.items():
-    if k not in st.session_state: st.session_state[k]=v
+
 
 # ============================================================
-# CAMPAIGN RULES / QC QUESTIONS
+# ACTIVE SESSION STORAGE
 # ============================================================
-CAMPAIGN_QC_QUESTIONS={
-"Rehab & Addiction Treatment":"""Focus on why the caller called, the treatment or rehab service requested, location, insurance/payment information from the caller, qualification, important qualification reason, appointment/scheduling, advice/referral/next step, and how the call ended. For insurance, use the caller's own response only. Never treat an agent question as the caller's answer.""",
-"Dumpster & Porta Potty Services":"""Focus on dumpster or porta potty service, size/capacity, residential/commercial/event/construction use, pricing, service location, delivery date/time, booking, and how the call ended. Include only clearly stated details.""",
-"Pest Control & Home Services":"""Focus on the specific home/pest problem, homeowner/renter status, service area, quote/service request, appointment or inspection, relevance/wrong number, handling issues, and outcome.""",
-"Insurance (Health / Auto / Home)":"""Focus on insurance type, current policy situation, quote/new policy/existing policy intent, location/eligibility, qualifying information, transfer/quote/callback, wrong number/unrelated inquiry, and outcome.""",
-"Debt Relief & Financial Services":"""Focus on debt-relief or financial service requested, debt amount if stated, unsecured/secured debt if stated, qualification, spam/wrong number/unrelated inquiry, transfer/enrollment/consultation, and outcome.""",
+
+DEFAULT_SESSION = {
+    "logged_in_user": None,
+    "current_view": "transcriber",
+    "theme_mode": "dark",
+    "source_name": "No file loaded",
+    "file_path": None,
+    "duration_sec": 0,
+    "est_proc_sec": 0,
+    "source_type": "Awaiting input",
+    "transcript": [],
+    "full_text": "",
+    "short_topic": "",
+    "detailed_summary": "",
+    "transcribed": False,
+    "status": "Ready for audio",
+    "elapsed": 0,
 }
-DEFAULT_QC_QUESTIONS="""Focus on why the caller called, service/product requested, qualification information, location/eligibility, quote/appointment/transfer/booking/next step, relevance, wrong number, caller objection, agent handling issue, spam/robot behavior, and outcome. Never guess missing information."""
 
-def get_campaign_category(raw_campaign):
-    raw=(raw_campaign or "").strip(); low=raw.lower()
-    if any(x in low for x in ["rehab","addiction","mental health","treatment"]): return "Rehab & Addiction Treatment"
-    if any(x in low for x in ["dumpster","porta potty","portable toilet"]): return "Dumpster & Porta Potty Services"
-    if any(x in low for x in ["pest","roof","moving","home service","locksmith","plumbing","hvac"]): return "Pest Control & Home Services"
-    if any(x in low for x in ["insurance","medicare","auto insurance","home insurance"]): return "Insurance (Health / Auto / Home)"
-    if any(x in low for x in ["debt","financial","loan","mca"]): return "Debt Relief & Financial Services"
-    return raw or "General Customer Inquiry"
+for key, value in DEFAULT_SESSION.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ============================================================
+# CAMPAIGN QUESTION SETS & PROMPTS
+# ============================================================
+
+CAMPAIGN_QC_QUESTIONS = {
+    "Rehab & Addiction Treatment": """
+Write a short, natural, human-written QC note for the Rehab call using simple English. Keep the summary concise. Combine related information into one sentence when possible. Do not repeat the same action or information. Prefer 2 short sentences over one long sentence.
+
+Use ONLY information that is clearly stated in the transcript. Never guess, assume, interpret, or fill in missing information from context. If speech is unclear or garbled, skip that information. 
+
+Clarify each speaker’s perspective: Always identify who said the information. Do not treat the agent’s question or statement as the caller’s answer or information. When summarizing insurance, treatment, location, appointment, or other details, clearly use the information provided by the correct speaker. If the caller answers the agent’s question, use the caller’s answer. If only the agent mentions something and the caller does not confirm it, do not present it as the caller’s information.
+
+IMPORTANT RULES:
+An agent's question is NOT the caller's answer.
+**Insurance Rule:** Always check the **caller’s response** when the agent asks about insurance.
+If the **agent asks the caller about insurance** and the caller gives an answer, include the **insurance name or insurance status** in the summary.
+If the caller says they **do not have insurance**, write **“The caller said they do not have insurance.”**
+If the caller clearly names an insurance provider, such as **Medicaid, Medicare, Blue Cross Blue Shield, Aetna, Cigna, or other insurance**, include that exact insurance name.
+Do not use the **agent’s question** as the caller’s answer. The insurance information must come from the **caller’s response or statement**. If the agent asks about insurance but the caller's response is completely unclear or unintelligible, skip the insurance information. If neither the agent nor the caller discusses insurance, skip it.
+
+Never state that the caller has or does not have insurance unless the caller clearly says so.
+If the caller does not clearly answer a question, skip it.
+Do not turn unclear speech into a definite fact.
+Do not create or assume information that is not clearly stated.
+Do not mention missing information unless it is necessary to explain something that actually happened.
+Do not say "no clear resolution," "no confirmed appointment," "no referral," or similar phrases unless the transcript clearly supports that statement.
+Do not repeat the same information.
+
+Focus only on clearly understood information, such as:
+**Reason for calling**
+**Treatment or Rehab service requested**
+**Location or ZIP code**
+**Insurance or payment information**, only if clearly stated
+**Appointment or scheduling**, only if clearly discussed
+**Important qualification information**
+**What the agent provided or advised**
+**Phone number, referral, or next step**
+**How the call ended**
+
+For treatment, use the exact service that is clearly understood. If only "rehab" or "treatment" is clear, use that instead of guessing a specific treatment.
+For insurance, include it only when the caller clearly provides the insurance type or payment information.
+For appointments, only mention an appointment if the caller clearly requested one or the agent clearly scheduled one. Do not assume an appointment was made or not made.
+For the ending, briefly describe what actually happened, such as the agent providing a phone number, giving a referral, scheduling an appointment, the caller thanking the agent, or the call ended.
+
+Use natural phrases such as:
+"The caller was looking for..."
+"The caller called about..."
+"The caller wanted..."
+"The caller asked about..."
+"The agent provided..."
+"The agent gave..."
+"The call ended after..."
+
+Avoid unnatural phrases such as:
+"The caller identified themselves as..."
+"The caller presented themselves as..."
+"The caller indicated that..."
+"The agent inquired about..."
+"No clear details were provided..."
+"No confirmed appointment was made..."
+
+Write ONE short paragraph only. No bullets, headings, or sections. Use **bold text** only for the most important treatment, service, action, or outcome.
+
+Keep the final summary very short, factual, natural, and conversational, like a human-written QC note.
+""",
+
+    "Dumpster & Porta Potty Services": """
+For each question below, only include the answer if it is clearly mentioned or answered in the call. If the caller does not answer a question or the information is not mentioned, skip that question completely. Do not assume, guess, or add missing information.
+
+What service is the caller looking for? Dumpster or Porta Potty.
+What size or capacity does the caller need? For dumpsters, include the size such as 10-yard, 20-yard, 30-yard, or 40-yard. For Porta Potty, include the capacity or type if mentioned.
+What is the service for? For example, residential, commercial, moving, construction, party, or event.
+Did the caller ask about the price? If yes, include the price or pricing information discussed.
+Did the caller provide or agree to provide their address or delivery location? Include it only if clearly mentioned.
+Did the caller provide or agree to provide their phone number? Include it only if clearly mentioned.
+What delivery date or time does the caller need? Mention if the request is urgent or if the requested delivery time was unavailable.
+Was an appointment, booking, or delivery scheduled? If yes, include the confirmed date and time.
+""",
+
+    "Pest Control & Home Services": """
+What specific home service or pest problem is the caller asking about?
+Is the caller a homeowner or renter?
+What service area or location did the caller mention?
+Was an appointment or inspection scheduled?
+Did the caller want a quote, service, or was it an unrelated inquiry or wrong number?
+How did the call end?
+Did the agent properly handle and qualify the caller?
+""",
+
+    "Insurance (Health / Auto / Home)": """
+What type of insurance coverage is the caller seeking (Health, Medicare, Auto, Home)?
+What is the caller's current insurance or policy situation?
+Is the caller looking for a new policy, quote, or asking about an existing policy?
+Is it a wrong number or unrelated inquiry?
+Did the caller meet qualifying criteria (age, location, employment state)?
+How did the call end (transferred, quote given, callback set)?
+Did the agent properly handle and qualify the caller?
+""",
+
+    "Debt Relief & Financial Services": """
+What type of debt relief or financial assistance is the caller asking for?
+What total amount of debt did the caller state they have?
+Is the debt unsecured (credit cards, personal loans) or secured?
+Is it a wrong number, spam, or unrelated inquiry?
+Was the caller transferred, enrolled, or scheduled for a consultation?
+How did the call end?
+Did the agent properly handle and qualify the caller?
+""",
+}
+
+
+# ============================================================
+# DEFAULT QC QUESTIONS
+# ============================================================
+
+DEFAULT_QC_QUESTIONS = """
+Write a short, natural, human-written QC note for the call using simple English.
+
+Only include information that is clearly understood from the transcript. Focus on the information that is relevant to the campaign and the quality of the call.
+
+Focus on:
+- Why the caller contacted the business or service
+- What product, service, or information the caller was looking for
+- Any important qualification information clearly discussed
+- Location or eligibility information when clearly provided
+- Any price, quote, appointment, transfer, booking, or next step that was actually discussed
+- Whether the call was relevant, unrelated, a wrong number, or otherwise unsuitable
+- Any clear caller objection or concern
+- Any clear agent mistake or handling issue
+- How the call ended
+
+Do not guess, assume, or fill in missing information.
+
+Always distinguish between the caller's information and the agent's statements or questions. An agent's question is NOT the caller's answer. If the caller does not clearly answer a question, skip that information.
+
+If one person speaks and the other person does not respond, describe the actual situation naturally when relevant.
+
+For example:
+"The agent spoke, but the caller did not respond."
+"The agent asked a question, but the caller did not respond."
+"The caller responded, but the agent did not respond."
+
+If neither side responds and the transcript clearly indicates silence, no meaningful speech, or dead air, describe it naturally as:
+"The call had dead air with no response from either side."
+
+If the agent gives a greeting or speaks and there is no caller response, do not create a reason for the call or assume the caller disconnected. Simply describe the lack of response.
+
+If the caller gives a response but the agent does not continue or answer, do not assume that the call was completed, transferred, scheduled, or resolved.
+
+If the transcript contains unclear, garbled, or incomplete speech, do not convert it into a definite response. Only describe the response if the intended meaning is reasonably clear.
+
+Do not use "dead air" when one side clearly responded. Use "did not respond" when only one side failed to respond.
+
+Do not repeat the same response issue multiple times. Mention it once in the most natural place in the QC summary.
+
+Keep the summary short, factual, natural, and conversational, like a human-written QC note.
+
+Write ONE short paragraph only. No bullets, headings, or sections.
+"""
+
+
+# ============================================================
+# MAIN QC SYSTEM PROMPT
+# ============================================================
+
+QC_SYSTEM_PROMPT = """
+You are a Call QC analyst for a pay-per-call affiliate network.
+
+Your task is to summarize a call transcript for QC review based on the campaign-specific QC questions provided below.
+
+The transcript is generated by Vosk speech-to-text and may contain grammar mistakes, repeated words, missing words, or incorrect word recognition. Understand the conversation using context and correct obvious transcription errors only when the intended meaning is clear. Never invent or assume information.
+
+CAMPAIGN:
+{campaign_name}
+
+QC QUESTIONS:
+{qc_questions}
+
+STRICT RULES:
+Read the entire transcript before summarizing.
+Check the transcript against the QC questions for this campaign.
+Include only information clearly supported by the transcript.
+If a QC question is not answered or the information is unclear, skip it completely.
+Never write "not mentioned", "not provided", "unknown", or similar phrases for missing information.
+Never guess or assume missing information.
+Keep campaign-specific details that are relevant to QC and qualification.
+Mention important issues such as wrong number, unrelated inquiry, disqualification, agent mistake, caller objection, fake/coached behavior, or other QC concerns when clearly supported by the call.
+Include how the call ended when this information is available.
+Do not include unnecessary personal information such as the caller's name, phone number, or address.
+Do not repeat information.
+Do not mention the QC questions in the summary.
+Do not use bullet points or numbered lists.
+Do not use headings or separate sections.
+Write ONE short, flat paragraph only.
+Use simple, clear, professional English.
+Focus on facts relevant to the campaign and QC.
+Do not make a payment, credit, or rejection decision unless the QC questions specifically ask for it.
+Do not add any information that is not supported by the transcript.
+
+UNIVERSAL RESPONSE RULES:
+These rules apply to EVERY campaign, including campaigns with campaign-specific QC questions and campaigns using the default QC questions.
+
+Always pay attention to whether both sides actually responded to each other.
+
+An agent's question is NOT the caller's answer.
+
+If the agent speaks or asks a question and the caller does not respond, clearly describe that situation when it is relevant to the QC outcome.
+
+Use natural wording such as:
+"The agent spoke, but the caller did not respond."
+"The agent asked a question, but the caller did not respond."
+
+If the caller speaks or asks a question and the agent does not respond, clearly describe that situation when it is relevant to the QC outcome.
+
+Use natural wording such as:
+"The caller responded, but the agent did not respond."
+
+If neither side responds and the transcript clearly indicates silence, no meaningful speech, or dead air, write:
+"The call had dead air with no response from either side."
+
+If the agent gives a greeting or speaks and there is no caller response, do not create a reason for the call and do not assume the caller disconnected. Simply describe the lack of response.
+
+If the caller gives a response but the agent does not continue or answer, do not assume that the call was completed, transferred, scheduled, or resolved.
+
+If the transcript contains unclear, garbled, or incomplete speech, do not convert it into a definite response. Only describe the response if the intended meaning is reasonably clear.
+
+Do not use "dead air" when one side clearly responded.
+Use "did not respond" when only one side failed to respond.
+
+Do not repeat the same response issue multiple times. Mention it once in the most natural place in the QC summary.
+
+If the transcript contains only a greeting, attempted greeting, or very short exchange without a meaningful conversation, summarize only what actually happened. Do not invent a caller intent or campaign qualification.
+
+If the call ends because one side stops responding, describe the actual response pattern when it is relevant. Do not assume the reason for the call ending.
+
+DO NOT use any Markdown formatting or asterisks (* or **). Output PLAIN TEXT ONLY.
+
+OUTPUT:
+Return ONLY the final QC summary paragraph.
+
+CALL TRANSCRIPT:
+{call_transcript}
+"""
+
+
+# ============================================================
+# SHORT TOPIC PROMPT
+# ============================================================
+
+SHORT_TOPIC_PROMPT = """
+MAIN TOPIC SUMMARY:
+
+Write ONE short sentence describing the caller's true main topic and reason for calling based on the summary below.
+
+SUMMARY:
+{call_transcript}
+"""
+
+
+# ============================================================
+# QC QUESTION SELECTOR
+# ============================================================
 
 def get_qc_questions(campaign_name):
-    return CAMPAIGN_QC_QUESTIONS.get(campaign_name, DEFAULT_QC_QUESTIONS)
+    if not campaign_name:
+        return DEFAULT_QC_QUESTIONS
+
+    if campaign_name in CAMPAIGN_QC_QUESTIONS:
+        return CAMPAIGN_QC_QUESTIONS[campaign_name]
+
+    campaign_name_clean = campaign_name.strip().lower()
+
+    for campaign, questions in CAMPAIGN_QC_QUESTIONS.items():
+        if campaign.strip().lower() == campaign_name_clean:
+            return questions
+
+    return DEFAULT_QC_QUESTIONS
+
 
 # ============================================================
-# STRUCTURED AI ANALYSIS
+# HELPER FUNCTIONS
 # ============================================================
-ANALYSIS_SCHEMA={
-    "type":"object",
-    "additionalProperties":False,
-    "properties":{
-        "long_summary":{"type":"string"},"main_topic":{"type":"string"},
-        "call_type":{"type":"string","enum":["QUALIFIED","NON-QUALIFIED","INFO ONLY","WRONG NUMBER","SILENT","SPAM / ROBOT","OTHER"]},
-        "qualification_status":{"type":"string","enum":["QUALIFIED","NON-QUALIFIED","NOT CLEAR","NOT APPLICABLE"]},
-        "caller_intent":{"type":"string"},"why_called":{"type":"string"},"service_requested":{"type":"string"},
-        "insurance":{"type":"string"},"location":{"type":"string"},"outcome":{"type":"string"},
-        "spam_robot":{"type":"boolean"},"spam_confidence":{"type":"integer","minimum":0,"maximum":100},
-        "spam_reason":{"type":"string"},"qc_issue":{"type":"string"},"qualification_reason":{"type":"string"}
-    },
-    "required":["long_summary","main_topic","call_type","qualification_status","caller_intent","why_called","service_requested","insurance","location","outcome","spam_robot","spam_confidence","spam_reason","qc_issue","qualification_reason"]
-}
 
-ANALYSIS_INSTRUCTIONS="""
-You are the QC analyst for a pay-per-call network. Read the entire transcript and return ONLY valid JSON matching the schema.
-Accuracy is more important than brevity. Use only facts supported by the transcript. The transcript may have speech-to-text errors; correct obvious errors only when the intended meaning is clear.
-
-CRITICAL:
-- Never invent facts.
-- Never turn an agent's question into the caller's answer.
-- Do not guess Agent vs Caller when speaker identity is unavailable. Do not output speaker labels or speaker segments.
-- If the caller does not clearly answer a question, leave that field as "Not clear" rather than assuming.
-- Insurance must come from the caller's own statement/answer, not an agent's question. If the caller clearly says no insurance, say that.
-- long_summary must be ONE natural, factual paragraph. Include decision-relevant intent, why called, service, qualification details/reason, insurance, location, outcome and clear QC/spam facts when present. Do not use bullets or headings.
-- main_topic should be a meaningful short topic, NOT simply "SPAM / ROBOT". For example, a Google listing solicitation should have a topic such as "Google listing / SEO solicitation".
-- Do not include unnecessary personal information such as caller name, phone number or full address.
-- If a field is not supported, use "Not clear" (or "Not mentioned" where natural).
-- IMPORTANT: Evaluate EVERY requested field independently against the entire transcript. Do not leave fields as "Not clear" merely because another field is unclear. If the transcript contains a direct or clearly implied answer, record that answer.
-- For qualification, explicitly state what information makes the caller qualified, non-qualified, or why qualification cannot be determined. Do not mark qualification as NOT CLEAR if the transcript clearly contains the required campaign qualification information.
-- For caller_intent and why_called, use the caller's actual request, not the agent's opening question.
-- For service_requested, name the actual service/product discussed.
-- For outcome, state what actually happened at the end of the call: appointment, transfer, quote, referral, callback, refusal, confusion, no response, etc. Do not invent a completed outcome.
-- For location, use the location actually stated by the caller or clearly established in the conversation. Do not replace it with a location merely mentioned by the agent.
-- For insurance, record the insurance the caller actually states, including carrier and type when available.
-- spam_robot should reflect clear spam/robot behavior supported by the call. Deterministic Python rules will also be applied after AI.
-- spam_confidence is your confidence in the spam assessment, 0-100.
-- Do not calculate a quality score. Python will calculate the final score.
-- Do not identify speakers.
-
-CAMPAIGN: {campaign}
-CAMPAIGN QC FOCUS: {qc}
-
-TRANSCRIPT:
-{transcript}
-"""
-
-def clean_ai_text(s):
-    if not s: return ""
-    s=str(s).strip()
-    s=re.sub(r"^```(?:json|text)?\s*|\s*```$", "", s, flags=re.I|re.S)
-    return s.replace("**","").replace("*","").strip()
-
-def parse_json_response(content):
-    content=clean_ai_text(content)
-    try: return json.loads(content)
-    except Exception: pass
-    m=re.search(r"\{.*\}",content,re.S)
-    if m:
-        try: return json.loads(m.group(0))
-        except Exception: pass
-    raise ValueError("AI returned invalid JSON.")
-
-def normalize_analysis(data):
-    defaults={"long_summary":"","main_topic":"General customer inquiry","call_type":"OTHER","qualification_status":"NOT CLEAR","caller_intent":"Not clear","why_called":"Not clear","service_requested":"Not clear","insurance":"Not mentioned","location":"Not mentioned","outcome":"Not clear","spam_robot":False,"spam_confidence":0,"spam_reason":"","qc_issue":"","qualification_reason":"Not clear"}
-    out=defaults.copy(); out.update(data or {})
-    if out["call_type"] not in [x for x in ["QUALIFIED","NON-QUALIFIED","INFO ONLY","WRONG NUMBER","SILENT","SPAM / ROBOT","OTHER"]]: out["call_type"]="OTHER"
-    if out["qualification_status"] not in ["QUALIFIED","NON-QUALIFIED","NOT CLEAR","NOT APPLICABLE"]: out["qualification_status"]="NOT CLEAR"
-    try: out["spam_confidence"]=max(0,min(100,int(out.get("spam_confidence",0))))
-    except Exception: out["spam_confidence"]=0
-    out["spam_robot"]=bool(out.get("spam_robot",False))
-    return out
-
-def usage_from_obj(usage):
-    """Normalize token usage from Groq/Pydantic/dict/OpenAI-compatible APIs."""
-    if usage is None:
-        return {"input": None, "output": None, "total": None}
-
-    # Groq's SDK returns a Pydantic CompletionUsage object. Convert it first.
-    if not isinstance(usage, dict):
-        try:
-            if hasattr(usage, "model_dump"):
-                usage = usage.model_dump()
-        except Exception:
-            pass
-        if not isinstance(usage, dict):
-            try:
-                if hasattr(usage, "dict"):
-                    usage = usage.dict()
-            except Exception:
-                pass
-        if not isinstance(usage, dict):
-            try:
-                usage = vars(usage)
-            except Exception:
-                usage = {}
-
-    if not isinstance(usage, dict):
-        usage = {}
-
-    def get_value(*names):
-        for name in names:
-            value = usage.get(name)
-            if value is not None:
-                return value
-        return None
-
-    input_tokens = get_value("prompt_tokens", "input_tokens", "promptTokenCount")
-    output_tokens = get_value("completion_tokens", "output_tokens", "candidatesTokenCount")
-    total_tokens = get_value("total_tokens", "totalTokenCount")
-
-    # Some providers omit total even though input/output are present.
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        try:
-            total_tokens = int(input_tokens) + int(output_tokens)
-        except Exception:
-            total_tokens = None
-
-    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
-
-def usage_text(provider, model, usage):
-    u=usage_from_obj(usage)
-    def v(x):
-        if x is None:
-            return "N/A"
-        try:
-            return f"{int(x):,}"
-        except Exception:
-            return str(x)
-    return f"{provider} | {model} | In: {v(u['input'])} | Out: {v(u['output'])} | Total: {v(u['total'])}"
-
-def extract_usage_from_response_dict(obj):
-    """Last-resort usage extractor for provider JSON responses."""
-    if not isinstance(obj, dict):
-        return None
-    for key in ("usage", "usageMetadata"):
-        if isinstance(obj.get(key), dict):
-            return obj[key]
-    return None
-
-def provider_specs():
-    # Missing keys are intentionally skipped.
-    return [
-        ("Groq-1", "groq", GROQ_API_KEY, GROQ_SUMMARY_MODEL),
-        ("Groq-2", "groq", GROQ_SECONDARY_API_KEY, GROQ_SUMMARY_MODEL),
-        ("Groq-3", "groq", GROQ_API_KEY_3, GROQ_SUMMARY_MODEL),
-        ("Gemini", "gemini", GEMINI_API_KEY, PROVIDER_MODELS["Gemini"]),
-        ("Cerebras", "openai_compat", CEREBRAS_API_KEY, PROVIDER_MODELS["Cerebras"]),
-        ("OpenRouter", "openai_compat", OPENROUTER_API_KEY, PROVIDER_MODELS["OpenRouter"]),
-        ("Mistral", "openai_compat", MISTRAL_API_KEY, PROVIDER_MODELS["Mistral"]),
-        ("Together", "openai_compat", TOGETHER_API_KEY, PROVIDER_MODELS["Together"]),
-        ("Cohere", "cohere", COHERE_API_KEY, PROVIDER_MODELS["Cohere"]),
-    ]
-
-def openai_compat_analysis(api_key, model, prompt, provider_name):
-    base_urls={
-        "Cerebras":"https://api.cerebras.ai/v1/chat/completions",
-        "OpenRouter":"https://openrouter.ai/api/v1/chat/completions",
-        "Mistral":"https://api.mistral.ai/v1/chat/completions",
-        "Together":"https://api.together.xyz/v1/chat/completions",
-    }
-    headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"}
-    if provider_name=="OpenRouter": headers.update({"HTTP-Referer":"https://streamlit.io","X-Title":"Aunty Next DOOR"})
-    payload={"model":model,"messages":[{"role":"system","content":"Return only valid JSON. Follow the requested schema exactly."},{"role":"user","content":prompt}],"temperature":0.1,"max_tokens":1600,"response_format":{"type":"json_object"}}
-    r=requests.post(base_urls[provider_name],headers=headers,json=payload,timeout=120)
-    r.raise_for_status(); obj=r.json(); content=obj["choices"][0]["message"]["content"]
-    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
-
-def gemini_analysis(api_key, model, prompt):
-    url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    payload={"systemInstruction":{"parts":[{"text":"You are a careful pay-per-call QC analyst. Return only valid JSON matching the requested schema."}]},"contents":[{"role":"user","parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.1,"maxOutputTokens":1600,"responseMimeType":"application/json","responseSchema":ANALYSIS_SCHEMA}}
-    r=requests.post(url,json=payload,timeout=120); r.raise_for_status(); obj=r.json()
-    content="".join(p.get("text","") for p in obj.get("candidates",[{}])[0].get("content",{}).get("parts",[]))
-    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
-
-def cohere_analysis(api_key, model, prompt):
-    url="https://api.cohere.com/v2/chat"
-    headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"}
-    payload={"model":model,"messages":[{"role":"user","content":prompt}],"temperature":0.1,"max_tokens":1600,"response_format":{"type":"json_object"}}
-    r=requests.post(url,headers=headers,json=payload,timeout=120); r.raise_for_status(); obj=r.json()
-    content=obj.get("message",{}).get("content","")
-    if isinstance(content,list): content="".join(x.get("text","") if isinstance(x,dict) else str(x) for x in content)
-    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
-
-def groq_analysis(api_key, model, prompt):
-    client=Groq(api_key=api_key)
-    # json_object is used for portability with gpt-oss-20b; Python validates the final JSON.
-    resp=client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role":"system","content":"Return only valid JSON matching the requested fields."},
-            {"role":"user","content":prompt}
-        ],
-        temperature=0.1,
-        max_tokens=1600,
-        reasoning_effort="low",
-        response_format={"type":"json_object"}
-    )
-    content=resp.choices[0].message.content or ""
-
-    # Groq SDK normally exposes resp.usage directly. Keep fallbacks for SDK/version differences.
-    usage=getattr(resp,"usage",None)
-    if usage is None:
-        try:
-            usage=resp.model_dump().get("usage")
-        except Exception:
-            pass
-    if usage is None:
-        try:
-            usage=resp.dict().get("usage")
-        except Exception:
-            pass
-
-    return parse_json_response(content), usage
-
-def run_provider(name, kind, key, model, prompt):
-    if kind=="groq": return groq_analysis(key,model,prompt)
-    if kind=="gemini": return gemini_analysis(key,model,prompt)
-    if kind=="cohere": return cohere_analysis(key,model,prompt)
-    return openai_compat_analysis(key,model,prompt,name)
-
-# ============================================================
-# DETERMINISTIC SPAM + SCORING
-# ============================================================
-def apply_deterministic_spam_rules(analysis, transcript):
-    text=(transcript or "").lower()
-    a=normalize_analysis(analysis)
-    # Latest business rule: ANY Yelp or Yellow Pages mention is spam.
-    if "yelp" in text or "yellow pages" in text:
-        a["spam_robot"]=True; a["spam_confidence"]=100
-        a["spam_reason"]="Caller mentioned Yelp or Yellow Pages."
-        if not a.get("main_topic") or a["main_topic"].lower() in {"spam / robot","spam","other"}:
-            a["main_topic"]="Yelp / Yellow Pages inquiry"
-        a["call_type"]="SPAM / ROBOT"
-        return a
-    patterns=[
-        (r"google\s+(business|listing|maps)|google listing|seo|search engine optimization|listing verification|business verification|directory verification",95,"Google listing / SEO / verification solicitation."),
-        (r"press\s*[09]|press zero|press nine",90,"Automated or scripted press-key behavior."),
-        (r"debt relief marketing|loan marketing|insurance sales|marketing call|telemarketing",90,"Marketing or solicitation behavior."),
-        (r"optimize your listing|verify your business|claim your listing",95,"Business directory/listing solicitation."),
-    ]
-    for pat,conf,reason in patterns:
-        if re.search(pat,text,re.I):
-            a["spam_robot"]=True; a["spam_confidence"]=max(int(a.get("spam_confidence",0)),conf); a["spam_reason"]=reason
-            if a["call_type"]=="OTHER": a["call_type"]="SPAM / ROBOT"
-            break
-    return a
-
-def deterministic_flags(a, transcript):
-    text=(transcript or "").strip().lower()
-    words=re.findall(r"\b\w+\b",text)
-    silent=(len(words)<3)
-    wrong= a.get("call_type")=="WRONG NUMBER" or "wrong number" in text
-    nonqual=a.get("qualification_status")=="NON-QUALIFIED" or a.get("call_type")=="NON-QUALIFIED"
-    info=a.get("call_type")=="INFO ONLY"
-    return silent,wrong,nonqual,info
-
-def calculate_quality_score(a, transcript, campaign):
-    score=0; reasons=[]
-    if a.get("qualification_status")=="QUALIFIED": score+=25; reasons.append("Qualified")
-    if a.get("service_requested") not in ["", "Not clear", "Not mentioned"]: score+=15; reasons.append("Service requested")
-    # Qualification information is represented by a concrete reason/status.
-    if a.get("qualification_reason") not in ["", "Not clear", "Not mentioned"] or a.get("qualification_status") in ["QUALIFIED","NON-QUALIFIED"]:
-        score+=15; reasons.append("Qualification information")
-    if a.get("location") not in ["", "Not clear", "Not mentioned"]: score+=10; reasons.append("Location/eligibility")
-    if a.get("outcome") not in ["", "Not clear", "Not mentioned"]: score+=10; reasons.append("Clear outcome")
-    if len(re.findall(r"\b\w+\b",transcript or ""))>=12: score+=10; reasons.append("Two-way/meaningful conversation")
-    if not a.get("spam_robot"): score+=5; reasons.append("No spam")
-    if not a.get("qc_issue"): score+=10; reasons.append("No major QC issue")
-    score=min(100,score)
-    silent,wrong,nonqual,info=deterministic_flags(a,transcript)
-    if a.get("spam_robot") and int(a.get("spam_confidence",0))>=90: score=5
-    elif a.get("spam_robot"): score=min(score,25)
-    if wrong: score=min(score,30)
-    if silent: score=min(score,15)
-    if nonqual or info: score=min(score,60)
-    if campaign=="Rehab & Addiction Treatment":
-        ins=(a.get("insurance") or "").lower()
-        if any(x in ins for x in ["medicaid","medicare","government","state insurance","public insurance"]): score=min(score,60)
-    return int(max(0,min(100,score))), reasons
-
-def decision_signal(score,a):
-    if a.get("spam_robot") and int(a.get("spam_confidence",0))>=90: return "REJECT / SPAM"
-    if score>=90:return "KEEP / HIGH VALUE"
-    if score>=80:return "KEEP / GOOD"
-    if score>=60:return "REVIEW"
-    if score>=40:return "LOW QUALITY / REVIEW"
-    return "REJECT / INVESTIGATE"
-
-def score_color(score):
-    if score>=95:return "#15803d"
-    if score>=80:return "#86efac"
-    if score>=60:return "#fde047"
-    if score>=40:return "#fb923c"
-    return "#f87171"
-
-def get_score_basis(a, reasons, score):
-    basis=", ".join(reasons) if reasons else "No positive quality factors"
-    if a.get("spam_robot") and a.get("spam_confidence",0)>=90: basis+="; high-confidence spam cap"
-    if a.get("qualification_status")=="NON-QUALIFIED": basis+="; non-qualified cap"
-    if a.get("call_type")=="WRONG NUMBER": basis+="; wrong-number cap"
-    if a.get("call_type")=="SILENT": basis+="; silent-call cap"
-    if a.get("call_type")=="INFO ONLY": basis+="; info-only cap"
-    return basis
-
-def build_k_report(a,score,reasons,decision):
-    fields=[
-        ("Call Type",a.get("call_type")),("Caller Intent",a.get("caller_intent")),("Why Called",a.get("why_called")),
-        ("Service Interest",a.get("service_requested")),("Qualification",a.get("qualification_status")),
-        ("Qualification Reason",a.get("qualification_reason")),("Insurance",a.get("insurance")),("Location",a.get("location")),
-        ("Outcome",a.get("outcome")),("Spam/Robot",str(a.get("spam_robot"))),
-        ("Spam Confidence",str(a.get("spam_confidence"))),("Spam Reason",a.get("spam_reason") or "None"),
-        ("QC Issue",a.get("qc_issue") or "None"),("Decision Signal",decision),
-        ("Score Basis",get_score_basis(a,reasons,score)),("Quality Score",str(score))]
-    return "\n".join(f"{k}: {v or 'Not clear'}" for k,v in fields)
-
-def generate_call_analysis(full_transcript,campaign_name):
-    if not full_transcript.strip(): raise ValueError("Transcript is empty.")
-    prompt=ANALYSIS_INSTRUCTIONS.format(campaign=campaign_name,qc=get_qc_questions(campaign_name),transcript=full_transcript)
-    errors=[]
-    for name,kind,key,model in provider_specs():
-        if not key: continue
-        try:
-            raw,usage=run_provider(name,kind,key,model,prompt)
-            a=normalize_analysis(raw)
-            a=apply_deterministic_spam_rules(a,full_transcript)
-            a["main_topic"]=clean_ai_text(a.get("main_topic")) or "General customer inquiry"
-            a["long_summary"]=clean_ai_text(a.get("long_summary")) or "No clear summary available."
-            a["long_summary"]=a["long_summary"].replace("\n"," ").strip()
-            a["provider"]=name; a["model"]=model; a["usage"]=usage_from_obj(usage)
-            st.session_state.last_analysis_provider=name; st.session_state.last_analysis_usage=a["usage"]; st.session_state.last_analysis_error=""
-            return a
-        except Exception as e:
-            errors.append(f"{name}: {str(e)[:180]}")
-            continue
-    raise RuntimeError("All configured AI analysis providers failed or were unavailable. " + " | ".join(errors[-3:]))
-
-# ============================================================
-# TRANSCRIPTION / AUDIO
-# ============================================================
 def format_time(seconds):
-    seconds=max(0,float(seconds or 0)); return f"{int(seconds//60):02d}:{int(seconds%60):02d}"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY: raise RuntimeError("Groq API key not found for Whisper transcription.")
-    client=Groq(api_key=GROQ_API_KEY)
-    with open(audio_file_path,"rb") as f:
-        tr=client.audio.transcriptions.create(file=(os.path.basename(audio_file_path),f.read()),model=GROQ_TRANSCRIPTION_MODEL,response_format="verbose_json",language="en")
-    timeline=[]; texts=[]; segments=getattr(tr,"segments",None)
+    if not GROQ_API_KEY:
+        raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
+
+    client = Groq(api_key=GROQ_API_KEY)
+
+    with open(audio_file_path, "rb") as file:
+        transcription = client.audio.transcriptions.create(
+            file=(os.path.basename(audio_file_path), file.read()),
+            model="whisper-large-v3-turbo",
+            response_format="verbose_json",
+            language="en",
+        )
+
+    timeline_data = []
+    raw_text_segments = []
+
+    segments = getattr(transcription, "segments", None)
     if segments:
         for seg in segments:
-            start=seg.get("start",0.0) if isinstance(seg,dict) else seg.start
-            end=seg.get("end",0.0) if isinstance(seg,dict) else seg.end
-            txt=(seg.get("text","") if isinstance(seg,dict) else seg.text).strip()
-            if txt:
-                timeline.append({"time":f"{format_time(start)} â {format_time(end)}","speaker":"Speaker","line":txt}); texts.append(txt)
+            start_t = seg.get("start", 0.0) if isinstance(seg, dict) else seg.start
+            end_t = seg.get("end", 0.0) if isinstance(seg, dict) else seg.end
+            text_value = seg.get("text", "").strip() if isinstance(seg, dict) else seg.text.strip()
+            if text_value:
+                timeline_data.append({
+                    "time": f"{format_time(start_t)} – {format_time(end_t)}",
+                    "speaker": "Unknown",
+                    "line": text_value,
+                })
+                raw_text_segments.append(text_value)
     else:
-        txt=getattr(tr,"text","").strip()
-        if txt: timeline.append({"time":"00:00 â 00:00","speaker":"Speaker","line":txt}); texts.append(txt)
-    return timeline,texts
+        full_text = getattr(transcription, "text", "").strip()
+        if full_text:
+            timeline_data.append({"time": "00:00 – 00:00", "speaker": "Unknown", "line": full_text})
+            raw_text_segments.append(full_text)
+
+    return timeline_data, raw_text_segments
+
+
+GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
+
+
+CALL_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "long_summary": {"type": "string"},
+        "main_topic": {"type": "string"},
+        "call_type": {
+            "type": "string",
+            "enum": ["QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT", "INFORMATION ONLY", "SILENT / NO RESPONSE", "OTHER"]
+        },
+        "qualification_status": {
+            "type": "string",
+            "enum": ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"]
+        },
+        "caller_intent": {"type": "string"},
+        "why_called": {"type": "string"},
+        "service_requested": {"type": "string"},
+        "insurance": {"type": "string"},
+        "location": {"type": "string"},
+        "outcome": {"type": "string"},
+        "spam_robot": {"type": "boolean"},
+        "spam_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "qc_issue": {"type": "string"},
+        "relevant_intent": {"type": "boolean"},
+        "qualification_info_present": {"type": "boolean"},
+        "location_or_eligibility_present": {"type": "boolean"},
+        "clear_outcome": {"type": "boolean"},
+        "two_way_conversation": {"type": "boolean"},
+        "major_qc_issue": {"type": "boolean"},
+        "speaker_segments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "segment_id": {"type": "integer"},
+                    "speaker": {"type": "string", "enum": ["Agent", "Caller", "Unknown"]}
+                },
+                "required": ["segment_id", "speaker"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": [
+        "long_summary", "main_topic", "call_type", "qualification_status",
+        "caller_intent", "why_called", "service_requested", "insurance", "location",
+        "outcome", "spam_robot", "spam_confidence", "qc_issue", "relevant_intent",
+        "qualification_info_present", "location_or_eligibility_present", "clear_outcome",
+        "two_way_conversation", "major_qc_issue", "speaker_segments"
+    ],
+    "additionalProperties": False
+}
+
+
+def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
+    qc_questions = get_qc_questions(campaign_name)
+
+    if timeline_data:
+        transcript_for_ai = "\n".join(
+            f"SEGMENT {i}: [{item.get('time', '')}] {item.get('line', '').strip()}"
+            for i, item in enumerate(timeline_data, start=1)
+            if item.get("line", "").strip()
+        )
+    else:
+        transcript_for_ai = full_transcript
+
+    return f"""
+You are the call-analysis and QC engine for a pay-per-call network.
+
+CAMPAIGN FAMILY:
+{campaign_name}
+
+CAMPAIGN QC GUIDANCE:
+{qc_questions}
+
+Your job is to analyze the complete transcript and return structured call information.
+
+IMPORTANT SPEAKER RULE:
+Whisper provides transcript segments but does not reliably identify speakers. You must infer whether each numbered segment is from the Agent, Caller, or Unknown using the conversation context. The agent is usually the representative asking qualification questions, explaining services, pricing, scheduling, transferring, or giving instructions. The caller is the person seeking the service, asking for help, answering qualification questions, or describing their problem.
+An Agent question is NEVER the Caller answer. Never infer caller information from an agent question.
+If the speaker cannot be determined with reasonable confidence, use Unknown instead of guessing.
+
+LONG SUMMARY RULES:
+- Write a factual, useful 2-5 sentence summary in simple natural English.
+- Describe only what actually happened in the call.
+- Include the caller's real reason for calling, requested service, important qualification information, insurance when clearly stated by the caller, location when relevant, important agent/caller actions, and the actual outcome when supported.
+- Do not add filler such as "the conversation was natural" or "there were no obvious signs of a robot" unless that fact is itself relevant to QC.
+- Do not invent facts, outcomes, appointments, insurance, or caller intent.
+- If the caller was not looking for the campaign service, explain what they actually wanted instead of simply writing "irrelevant".
+- If it was a wrong number, say what the caller was trying to reach when clear.
+- If it was spam/robot, summarize what the automated call was promoting or asking the recipient to do.
+- Never turn an Agent's question into a Caller answer.
+- Do not include unnecessary personal information such as full phone numbers or addresses.
+
+MAIN TOPIC RULES:
+- One short sentence, normally 5-15 words.
+- Answer: "What was this caller actually calling about?"
+- Do not make SPAM / ROBOT the main topic unless the call itself was an automated solicitation or spam event. In that case, describe the actual subject, such as "Automated Google listing and SEO solicitation."
+- For unrelated calls, describe the actual request and make it clear that it was unrelated.
+
+SPAM / ROBOT RULES:
+- Do NOT use exact phrase matching only.
+- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Similar wording must be recognized even when the exact words differ.
+- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
+- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
+- spam_confidence must reflect the strength of the evidence from 0-100.
+
+QUALIFICATION RULES:
+- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
+- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
+- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
+
+MISSING INFORMATION:
+For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
+
+CALL TYPE:
+- QUALIFIED: relevant and clearly qualified.
+- NON-QUALIFIED: relevant but clearly not qualified.
+- WRONG NUMBER: caller was trying to reach another person/business/service.
+- SPAM / ROBOT: automated/scripted spam or marketing call.
+- INFORMATION ONLY: caller wanted information but not the campaign service/action.
+- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
+- OTHER: anything else that does not fit the categories.
+
+QC ISSUE:
+Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
+
+Read the entire transcript before deciding.
+
+TRANSCRIPT:
+{transcript_for_ai}
+"""
+
+
+def _call_structured_analysis(client, prompt):
+    response = client.chat.completions.create(
+        model=GROQ_SUMMARY_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "Return only the structured call-analysis object. Do not add commentary."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
+        max_tokens=1400,
+        reasoning_effort="low",
+        reasoning_format="hidden",
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "call_qc_analysis",
+                "strict": True,
+                "schema": CALL_ANALYSIS_SCHEMA
+            }
+        }
+    )
+    content = response.choices[0].message.content or "{}"
+    return json.loads(content)
+
+
+def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
+    if not full_transcript.strip():
+        raise RuntimeError("No transcription text was available for AI analysis.")
+
+    if not GROQ_API_KEY:
+        raise RuntimeError("Primary Groq API key is not configured.")
+
+    prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
+    primary_error = None
+
+    try:
+        analysis = _call_structured_analysis(Groq(api_key=GROQ_API_KEY), prompt)
+    except Exception as primary_exc:
+        primary_error = primary_exc
+        if not GROQ_SECONDARY_API_KEY:
+            raise RuntimeError(f"Primary Groq analysis failed: {primary_exc}")
+        try:
+            analysis = _call_structured_analysis(Groq(api_key=GROQ_SECONDARY_API_KEY), prompt)
+        except Exception as secondary_exc:
+            raise RuntimeError(
+                f"Both Groq analysis accounts failed. Primary: {primary_error}. Secondary: {secondary_exc}"
+            )
+
+    if timeline_data is not None:
+        speaker_map = {
+            int(item.get("segment_id")): item.get("speaker", "Unknown")
+            for item in analysis.get("speaker_segments", [])
+        }
+        for idx, item in enumerate(timeline_data, start=1):
+            item["speaker"] = speaker_map.get(idx, "Unknown")
+
+    analysis["main_topic"] = str(analysis.get("main_topic", "")).replace("*", "").strip()
+    analysis["long_summary"] = str(analysis.get("long_summary", "")).replace("*", "").strip()
+    analysis["qc_issue"] = str(analysis.get("qc_issue", "")).replace("*", "").strip()
+    return analysis
+
+
+def generate_summaries_groq(full_transcript, campaign_name, timeline_data=None):
+    """Compatibility wrapper for the existing UI: returns (main_topic, long_summary)."""
+    analysis = generate_call_analysis_groq(
+        full_transcript,
+        get_campaign_category(campaign_name),
+        timeline_data=timeline_data,
+    )
+    return analysis["main_topic"], analysis["long_summary"]
+
+
+def build_qc_report(analysis):
+    parts = [
+        f"Call Type: {analysis.get('call_type', 'OTHER')}",
+        f"Caller Intent: {analysis.get('caller_intent', '').strip()}",
+        f"Why They Called: {analysis.get('why_called', '').strip()}",
+        f"Treatment/Service Interest: {analysis.get('service_requested', '').strip()}",
+    ]
+
+    if analysis.get("insurance", "").strip():
+        parts.append(f"Insurance: {analysis['insurance'].strip()}")
+    if analysis.get("location", "").strip():
+        parts.append(f"Location: {analysis['location'].strip()}")
+    if analysis.get("outcome", "").strip():
+        parts.append(f"Outcome: {analysis['outcome'].strip()}")
+
+    parts.extend([
+        f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
+        f"Spam Confidence: {int(analysis.get('spam_confidence', 0))}%",
+        f"QC Issue: {analysis.get('qc_issue', '').strip() or 'None'}",
+    ])
+
+    return " | ".join(part for part in parts if part.split(": ", 1)[-1].strip())
+
+
+def calculate_call_quality_score(analysis):
+    """Deterministic 0-100 score. AI supplies facts; Python supplies the score."""
+    score = 0
+
+    qualification_status = analysis.get("qualification_status", "NOT CLEAR")
+    if qualification_status == "QUALIFIED":
+        score += 25
+    elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
+        score += 10
+
+    if analysis.get("service_requested", "").strip():
+        score += 15
+    if analysis.get("qualification_info_present"):
+        score += 15
+    if analysis.get("location_or_eligibility_present"):
+        score += 10
+    if analysis.get("clear_outcome"):
+        score += 10
+    if analysis.get("two_way_conversation"):
+        score += 10
+    if not analysis.get("spam_robot"):
+        score += 5
+    if not analysis.get("major_qc_issue"):
+        score += 10
+
+    call_type = analysis.get("call_type", "OTHER")
+    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+
+    if analysis.get("spam_robot") and spam_confidence >= 90:
+        return 5
+    if analysis.get("spam_robot"):
+        return min(score, 25)
+    if call_type == "WRONG NUMBER":
+        return min(score, 30)
+    if call_type == "SILENT / NO RESPONSE":
+        return min(score, 15)
+    if call_type in {"NON-QUALIFIED", "INFORMATION ONLY"}:
+        return min(score, 60)
+
+    return max(0, min(100, score))
+
+
+SCORE_COLORS = {
+    "excellent": {"red": 0.56, "green": 0.83, "blue": 0.60},
+    "good": {"red": 0.75, "green": 0.93, "blue": 0.78},
+    "yellow": {"red": 1.00, "green": 0.93, "blue": 0.60},
+    "orange": {"red": 1.00, "green": 0.78, "blue": 0.50},
+    "poor": {"red": 1.00, "green": 0.60, "blue": 0.60},
+    "spam": {"red": 1.00, "green": 0.35, "blue": 0.35},
+}
+
+
+def get_score_color(score, analysis):
+    if analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90:
+        return SCORE_COLORS["spam"]
+    if score >= 95:
+        return SCORE_COLORS["excellent"]
+    if score >= 80:
+        return SCORE_COLORS["good"]
+    if score >= 60:
+        return SCORE_COLORS["yellow"]
+    if score >= 40:
+        return SCORE_COLORS["orange"]
+    return SCORE_COLORS["poor"]
+
+
+def _background_is_special(background):
+    if not background:
+        return False
+
+    color = background.get("rgbColor", background)
+    if not isinstance(color, dict):
+        return False
+
+    r = 1.0 if color.get("red") is None else float(color.get("red", 1.0))
+    g = 1.0 if color.get("green") is None else float(color.get("green", 1.0))
+    b = 1.0 if color.get("blue") is None else float(color.get("blue", 1.0))
+
+    # Treat plain/near-white as the normal background.
+    return not (r >= 0.97 and g >= 0.97 and b >= 0.97)
+
+
+def get_existing_special_columns(worksheet, start_row, end_row):
+    """Read user-entered background colors so existing VOIP/special colors survive score coloring."""
+    if end_row < start_row:
+        return {}
+
+    try:
+        metadata = worksheet.spreadsheet.fetch_sheet_metadata(
+            params={
+                "includeGridData": True,
+                "ranges": [f"'{worksheet.title}'!A{start_row}:L{end_row}"],
+                "fields": "sheets/data/startRow,sheets/data/rowData/values/userEnteredFormat/backgroundColor,sheets/data/rowData/values/userEnteredFormat/backgroundColorStyle",
+            }
+        )
+    except Exception:
+        return {}
+
+    special_by_row = {}
+
+    for sheet_data in metadata.get("sheets", []):
+        for grid_data in sheet_data.get("data", []):
+            base_row = int(grid_data.get("startRow", start_row - 1)) + 1
+            for offset, row_data in enumerate(grid_data.get("rowData", [])):
+                row_number = base_row + offset
+                special_columns = set()
+
+                for col_number, cell in enumerate(row_data.get("values", []), start=1):
+                    user_format = cell.get("userEnteredFormat", {})
+                    background = user_format.get("backgroundColor")
+                    background_style = user_format.get("backgroundColorStyle")
+                    if _background_is_special(background) or _background_is_special(background_style):
+                        special_columns.add(col_number)
+
+                special_by_row[row_number] = special_columns
+
+    return special_by_row
+
+
+def _column_letter(number):
+    result = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _contiguous_ranges_for_row(row_number, columns):
+    if not columns:
+        return []
+
+    columns = sorted(set(columns))
+    ranges = []
+    start_col = previous_col = columns[0]
+
+    for col in columns[1:]:
+        if col == previous_col + 1:
+            previous_col = col
+            continue
+
+        ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
+        start_col = previous_col = col
+
+    ranges.append(f"{_column_letter(start_col)}{row_number}:{_column_letter(previous_col)}{row_number}")
+    return ranges
+
+
+def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
+    """Color A:L by score while preserving existing special colors, except high-confidence spam is fully red."""
+    special_columns = set(special_columns or [])
+    color = get_score_color(score, analysis)
+
+    high_confidence_spam = analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90
+
+    if high_confidence_spam:
+        worksheet.format(
+            f"A{row_number}:L{row_number}",
+            {"backgroundColor": SCORE_COLORS["spam"]}
+        )
+        return
+
+    # L (score) always gets the score color, even if it previously had a color.
+    columns_to_color = [col for col in range(1, 13) if col not in special_columns and col != 12]
+    ranges = _contiguous_ranges_for_row(row_number, columns_to_color)
+    ranges.append(f"L{row_number}")
+
+    if ranges:
+        worksheet.format(ranges, {"backgroundColor": color})
 
 def save_uploaded_audio(uploaded_file):
-    ext=Path(uploaded_file.name).suffix.lower()
-    if ext not in {".mp3",".wav"}: raise ValueError("Only MP3 and WAV are supported.")
-    path=UPLOAD_DIR/f"{uuid.uuid4().hex}{ext}"; path.write_bytes(uploaded_file.getbuffer())
-    try: duration=len(AudioSegment.from_file(path))/1000
-    except Exception: duration=60
-    st.session_state.update(source_name=uploaded_file.name,file_path=str(path),duration_sec=duration,est_proc_sec=max(1,round(duration*.008,1)),source_type="Uploaded file",transcribed=False,transcript=[],full_text="",short_topic="No transcription available yet.",detailed_summary="No summary generated yet.",status="Audio loaded and ready for processing.")
+    ext = Path(uploaded_file.name).suffix.lower()
+    if ext not in {".mp3", ".wav"}:
+        raise ValueError("Only MP3 and WAV are supported.")
+
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    path = UPLOAD_DIR / safe_name
+
+    with open(path, "wb") as output:
+        output.write(uploaded_file.getbuffer())
+
+    try:
+        sound = AudioSegment.from_file(path)
+        duration_sec = len(sound) / 1000.0
+    except Exception:
+        duration_sec = 60.0
+
+    st.session_state.source_name = uploaded_file.name
+    st.session_state.file_path = str(path)
+    st.session_state.duration_sec = duration_sec
+    st.session_state.est_proc_sec = max(1.0, round(duration_sec * 0.008, 1))
+    st.session_state.source_type = "Uploaded file"
+    st.session_state.transcribed = False
+    st.session_state.transcript = []
+    st.session_state.full_text = ""
+    st.session_state.short_topic = "No transcription available yet."
+    st.session_state.detailed_summary = "No summary generated yet."
+    st.session_state.status = "Audio loaded and ready for processing."
 
 def load_audio_url(url):
-    url=url.strip();
-    if not url: raise ValueError("URL is required.")
-    filename=url.split("/")[-1].split("?")[0] or "web_audio.mp3"; ext=Path(filename).suffix.lower(); ext=ext if ext in {".mp3",".wav"} else ".mp3"; path=UPLOAD_DIR/f"{uuid.uuid4().hex}{ext}"
-    req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"})
-    with urllib.request.urlopen(req,timeout=120) as r: path.write_bytes(r.read())
-    duration=len(AudioSegment.from_file(path))/1000
-    st.session_state.update(source_name=filename,file_path=str(path),duration_sec=duration,est_proc_sec=max(1,round(duration*.008,1)),source_type="Recording URL",transcribed=False,transcript=[],full_text="",short_topic="No transcription available yet.",detailed_summary="No summary generated yet.",status="Recording link loaded and ready.")
+    url = url.strip()
+    if not url:
+        raise ValueError("URL is required.")
 
-# ============================================================
-# GOOGLE SHEETS SYNC
-# ============================================================
-def get_gspread_client():
-    if os.path.exists("service_account.json"): return gspread.service_account(filename="service_account.json")
-    return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    filename = url.split("/")[-1].split("?")[0] or "web_audio.mp3"
+    ext = Path(filename).suffix.lower()
+    safe_name = f"{uuid.uuid4().hex}{ext if ext in {'.mp3', '.wav'} else '.mp3'}"
+    path = UPLOAD_DIR / safe_name
 
-def apply_row_score_color(worksheet,row,score):
-    # Final score color is authoritative. Existing VoIP/pink logic does not override it.
-    color=score_color(score)
-    rgb={"#15803d":(0.08,0.50,0.24),"#86efac":(0.53,0.93,0.67),"#fde047":(0.99,0.87,0.28),"#fb923c":(0.98,0.57,0.24),"#f87171":(0.97,0.44,0.44)}.get(color,(0.97,0.44,0.44))
-    try:
-        worksheet.format(f"A{row}:L{row}",{"backgroundColor":{"red":rgb[0],"green":rgb[1],"blue":rgb[2]}})
-    except Exception: pass
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as response:
+        with open(path, "wb") as out_file:
+            out_file.write(response.read())
 
-def update_q_cell(ws,row,value):
-    """Write Q reliably and never hide the real Sheets error."""
-    last_error=None
-    try:
-        # Some worksheets have fewer than 17 grid columns. Expand them first.
-        try:
-            if getattr(ws, "col_count", 0) < 17:
-                ws.add_cols(17 - int(ws.col_count))
-        except Exception:
-            pass
-        ws.update_cell(row,17,value)
-        return True, ""
-    except Exception as e:
-        last_error=str(e)
+    sound = AudioSegment.from_file(path)
+    duration_sec = len(sound) / 1000.0
+
+    st.session_state.source_name = filename
+    st.session_state.file_path = str(path)
+    st.session_state.duration_sec = duration_sec
+    st.session_state.est_proc_sec = max(1.0, round(duration_sec * 0.008, 1))
+    st.session_state.source_type = "Recording URL"
+    st.session_state.transcribed = False
+    st.session_state.transcript = []
+    st.session_state.full_text = ""
+    st.session_state.short_topic = "No transcription available yet."
+    st.session_state.detailed_summary = "No summary generated yet."
+    st.session_state.status = "Recording link loaded and ready."
+
+
+def get_google_client():
+    """Connect to Google Sheets using the local service account or Streamlit Secrets."""
+    if os.path.exists("service_account.json"):
+        return gspread.service_account(filename="service_account.json")
 
     try:
-        ws.update(f"Q{row}", [[value]])
-        return True, ""
-    except Exception as e:
-        last_error=f"{last_error} | fallback: {e}"
+        return gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    except Exception as exc:
+        raise RuntimeError(
+            "Google Sheets credentials not found. Add service_account.json or gcp_service_account to Streamlit Secrets."
+        ) from exc
 
-    return False, last_error
 
 def sync_google_sheet_batch(default_campaign_name=""):
-    sheet_names=["Ringba to Sheet QC"]; total=0; status=st.empty()
+    """Process Ringba recordings from the shared Google Sheet.
+
+    Sheet layout:
+    D = Campaign
+    G = Long AI Summary
+    H = Main Topic / processing flag
+    I = Recording URL
+    J = Existing carrier / VOIP data (untouched)
+    K = AI QC Report
+    L = Numeric quality score
+    """
     try:
-        gc=get_gspread_client()
-        for sheet_name in sheet_names:
+        gc = get_google_client()
+        sheet = gc.open("Ringba to Sheet QC")
+        worksheet = sheet.worksheet("Sheet1")
+
+        rows = worksheet.get_all_values()
+        processed_count = 0
+
+        if len(rows) > 1:
+            special_color_map = get_existing_special_columns(worksheet, 2, len(rows))
+        else:
+            special_color_map = {}
+
+        for index, row in enumerate(rows[1:], start=2):
+            raw_campaign = row[3].strip() if len(row) > 3 else ""
+            raw_duration = row[5].strip() if len(row) > 5 else ""
+            existing_main_topic = row[7].strip() if len(row) > 7 else ""
+            recording_url = row[8].strip() if len(row) > 8 else ""
+
+            # Keep the existing duration formatting behavior.
+            if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
+                try:
+                    worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+
+            # Existing trigger stays: recording exists + H is empty.
+            if not recording_url or not recording_url.startswith("http") or existing_main_topic:
+                continue
+
             try:
-                status.text(f"Checking sheet: {sheet_name}..."); ws=gc.open(sheet_name).worksheet("Sheet1"); rows=ws.get_all_values()
-                if len(rows)<2: continue
-                for index,row in enumerate(rows[1:],start=2):
-                    raw_campaign=row[3].strip() if len(row)>3 else ""; raw_duration=row[5].strip() if len(row)>5 else ""; existing_h=row[7].strip() if len(row)>7 else ""; rec=row[8].strip() if len(row)>8 else ""
-                    if raw_duration and ":" not in raw_duration and raw_duration.isdigit():
-                        sec=int(raw_duration); ws.update_cell(index,6,f"{sec//3600}:{(sec%3600)//60:02d}:{sec%60:02d}"); time.sleep(.3)
-                    if not (rec.startswith("http") and not existing_h): continue
-                    try:
-                        status.text(f"Row {index}: downloading audio..."); r=requests.get(rec,headers={"User-Agent":"Mozilla/5.0"},timeout=30); r.raise_for_status(); temp=f"temp_downloaded_audio_{uuid.uuid4().hex}.mp3"; Path(temp).write_bytes(r.content)
-                        status.text(f"Row {index}: transcribing..."); _,texts=transcribe_groq_whisper(temp); transcript=" ".join(texts)
-                        status.text(f"Row {index}: AI QC analysis..."); campaign=get_campaign_category(raw_campaign) if raw_campaign else (default_campaign_name or "General Customer Inquiry"); a=generate_call_analysis(transcript,campaign)
-                        score,reasons=calculate_quality_score(a,transcript,campaign); decision=decision_signal(score,a); k=build_k_report(a,score,reasons,decision)
-                        ws.update_cell(index,7,a["long_summary"]); ws.update_cell(index,8,a["main_topic"]); ws.update_cell(index,11,k); ws.update_cell(index,12,score)
-                        q_value=usage_text(a["provider"],a["model"],a["usage"])
-                        q_ok,q_error=update_q_cell(ws,index,q_value)
-                        if not q_ok:
-                            raise RuntimeError(f"Q column write failed: {q_error}")
-                        apply_row_score_color(ws,index,score)
-                        total+=1; time.sleep(1)
-                        try: os.remove(temp)
-                        except Exception: pass
-                    except Exception as row_err:
-                        # Do not overwrite J. K gets the processing error and Q records failure status.
-                        try:
-                            ws.update_cell(index,11,f"Processing Error: {str(row_err)[:500]}")
-                            q_ok,q_error=update_q_cell(ws,index,f"FAILED | {str(row_err)[:300]}")
-                            if not q_ok:
-                                status.text(f"Row {index}: Q write failed: {q_error}")
-                        except Exception:
-                            pass
-            except Exception: continue
-        status.empty(); return True,f"Successfully processed {total} new call records!"
+                campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
+                if not campaign_to_use:
+                    campaign_to_use = "General Customer Inquiry"
+
+                load_audio_url(recording_url)
+                timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                full_transcript_str = " ".join(raw_text_segments).strip()
+
+                analysis = generate_call_analysis_groq(
+                    full_transcript_str,
+                    campaign_to_use,
+                    timeline_data=timeline_data,
+                )
+
+                main_topic = analysis["main_topic"]
+                detailed_summary = analysis["long_summary"]
+                qc_report = build_qc_report(analysis)
+                score = calculate_call_quality_score(analysis)
+
+                worksheet.update_cell(index, 7, detailed_summary)  # G
+                worksheet.update_cell(index, 8, main_topic)        # H
+                worksheet.update_cell(index, 11, qc_report)        # K
+                worksheet.update_cell(index, 12, score)             # L
+
+                apply_row_score_color(
+                    worksheet,
+                    index,
+                    score,
+                    analysis,
+                    special_color_map.get(index, set()),
+                )
+
+                processed_count += 1
+                time.sleep(1)
+
+            except Exception as e:
+                error_text = f"Processing error: {str(e)}"
+                try:
+                    worksheet.update_cell(index, 7, error_text)
+                    worksheet.update_cell(index, 11, error_text)
+                except Exception:
+                    pass
+
+        return True, f"Successfully processed {processed_count} new recordings!"
     except Exception as e:
-        status.empty(); return False,f"Google Sheets connection error: {e}"
+        return False, f"Google Sheets error: {str(e)}"
+
 
 # ============================================================
-# THEME
+# THEME DYNAMIC INJECTION
 # ============================================================
-theme_vars="""
---bg:#0b111e;--panel:#111a2e;--border:#1a2942;--text:#e2e8f0;--title-color:#fff;--muted:#64748b;--sidebar-bg:#080d1a;--card-bg:#101828;--input-bg:#090e17;--btn-bg:#172439;--stamp-bg:#132440;--stamp-text:#3b82f6;--blue-accent:#2563eb;--card-shadow:0 10px 30px rgba(0,0,0,.3);
-""" if st.session_state.theme_mode=="dark" else """
---bg:#f8fafc;--panel:#fff;--border:#cbd5e1;--text:#0f172a;--title-color:#0f172a;--muted:#475569;--sidebar-bg:#fff;--card-bg:#fff;--input-bg:#f1f5f9;--btn-bg:#e2e8f0;--stamp-bg:#eff6ff;--stamp-text:#1d4ed8;--blue-accent:#2563eb;--card-shadow:0 4px 12px rgba(0,0,0,.05);
-"""
-render_html(f"""<style>
-:root{{{theme_vars}--blue:#3b82f6;--green:#10b981;--radius:8px}}header[data-testid="stHeader"]{{background:transparent!important}}.stApp{{background:var(--bg)!important;color:var(--text)!important}}.block-container{{max-width:1700px;padding-top:18px;padding-bottom:20px}}section[data-testid="stSidebar"]{{background:var(--sidebar-bg)!important;border-right:1px solid var(--border)!important}}section[data-testid="stSidebar"]>div{{padding-top:14px}}div[data-testid="stRadio"] label{{color:var(--text)!important;font-weight:800!important;font-size:13px!important}}.brand{{display:flex;align-items:center;gap:10px;font-weight:900;letter-spacing:.05em;color:var(--text);font-size:16px;padding:0 4px 18px}}.brand-mark{{width:24px;height:24px;border-radius:6px;background:linear-gradient(135deg,#2563eb,#1d4ed8);display:grid;place-items:center}}.sidebar-divider{{height:1px;background:var(--border);margin:12px 0}}.sidebar-label{{font-size:11px;font-weight:800;color:var(--muted);margin:10px 4px 6px;text-transform:uppercase;letter-spacing:.05em}}.sidebar-user{{margin-top:15px;padding-top:12px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;color:var(--text);font-size:13px;font-weight:700}}.avatar{{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:var(--input-bg);color:var(--muted);font-weight:800;font-size:11px;border:1px solid var(--border)}}.page-title{{display:flex;align-items:center;gap:10px;margin:4px 0 2px;font-size:26px;color:var(--title-color);font-weight:800}}.online{{font-size:11px;color:#10b981;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.25);padding:2px 8px;border-radius:999px;font-weight:600}}.subtitle{{color:var(--muted);font-size:13px;margin:0 0 16px}}.dopp-card,.transcript-container{{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--card-shadow);overflow:hidden}}.card-title{{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700;color:var(--title-color)}}.card-dot{{width:8px;height:8px;border-radius:50%;background:#2563eb}}div[data-baseweb="select"]>div{{background:var(--card-bg)!important;color:var(--text)!important;border-color:var(--border)!important;font-weight:700!important}}div.stButton>button{{background:var(--btn-bg)!important;color:var(--text)!important;border:1px solid var(--border)!important;border-radius:6px;font-size:13px;font-weight:600;min-height:38px;height:38px}}div.stButton>button[kind="primary"]{{background:#2563eb!important;color:#fff!important;border:0!important;font-weight:700!important}}.stTextInput input{{background:var(--card-bg)!important;border:1px solid var(--border)!important;color:var(--text)!important;border-radius:6px!important;font-size:13px!important}}.meta-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:10px}}.meta-item{{background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:8px 10px}}.meta-key{{color:var(--muted);font-size:10px;text-transform:uppercase;font-weight:600}}.meta-value{{color:var(--title-color);font-size:12px;margin-top:3px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.status-box{{margin-top:8px;padding:8px 12px;border-radius:6px;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);color:#059669;font-size:12px;display:flex;align-items:center;gap:8px;font-weight:700}}.summary-card{{background:var(--card-bg);border:1px solid var(--border);border-radius:var(--radius);padding:16px;box-shadow:var(--card-shadow);min-height:130px}}.summary-icon{{width:28px;height:28px;border-radius:6px;background:rgba(37,99,235,.15);color:#2563eb;display:grid;place-items:center;margin-bottom:8px;font-size:14px}}.summary-title{{margin:0;font-size:15px;font-weight:700;color:var(--title-color)}}.topic-text{{margin:10px 0 0;color:var(--text);font-size:14px;font-weight:600;line-height:1.5}}.summary-text{{margin:10px 0 0;color:var(--text);font-size:13px;line-height:1.6}}.transcript-header{{padding:14px 16px;border-bottom:1px solid var(--border)}}.transcript-scroll{{max-height:560px;overflow-y:auto;padding:6px 12px}}.transcript-line{{display:grid;grid-template-columns:85px 65px minmax(0,1fr);gap:10px;padding:12px 0;border-bottom:1px solid var(--border);align-items:start}}.transcript-stamp{{display:inline-flex;justify-content:center;background:var(--stamp-bg);color:var(--stamp-text);border-radius:4px;padding:3px 6px;font-size:11px;font-weight:700}}.transcript-speaker{{font-size:12px;color:var(--muted);padding-top:2px;font-weight:600}}.transcript-text{{font-size:13px;line-height:1.5;color:var(--text)}}
-</style>""")
+
+if st.session_state.theme_mode == "light":
+    theme_vars = """
+        --bg: #f8fafc;
+        --panel: #ffffff;
+        --border: #cbd5e1;
+        --text: #0f172a;
+        --title-color: #0f172a;
+        --muted: #475569;
+        --sidebar-bg: #ffffff;
+        --card-bg: #ffffff;
+        --input-bg: #f1f5f9;
+        --btn-bg: #e2e8f0;
+        --stamp-bg: #eff6ff;
+        --stamp-text: #1d4ed8;
+        --blue-accent: #2563eb;
+        --card-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+    """
+else:
+    theme_vars = """
+        --bg: #0b111e;
+        --panel: #111a2e;
+        --border: #1a2942;
+        --text: #e2e8f0;
+        --title-color: #ffffff;
+        --muted: #64748b;
+        --sidebar-bg: #080d1a;
+        --card-bg: #101828;
+        --input-bg: #090e17;
+        --btn-bg: #172439;
+        --stamp-bg: #132440;
+        --stamp-text: #3b82f6;
+        --blue-accent: #2563eb;
+        --card-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    """
+
+render_html(f"""
+<style>
+:root {{
+    {theme_vars}
+    --blue: #3b82f6;
+    --green: #10b981;
+    --radius: 8px;
+}}
+header[data-testid="stHeader"] {{ background: transparent !important; }}
+.stApp {{ background: var(--bg) !important; color: var(--text) !important; }}
+.block-container {{ max-width: 1700px; padding-top: 18px; padding-bottom: 20px; }}
+section[data-testid="stSidebar"] {{ background: var(--sidebar-bg) !important; border-right: 1px solid var(--border) !important; }}
+section[data-testid="stSidebar"] > div {{ padding-top: 14px; }}
+div[data-testid="stRadio"] label {{ color: var(--text) !important; font-weight: 800 !important; font-size: 13px !important; }}
+.brand {{ display: flex; align-items: center; gap: 10px; font-weight: 900; letter-spacing: .05em; color: var(--text); font-size: 16px; padding: 0px 4px 18px; }}
+.brand-mark {{ width: 24px; height: 24px; border-radius: 6px; background: linear-gradient(135deg, #2563eb, #1d4ed8); display: grid; place-items: center; box-shadow: 0 2px 8px rgba(37,99,235,0.4); }}
+.sidebar-divider {{ height: 1px; background: var(--border); margin: 12px 0; }}
+.sidebar-nav {{ color: var(--text); font-size: 13px; padding: 9px 12px; border-radius: 6px; margin-bottom: 3px; font-weight: 700 !important; cursor: pointer; }}
+.sidebar-nav.active {{ background: rgba(37,99,235,0.12); color: #2563eb; font-weight: 800 !important; border-left: 3px solid #2563eb; }}
+.sidebar-label {{ font-size: 11px; font-weight: 800 !important; color: var(--muted); margin: 10px 4px 6px; text-transform: uppercase; letter-spacing: .05em; }}
+.sidebar-user {{ margin-top: 15px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 10px; color: var(--text); font-size: 13px; font-weight: 700 !important; }}
+.avatar {{ width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: var(--input-bg); color: var(--muted); font-weight: 800; font-size: 11px; border: 1px solid var(--border); }}
+.page-title {{ display: flex; align-items: center; gap: 10px; margin: 4px 0 2px 0; font-size: 26px; color: var(--title-color); font-weight: 800; }}
+.online {{ font-size: 11px; color: #10b981; background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.25); padding: 2px 8px; border-radius: 999px; font-weight: 600; }}
+.subtitle {{ color: var(--muted); font-size: 13px; margin: 0 0 16px 0; }}
+.dopp-card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--card-shadow); overflow: hidden; }}
+.card-title {{ display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 700; color: var(--title-color); }}
+.card-dot {{ width: 8px; height: 8px; border-radius: 50%; background: #2563eb; }}
+div[data-baseweb="select"] > div {{ background-color: var(--card-bg) !important; color: var(--text) !important; border-color: var(--border) !important; font-weight: 700 !important; }}
+div.stButton > button {{ background: var(--btn-bg) !important; color: var(--text) !important; border: 1px solid var(--border) !important; border-radius: 6px; font-size: 13px; font-weight: 600; min-height: 38px; height: 38px; }}
+div.stButton > button[kind="primary"] {{ background: #2563eb !important; color: #ffffff !important; border: none !important; font-weight: 700 !important; }}
+.stTextInput input {{ background: var(--card-bg) !important; border: 1px solid var(--border) !important; color: var(--text) !important; border-radius: 6px !important; font-size: 13px !important; }}
+.meta-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; padding: 10px; }}
+.meta-item {{ background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }}
+.meta-key {{ color: var(--muted); font-size: 10px; text-transform: uppercase; font-weight: 600; }}
+.meta-value {{ color: var(--title-color); font-size: 12px; margin-top: 3px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.status-box {{ margin-top: 8px; padding: 8px 12px; border-radius: 6px; background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); color: #059669; font-size: 12px; display: flex; align-items: center; gap: 8px; font-weight: 700; }}
+.summary-card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; box-shadow: var(--card-shadow); min-height: 130px; }}
+.summary-icon {{ width: 28px; height: 28px; border-radius: 6px; background: rgba(37,99,235,0.15); color: #2563eb; display: grid; place-items: center; margin-bottom: 8px; font-size: 14px; }}
+.summary-title {{ margin: 0; font-size: 15px; font-weight: 700; color: var(--title-color); }}
+.topic-text {{ margin: 10px 0 0; color: var(--text); font-size: 14px; font-weight: 600; line-height: 1.5; }}
+.summary-text {{ margin: 10px 0 0; color: var(--text); font-size: 13px; line-height: 1.6; }}
+.transcript-container {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--card-shadow); overflow: hidden; }}
+.transcript-header {{ padding: 14px 16px; border-bottom: 1px solid var(--border); }}
+.transcript-scroll {{ max-height: 560px; overflow-y: auto; padding: 6px 12px; }}
+.transcript-line {{ display: grid; grid-template-columns: 85px 65px minmax(0,1fr); gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border); align-items: start; }}
+.transcript-stamp {{ display: inline-flex; justify-content: center; background: var(--stamp-bg); color: var(--stamp-text); border-radius: 4px; padding: 3px 6px; font-size: 11px; font-weight: 700; }}
+.transcript-speaker {{ font-size: 12px; color: var(--muted); padding-top: 2px; font-weight: 600; }}
+.transcript-text {{ font-size: 13px; line-height: 1.5; color: var(--text); }}
+</style>
+""")
+
 
 # ============================================================
-# AUTH SCREEN
+# AUTHENTICATION SCREEN (LOGIN / SIGN UP / FORGOT PASSWORD)
 # ============================================================
+
 if not st.session_state.logged_in_user:
-    st.markdown("## Welcome to **Aunty Next DOOR**"); st.markdown("Please log in, create a public account, or reset your password.")
-    t1,t2,t3=st.tabs(["ð Login","ð Sign Up","ð Forgot Password"])
-    with t1:
-        st.subheader("Login to your account"); e=st.text_input("Email Address",key="login_email"); p=st.text_input("Password",type="password",key="login_pass")
-        if st.button("Log In",type="primary",use_container_width=True):
-            u=authenticate_user(e,p)
-            if u: st.session_state.logged_in_user=u; st.session_state.current_view="transcriber"; st.success(f"Welcome back, {u['name']}!"); time.sleep(.3); st.rerun()
-            else: st.error("Invalid email or password.")
-    with t2:
-        st.subheader("Create a public account"); n=st.text_input("Full Name",key="signup_name"); e=st.text_input("Email Address",key="signup_email"); p=st.text_input("Create Password",type="password",key="signup_pass")
-        if st.button("Create Account",type="primary",use_container_width=True):
-            if n and e and p:
-                ok,msg=register_user(n,e,p); st.success(msg) if ok else st.error(msg)
-            else: st.warning("Please fill out all fields.")
-    with t3:
-        st.subheader("Reset Password via Email"); c1,c2=st.columns(2)
-        with c1:
-            st.markdown("##### 1. Request Reset Code"); e=st.text_input("Registered Email Address",key="reset_req_email")
-            if st.button("Send Verification Code",use_container_width=True):
-                if e.strip():
-                    with st.spinner("Generating and sending code..."): ok,msg=generate_reset_code(e); st.success(msg) if ok else st.error(msg)
-                else: st.warning("Please enter your email address.")
-        with c2:
-            st.markdown("##### 2. Enter Code & Set New Password"); e=st.text_input("Email Address",key="reset_email"); code=st.text_input("6-Digit Code",key="reset_code"); np=st.text_input("New Password",type="password",key="reset_new_pass")
-            if st.button("Update Password",type="primary",use_container_width=True):
-                if e.strip() and code.strip() and np.strip(): ok,msg=reset_password_with_code(e,code,np); st.success(msg) if ok else st.error(msg)
-                else: st.warning("Please fill in all reset fields.")
+    st.markdown("## Welcome to **Aunty Next DOOR**")
+    st.markdown("Please log in, create a public account, or reset your password.")
+
+    auth_tab1, auth_tab2, auth_tab3 = st.tabs(["🔐 Login", "📝 Sign Up", "🔑 Forgot Password"])
+
+    with auth_tab1:
+        st.subheader("Login to your account")
+        login_email = st.text_input("Email Address", key="login_email")
+        login_password = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Log In", type="primary", use_container_width=True):
+            user = authenticate_user(login_email, login_password)
+            if user:
+                st.session_state.logged_in_user = user
+                st.session_state.current_view = "transcriber"
+                st.success(f"Welcome back, {user['name']}!")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("Invalid email or password.")
+
+    with auth_tab2:
+        st.subheader("Create a public account")
+        signup_name = st.text_input("Full Name", key="signup_name")
+        signup_email = st.text_input("Email Address", key="signup_email")
+        signup_password = st.text_input("Create Password", type="password", key="signup_pass")
+        if st.button("Create Account", type="primary", use_container_width=True):
+            if signup_name and signup_email and signup_password:
+                ok, msg = register_user(signup_name, signup_email, signup_password)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+            else:
+                st.warning("Please fill out all fields.")
+
+    with auth_tab3:
+        st.subheader("Reset Password via Email")
+        
+        step1, step2 = st.columns(2)
+        
+        with step1:
+            st.markdown("##### 1. Request Reset Code")
+            reset_req_email = st.text_input("Registered Email Address", key="reset_req_email")
+            if st.button("Send Verification Code", use_container_width=True):
+                if reset_req_email.strip():
+                    with st.spinner("Generating and sending code..."):
+                        ok, msg = generate_reset_code(reset_req_email)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+                else:
+                    st.warning("Please enter your email address.")
+
+        with step2:
+            st.markdown("##### 2. Enter Code & Set New Password")
+            reset_email = st.text_input("Email Address", key="reset_email")
+            reset_code = st.text_input("6-Digit Code", key="reset_code")
+            new_pass = st.text_input("New Password", type="password", key="reset_new_pass")
+            
+            if st.button("Update Password", type="primary", use_container_width=True):
+                if reset_email.strip() and reset_code.strip() and new_pass.strip():
+                    ok, msg = reset_password_with_code(reset_email, reset_code, new_pass)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please fill in all reset fields.")
+
     st.stop()
 
-# ============================================================
-# SIDEBAR
-# ============================================================
-current_user=st.session_state.logged_in_user
-with st.sidebar:
-    render_html('<div class="brand"><div class="brand-mark"></div><span>Aunty Next DOOR</span></div>')
-    theme=st.radio("Theme Mode",["Dark","Light"],index=0 if st.session_state.theme_mode=="dark" else 1,horizontal=True,label_visibility="collapsed")
-    if theme.lower()!=st.session_state.theme_mode: st.session_state.theme_mode=theme.lower(); st.rerun()
-    if st.button("ðï¸  Transcriber",use_container_width=True,type="primary" if st.session_state.current_view=="transcriber" else "secondary"): st.session_state.current_view="transcriber"; st.rerun()
-    if current_user.get("is_admin"):
-        if st.button("ð¡ï¸  Admin Panel",use_container_width=True,type="primary" if st.session_state.current_view=="admin" else "secondary"): st.session_state.current_view="admin"; st.rerun()
-    render_html('<div class="sidebar-divider"></div><div class="sidebar-label">Campaign</div>')
-    selected_campaign=st.selectbox("Campaign",list(CAMPAIGN_QC_QUESTIONS.keys()),index=0,label_visibility="collapsed")
-    render_html('<div class="sidebar-divider"></div><div class="sidebar-label">Google Sheets Automation</div>')
-    if st.button("ð Sync & Process Sheet",use_container_width=True):
-        with st.spinner("Scanning sheet and processing recordings..."):
-            ok,msg=sync_google_sheet_batch(selected_campaign); st.success(msg) if ok else st.error(msg)
-    render_html('<div class="sidebar-divider"></div><div class="sidebar-label">User Account Profile</div>')
-    with st.form("profile_update_form"):
-        nn=st.text_input("Name",value=current_user["name"]); ne=st.text_input("Email",value=current_user["email"]); np=st.text_input("New Password (optional)",type="password",placeholder="Leave blank to keep current")
-        if st.form_submit_button("Save Profile Changes",use_container_width=True,type="primary"):
-            ok,msg=update_user_profile(current_user["id"],nn,ne,np)
-            if ok: st.session_state.logged_in_user.update(name=nn,email=ne); st.success(msg); time.sleep(.3); st.rerun()
-            else: st.error(msg)
-    if st.button("Logout",use_container_width=True): st.session_state.logged_in_user=None; st.rerun()
-    initials="".join(x[0].upper() for x in current_user['name'].split()[:2]) or "U"; badge=" <span style='font-size:10px;color:#10b981'>(Admin)</span>" if current_user.get('is_admin') else ""
-    render_html(f'<div class="sidebar-user"><div class="avatar">{initials}</div><div style="flex:1">{html.escape(current_user["name"])}{badge}</div></div>')
 
 # ============================================================
-# ADMIN
+# LOGGED IN SIDEBAR & ROUTING
 # ============================================================
-if st.session_state.current_view=="admin":
-    if not current_user.get("is_admin"): st.error("Access denied. Admin permissions required."); st.stop()
-    render_html('<div class="page-title">Admin Panel <span class="online">â Management</span></div><p class="subtitle">Manage system users, grant/revoke permissions, and reset user credentials.</p>')
-    a1,a2=st.tabs(["ð¥ Manage Users","â Create New User"])
-    with a1:
-        users=get_all_users(); st.subheader(f"Registered Accounts ({len(users)})")
-        for u in users:
-            with st.expander(f"{u['name']} ({u['email']}) {'â [ADMIN]' if u['is_admin'] else ''}"):
-                c1,c2,c3=st.columns([1.5,1.5,1])
+
+current_user = st.session_state.logged_in_user
+
+with st.sidebar:
+    render_html("""
+        <div class="brand">
+            <div class="brand-mark"></div>
+            <span>Aunty Next DOOR</span>
+        </div>
+    """)
+
+    theme_choice = st.radio(
+        "Theme Mode",
+        ["Dark", "Light"],
+        index=0 if st.session_state.theme_mode == "dark" else 1,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if theme_choice.lower() != st.session_state.theme_mode:
+        st.session_state.theme_mode = theme_choice.lower()
+        st.rerun()
+
+    if st.button("🎙️ &nbsp; Transcriber", use_container_width=True, type="primary" if st.session_state.current_view == "transcriber" else "secondary"):
+        st.session_state.current_view = "transcriber"
+        st.rerun()
+
+    if current_user.get("is_admin"):
+        if st.button("🛡 &nbsp; Admin Panel", use_container_width=True, type="primary" if st.session_state.current_view == "admin" else "secondary"):
+            st.session_state.current_view = "admin"
+            st.rerun()
+
+    render_html("""
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-label">Campaign</div>
+    """)
+
+    selected_campaign = st.selectbox(
+        "Campaign",
+        list(CAMPAIGN_QC_QUESTIONS.keys()),
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    render_html("""
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-label">Google Sheets Automation</div>
+    """)
+    if st.button("🔄 Sync & Process Sheet", use_container_width=True):
+        with st.spinner("Scanning sheet and processing recordings..."):
+            success, message = sync_google_sheet_batch(selected_campaign)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+
+    render_html("""
+        <div class="sidebar-divider"></div>
+        <div class="sidebar-label">User Account Profile</div>
+    """)
+
+    with st.form("profile_update_form"):
+        new_name = st.text_input("Name", value=current_user["name"])
+        new_email = st.text_input("Email", value=current_user["email"])
+        new_pass = st.text_input("New Password (optional)", type="password", placeholder="Leave blank to keep current")
+
+        save_profile = st.form_submit_button("Save Profile Changes", use_container_width=True, type="primary")
+
+        if save_profile:
+            ok, msg = update_user_profile(current_user["id"], new_name, new_email, new_pass)
+            if ok:
+                st.session_state.logged_in_user["name"] = new_name
+                st.session_state.logged_in_user["email"] = new_email
+                st.success(msg)
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    if st.button("Logout", use_container_width=True):
+        st.session_state.logged_in_user = None
+        st.rerun()
+
+    initials = "".join([part[0].upper() for part in current_user['name'].split()[:2]]) or "U"
+    admin_badge = " <span style='font-size:10px; color:#10b981;'>(Admin)</span>" if current_user.get("is_admin") else ""
+    render_html(f"""
+        <div class="sidebar-user">
+            <div class="avatar">{initials}</div>
+            <div style="flex:1">{html.escape(current_user['name'])}{admin_badge}</div>
+        </div>
+    """)
+
+
+# ============================================================
+# ADMIN PANEL VIEW
+# ============================================================
+
+if st.session_state.current_view == "admin":
+    if not current_user.get("is_admin"):
+        st.error("Access denied. Admin permissions required.")
+        st.stop()
+
+    render_html("""
+        <div class="page-title">
+            Admin Panel
+            <span class="online" style="background: rgba(37,99,235,0.12); border-color: rgba(37,99,235,0.25); color: #2563eb;">● Management</span>
+        </div>
+        <p class="subtitle">
+            Manage system users, grant/revoke permissions, and reset user credentials.
+        </p>
+    """)
+
+    admin_tabs = st.tabs(["👥 Manage Users", "➕ Create New User"])
+
+    with admin_tabs[0]:
+        users_list = get_all_users()
+        st.subheader(f"Registered Accounts ({len(users_list)})")
+
+        for u in users_list:
+            with st.expander(f"{u['name']} ({u['email']}) {'— [ADMIN]' if u['is_admin'] else ''}"):
+                c1, c2, c3 = st.columns([1.5, 1.5, 1])
+                
                 with c1:
-                    adm=st.checkbox("Admin Role",value=u["is_admin"],key=f"role_{u['id']}")
-                    if adm!=u["is_admin"]: admin_toggle_role(u["id"],adm); st.rerun()
+                    is_adm = st.checkbox("Admin Role", value=u["is_admin"], key=f"role_{u['id']}")
+                    if is_adm != u["is_admin"]:
+                        admin_toggle_role(u["id"], is_adm)
+                        st.success("User role updated!")
+                        time.sleep(0.4)
+                        st.rerun()
+
                 with c2:
-                    pw=st.text_input("Reset Password",key=f"pwd_{u['id']}",type="password")
-                    if st.button("Update Password",key=f"btn_pwd_{u['id']}"):
-                        if pw.strip(): admin_reset_password(u["id"],pw); st.success("Password updated!")
-                        else: st.warning("Enter a valid password.")
+                    new_user_pwd = st.text_input("Reset Password", key=f"pwd_{u['id']}", type="password", placeholder="New password")
+                    if st.button("Update Password", key=f"btn_pwd_{u['id']}"):
+                        if new_user_pwd.strip():
+                            admin_reset_password(u["id"], new_user_pwd.strip())
+                            st.success("Password updated!")
+                        else:
+                            st.warning("Enter a valid password.")
+
                 with c3:
-                    if u["id"]!=current_user["id"]:
-                        if st.button("ðï¸ Delete Account",key=f"del_{u['id']}"): admin_delete_user(u["id"]); st.rerun()
-                    else: st.caption("Cannot delete self")
-    with a2:
+                    if u["id"] != current_user["id"]:
+                        if st.button("🗑️ Delete Account", key=f"del_{u['id']}", type="secondary"):
+                            admin_delete_user(u["id"])
+                            st.success("User deleted!")
+                            time.sleep(0.4)
+                            st.rerun()
+                    else:
+                        st.caption("Cannot delete self")
+
+    with admin_tabs[1]:
         st.subheader("Add a New User Account")
         with st.form("admin_create_user"):
-            n=st.text_input("Full Name"); e=st.text_input("Email Address"); p=st.text_input("Password",type="password"); adm=st.checkbox("Grant Admin Privileges")
-            if st.form_submit_button("Create User",type="primary"):
-                if n and e and p:
-                    ok,msg=register_user(n,e,p,1 if adm else 0); st.success(msg) if ok else st.error(msg)
-                else: st.warning("Please fill out all fields.")
+            new_u_name = st.text_input("Full Name")
+            new_u_email = st.text_input("Email Address")
+            new_u_pass = st.text_input("Password", type="password")
+            new_u_is_admin = st.checkbox("Grant Admin Privileges")
+            
+            if st.form_submit_button("Create User", type="primary"):
+                if new_u_name and new_u_email and new_u_pass:
+                    ok, msg = register_user(new_u_name, new_u_email, new_u_pass, 1 if new_u_is_admin else 0)
+                    if ok:
+                        st.success(msg)
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please fill out all fields.")
+
     st.stop()
 
+
 # ============================================================
-# MAIN TRANSCRIBER
+# MAIN TRANSCRIBER INTERFACE (PROTECTED)
 # ============================================================
-render_html('<div class="page-title">Transcriber <span class="online">â Online</span></div><p class="subtitle">Convert audio to text and get AI-powered summaries and insights.</p>')
-left,right=st.columns([1.05,.95],gap="medium")
-with left:
-    c1,c2=st.columns(2)
-    with c1:
-        render_html(f'<div class="summary-card"><div class="summary-icon">â</div><h3 class="summary-title">Main topic</h3><p class="topic-text">{html.escape(st.session_state.short_topic or "No transcription available yet.")}</p></div>')
-        if st.session_state.transcribed and st.session_state.short_topic: render_copy_icon_button(st.session_state.short_topic,"btn_copy_topic")
-    with c2:
-        render_html(f'<div class="summary-card"><div class="summary-icon">â¤</div><h3 class="summary-title">AI call summary</h3><p class="summary-text">{html.escape(st.session_state.detailed_summary or "No summary generated yet.")}</p></div>')
-        if st.session_state.transcribed and st.session_state.detailed_summary: render_copy_icon_button(st.session_state.detailed_summary,"btn_copy_summary")
+
+render_html("""
+    <div class="page-title">
+        Transcriber
+        <span class="online">● Online</span>
+    </div>
+    <p class="subtitle">
+        Convert audio to text and get AI-powered summaries and insights.
+    </p>
+""")
+
+left_col, right_col = st.columns([1.05, 0.95], gap="medium")
+
+with left_col:
+    summary_col1, summary_col2 = st.columns(2)
+
+    with summary_col1:
+        render_html(f"""
+            <div class="summary-card">
+                <div class="summary-icon">◎</div>
+                <h3 class="summary-title">Main topic</h3>
+                <p class="topic-text">{html.escape(st.session_state.short_topic or "No transcription available yet.")}</p>
+            </div>
+        """)
+        if st.session_state.transcribed and st.session_state.short_topic:
+            render_copy_icon_button(st.session_state.short_topic, "btn_copy_topic")
+
+    with summary_col2:
+        render_html(f"""
+            <div class="summary-card">
+                <div class="summary-icon">▤</div>
+                <h3 class="summary-title">AI call summary</h3>
+                <p class="summary-text">{html.escape(st.session_state.detailed_summary or "No summary generated yet.")}</p>
+            </div>
+        """)
+        if st.session_state.transcribed and st.session_state.detailed_summary:
+            render_copy_icon_button(st.session_state.detailed_summary, "btn_copy_summary")
+
     render_html("<div style='height:6px'></div>")
-    if "source_mode" not in st.session_state: st.session_state.source_mode="url"
-    u1,u2=st.columns(2)
-    with u1:
-        if st.button("ð Paste recording URL",use_container_width=True,type="primary" if st.session_state.source_mode=="url" else "secondary"): st.session_state.source_mode="url"; st.rerun()
-    with u2:
-        if st.button("â¥ Upload MP3 / WAV",use_container_width=True,type="primary" if st.session_state.source_mode=="upload" else "secondary"): st.session_state.source_mode="upload"; st.rerun()
-    if st.session_state.source_mode=="url":
-        with st.form("url_form",clear_on_submit=False):
-            url=st.text_input("Recording URL",placeholder="https://example.com/recording.mp3",label_visibility="collapsed")
-            if st.form_submit_button("Load Audio",type="primary",use_container_width=True):
-                if not url.strip(): st.error("Paste a recording URL first.")
+
+    if "source_mode" not in st.session_state:
+        st.session_state.source_mode = "url"
+
+    tab_url, tab_upload = st.columns(2)
+    with tab_url:
+        if st.button("🔗 Paste recording URL", use_container_width=True, type=("primary" if st.session_state.source_mode == "url" else "secondary")):
+            st.session_state.source_mode = "url"
+            st.rerun()
+
+    with tab_upload:
+        if st.button("↥ Upload MP3 / WAV", use_container_width=True, type=("primary" if st.session_state.source_mode == "upload" else "secondary")):
+            st.session_state.source_mode = "upload"
+            st.rerun()
+
+    if st.session_state.source_mode == "url":
+        with st.form("url_form", clear_on_submit=False):
+            url_value = st.text_input("Recording URL", placeholder="https://example.com/recording.mp3", label_visibility="collapsed")
+            submitted = st.form_submit_button("Load Audio", type="primary", use_container_width=True)
+            if submitted:
+                if not url_value.strip():
+                    st.error("Paste a recording URL first.")
                 else:
                     with st.spinner("Downloading audio from link..."):
-                        try: load_audio_url(url); st.success("Recording link loaded and ready.")
-                        except Exception as e: st.error(f"Error loading URL: {e}")
+                        try:
+                            load_audio_url(url_value)
+                            st.success("Recording link loaded and ready.")
+                        except Exception as e:
+                            st.error(f"Error loading URL: {str(e)}")
     else:
-        upload=st.file_uploader("Drop your audio here",type=["mp3","wav"],label_visibility="collapsed")
-        if upload is not None and st.session_state.get("last_uploaded_name")!=upload.name:
-            try: save_uploaded_audio(upload); st.session_state.last_uploaded_name=upload.name; st.success("Audio loaded successfully.")
-            except Exception as e: st.error(f"Error loading audio: {e}")
-    valid=bool(st.session_state.file_path and os.path.exists(st.session_state.file_path))
-    if st.button("ðï¸ Transcribe audio",type="primary",use_container_width=True,disabled=not valid):
-        progress=st.progress(0,text="Preparing audio..."); status=st.empty(); start=time.time()
+        uploaded_file = st.file_uploader("Drop your audio here", type=["mp3", "wav"], label_visibility="collapsed")
+        if uploaded_file is not None:
+            if st.session_state.get("last_uploaded_name") != uploaded_file.name:
+                try:
+                    save_uploaded_audio(uploaded_file)
+                    st.session_state["last_uploaded_name"] = uploaded_file.name
+                    st.success("Audio loaded successfully.")
+                except Exception as e:
+                    st.error(f"Error loading audio: {str(e)}")
+
+    valid_audio = st.session_state.file_path and os.path.exists(st.session_state.file_path)
+
+    if st.button("🎙️ Transcribe audio", type="primary", use_container_width=True, disabled=not valid_audio):
+        progress_bar = st.progress(0, text="Preparing audio...")
+        status_placeholder = st.empty()
         try:
-            status.info("Processing Groq Whisper..."); progress.progress(20,text="Sending audio to Groq Whisper..."); timeline,texts=transcribe_groq_whisper(st.session_state.file_path)
-            progress.progress(65,text="Running AI QC analysis..."); transcript=" ".join(texts); a=generate_call_analysis(transcript,selected_campaign); elapsed=round(time.time()-start,1)
-            st.session_state.transcript=timeline; st.session_state.full_text=transcript; st.session_state.short_topic=a["main_topic"]; st.session_state.detailed_summary=a["long_summary"]; st.session_state.transcribed=True; st.session_state.status=f"Transcription completed ({elapsed}s)"; st.session_state.elapsed=elapsed
-            progress.progress(100,text="Completed"); status.success(f"Done in {elapsed}s â¢ AI: {a['provider']}"); time.sleep(.4); st.rerun()
+            start_clock = time.time()
+            status_placeholder.info("Processing Groq Whisper...")
+            progress_bar.progress(15, text="Sending audio to Groq Whisper...")
+
+            timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+            progress_bar.progress(65, text="Generating AI summary...")
+
+            full_transcript_str = " ".join(raw_text_segments)
+            short_topic, detailed_summary = generate_summaries_groq(
+                full_transcript_str,
+                selected_campaign,
+                timeline_data=timeline_data,
+            )
+            elapsed_time = round(time.time() - start_clock, 1)
+
+            st.session_state.transcript = timeline_data
+            st.session_state.full_text = full_transcript_str
+            st.session_state.short_topic = short_topic
+            st.session_state.detailed_summary = detailed_summary
+            st.session_state.transcribed = True
+            st.session_state.status = f"Transcription completed ({elapsed_time}s)"
+            st.session_state.elapsed = elapsed_time
+
+            progress_bar.progress(100, text="Completed")
+            status_placeholder.success(f"Done in {elapsed_time}s")
+            time.sleep(0.5)
+            st.rerun()
         except Exception as e:
-            progress.empty(); status.error(f"Processing failed: {e}")
-    if valid:
+            progress_bar.empty()
+            status_placeholder.error(f"Transcription failed: {str(e)}")
+
+    if st.session_state.file_path and os.path.exists(st.session_state.file_path):
         try:
-            with open(st.session_state.file_path,"rb") as af: st.audio(af.read(),format="audio/mp3")
-        except Exception: pass
-    render_html(f'<div class="dopp-card"><div class="meta-grid"><div class="meta-item"><div class="meta-key">Duration</div><div class="meta-value">{format_time(st.session_state.duration_sec)}</div></div><div class="meta-item"><div class="meta-key">Est. Time</div><div class="meta-value">~{st.session_state.est_proc_sec}s</div></div><div class="meta-item"><div class="meta-key">Source</div><div class="meta-value">{html.escape(st.session_state.source_type)}</div></div><div class="meta-item"><div class="meta-key">Campaign</div><div class="meta-value" style="color:#2563eb">{html.escape(selected_campaign)}</div></div></div></div><div class="status-box"><span>â</span><span>{html.escape(st.session_state.status)}</span><span style="margin-left:auto">{"100%" if st.session_state.transcribed else "0%"}</span></div>')
-with right:
-    render_html('<div class="transcript-container"><div class="transcript-header"><div class="card-title"><span class="card-dot"></span> Timeline Transcript</div></div></div>')
-    if st.session_state.transcribed and st.session_state.full_text: render_copy_icon_button(st.session_state.full_text,"btn_copy_transcript")
-    q=st.text_input("Search transcript",placeholder="Search transcript...",label_visibility="collapsed"); data=st.session_state.transcript
-    if not data: render_html('<div class="transcript-container"><div class="transcript-scroll"><div style="padding:40px 20px;text-align:center;color:var(--muted);font-size:13px">No transcript processed yet.</div></div></div>')
+            with open(st.session_state.file_path, "rb") as audio_file:
+                st.audio(audio_file.read(), format="audio/mp3")
+        except Exception:
+            pass
+
+    render_html(f"""
+        <div class="dopp-card">
+            <div class="meta-grid">
+                <div class="meta-item">
+                    <div class="meta-key">Duration</div>
+                    <div class="meta-value">{format_time(st.session_state.duration_sec)}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-key">Est. Time</div>
+                    <div class="meta-value">~{st.session_state.est_proc_sec}s</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-key">Source</div>
+                    <div class="meta-value">{html.escape(st.session_state.source_type)}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="meta-key">Campaign</div>
+                    <div class="meta-value" style="color:#2563eb">{html.escape(selected_campaign)}</div>
+                </div>
+            </div>
+        </div>
+        <div class="status-box">
+            <span>✓</span>
+            <span>{html.escape(st.session_state.status)}</span>
+            <span style="margin-left:auto">{ "100%" if st.session_state.transcribed else "0%" }</span>
+        </div>
+    """)
+
+with right_col:
+    render_html("""
+        <div class="transcript-container">
+            <div class="transcript-header">
+                <div class="card-title"><span class="card-dot"></span> Timeline Transcript</div>
+            </div>
+        </div>
+    """)
+
+    if st.session_state.transcribed and st.session_state.full_text:
+        render_copy_icon_button(st.session_state.full_text, "btn_copy_transcript")
+
+    search_query = st.text_input("Search transcript", placeholder="Search transcript...", label_visibility="collapsed")
+    transcript_data = st.session_state.transcript
+
+    if not transcript_data:
+        render_html("""
+            <div class="transcript-container">
+                <div class="transcript-scroll">
+                    <div style="padding:40px 20px; text-align:center; color:var(--muted); font-size:13px;">
+                        No transcript processed yet.
+                    </div>
+                </div>
+            </div>
+        """)
     else:
-        q=q.strip().lower(); rows=[]
-        for item in data:
-            ts=item.get("time",""); sp=item.get("speaker","Speaker"); line=item.get("line","")
-            if q and q not in f"{ts} {sp} {line}".lower(): continue
-            rows.append(f'<div class="transcript-line"><span class="transcript-stamp">{html.escape(ts)}</span><span class="transcript-speaker">{html.escape(sp)}</span><div class="transcript-text">{html.escape(line)}</div></div>')
-        render_html('<div class="transcript-container"><div class="transcript-scroll">'+(''.join(rows) if rows else '<div style="padding:40px 20px;text-align:center;color:var(--muted);font-size:13px">No matching transcript found.</div>')+'</div></div>')
+        query = search_query.strip().lower()
+        rows = []
+        for item in transcript_data:
+            timestamp = item.get("time", "")
+            speaker = item.get("speaker", "Unknown")
+            line_text = item.get("line", "")
+            if query and query not in f"{timestamp} {speaker} {line_text}".lower():
+                continue
+            rows.append(f"""
+                <div class="transcript-line">
+                    <span class="transcript-stamp">{html.escape(timestamp)}</span>
+                    <span class="transcript-speaker">{html.escape(speaker)}</span>
+                    <div class="transcript-text">{html.escape(line_text)}</div>
+                </div>
+            """)
+
+        if rows:
+            render_html('<div class="transcript-container"><div class="transcript-scroll">' + "".join(rows) + "</div></div>")
+        else:
+            render_html("""
+                <div class="transcript-container">
+                    <div class="transcript-scroll">
+                        <div style="padding:40px 20px; text-align:center; color:var(--muted); font-size:13px;">
+                            No matching transcript found.
+                        </div>
+                    </div>
+                </div>
+            """)
+
+
