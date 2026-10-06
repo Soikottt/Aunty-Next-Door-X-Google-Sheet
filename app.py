@@ -1189,9 +1189,6 @@ PRIVATE_TERMS = [
     "company insurance", "company plan", "group insurance", "group plan",
     "insurance through work",
     "ppo", "hmo", "pos", "epo",
-    "blue cross", "blue shield", "bcbs",
-    "aetna", "cigna", "unitedhealth", "united healthcare", "unitedhealthcare",
-    "humana", "kaiser", "anthem", "molina", "oscar",
 ]
 
 
