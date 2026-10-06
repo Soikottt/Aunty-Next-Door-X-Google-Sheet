@@ -829,7 +829,7 @@ CAMPAIGN FOCUS: {campaign_guidance}
 Return exactly these keys:
 long_summary, main_topic, call_type, qualification_status, caller_intent, why_called,
 service_requested, insurance, location, outcome, spam_robot, spam_confidence,
-qc_issue, spam_reason, qualification_reason
+qc_issue, spam_reason, qualification_reason, call_type_reason
 
 Allowed call_type values: QUALIFIED, NON-QUALIFIED, WRONG NUMBER, SPAM / ROBOT, INFORMATION ONLY, SILENT / NO RESPONSE, OTHER.
 Allowed qualification_status values: QUALIFIED, NON-QUALIFIED, NOT CLEAR.
@@ -837,6 +837,7 @@ Use empty strings for unknown string values. spam_robot must be true/false. spam
 
 RULES:
 - Use only facts supported by the transcript. Never guess or invent.
+- call_type_reason must be one short sentence (5-15 words) explaining why you chose that call_type, e.g. "Private insurance and seeking detox".
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
 - Write a natural 2-8 sentence long_summary and a 5-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and how the call ended.
 - If the caller is unrelated, explain what they actually wanted.
@@ -967,7 +968,8 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
 
     for key in [
         "long_summary", "main_topic", "caller_intent", "why_called", "service_requested",
-        "insurance", "location", "outcome", "qc_issue", "spam_reason", "qualification_reason"
+        "insurance", "location", "outcome", "qc_issue", "spam_reason", "qualification_reason",
+        "call_type_reason"
     ]:
         analysis[key] = str(analysis.get(key, "") or "").replace("*", "").strip()
 
