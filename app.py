@@ -23,7 +23,8 @@ import gspread
 import threading
 import zipfile
 import requests
-
+import re
+from typing import Optional
 
 
 # ============================================================
@@ -926,7 +927,7 @@ def apply_deterministic_spam_rules(analysis, full_transcript):
     # A directory name + business solicitation is a strong spam signal.
     if directory_hit and solicitation_hit:
         analysis["spam_robot"] = True
-        analysis["spam_confidence"] = max(int(analysis.get("spam_confidence", 0) or 0), 97)
+        analysis["spam_confidence"] = max(_safe_int(analysis.get("spam_confidence")), 97)
         current_reason = str(analysis.get("spam_reason", "") or "").strip()
         directory_name = "Yelp" if "yelp" in text else "Yellow Pages"
         forced_reason = f"{directory_name} business-listing/advertising solicitation"
@@ -960,7 +961,7 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     else:
         analysis["spam_robot"] = bool(spam_value)
     try:
-        analysis["spam_confidence"] = max(0, min(100, int(analysis.get("spam_confidence", 0) or 0)))
+        analysis["spam_confidence"] = max(0, min(100, _safe_int(analysis.get("spam_confidence"))))
     except (TypeError, ValueError):
         analysis["spam_confidence"] = 0
 
@@ -1167,36 +1168,74 @@ def _clean_report_value(value, default="None"):
     return value if value else default
 
 
+# --------------------------------------------------------
+# INSURANCE KEYWORDS
+# --------------------------------------------------------
+
+GOVERNMENT_TERMS = [
+    "medicaid", "medicare", "medi-cal", "medi cal",
+    "state insurance", "state-funded", "state funded", "state plan", "state program",
+    "government insurance", "government-funded", "government funded",
+    "government plan", "government program",
+    "public insurance", "public plan", "public health insurance",
+    "county insurance", "county-funded", "county funded",
+    "chip", "marketplace",
+]
+
+PRIVATE_TERMS = [
+    "private", "employer", "employee", "commercial",
+    "company insurance", "company plan", "group insurance", "group plan",
+    "insurance through work",
+    "ppo", "hmo", "pos", "epo",
+    "blue cross", "blue shield", "bcbs",
+    "aetna", "cigna", "unitedhealth", "united healthcare", "unitedhealthcare",
+    "humana", "kaiser", "anthem", "molina", "oscar",
+]
+
+
+def _compile(terms):
+    # Word-boundary matching: "chip" won't match "chipotle", "pos" won't match "position".
+    pattern = r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+GOVERNMENT_RE = _compile(GOVERNMENT_TERMS)
+PRIVATE_RE = _compile(PRIVATE_TERMS)
+
+INSURANCE_KEYS = ("insurance",)
+
+
+def _safe_int(value, default=0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_rehab_insurance_status(analysis):
-    """Classify Rehab insurance for deterministic qualification scoring."""
-    insurance = str(analysis.get("insurance", "") or "").strip().lower()
+    """Classify Rehab insurance for deterministic qualification scoring.
+    Returns "YELLOW" (government/state), "GREEN" (private/commercial), or None."""
+    insurance = " ".join(
+        str(analysis.get(key) or "") for key in INSURANCE_KEYS
+    ).strip()
     if not insurance:
         return None
 
-    government_terms = [
-        "medicaid", "medicare", "state insurance", "state-funded",
-        "state funded", "government insurance", "government-funded",
-        "government funded", "government plan", "government program",
-        "public insurance", "public plan", "chip", "marketplace",
-    ]
-    if any(term in insurance for term in government_terms):
-        return "GOVERNMENT"
+    # Government is checked first, so it wins if both match.
+    if GOVERNMENT_RE.search(insurance):
+        return "YELLOW"
 
-    private_terms = [
-        "private", "employer", "employee", "commercial", "company insurance",
-        "group insurance", "group plan", "ppo", "hmo", "pos", "epo",
-        "insurance through work",
-    ]
-    if any(term in insurance for term in private_terms):
-        return "PRIVATE"
+    if PRIVATE_RE.search(insurance):
+        return "GREEN"
 
     return None
+
 
 
 def get_decision_signal(score, analysis):
     """Convert the numeric score into a practical operations signal."""
     spam = bool(analysis.get("spam_robot"))
-    spam_conf = int(analysis.get("spam_confidence", 0) or 0)
+    spam_conf = _safe_int(analysis.get("spam_confidence"))
     if spam and spam_conf >= 90:
         return "REJECT / SPAM"
     if score >= 90:
@@ -1253,7 +1292,7 @@ def build_qc_report(analysis):
 
     parts.extend([
         f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
-        f"Spam Confidence: {int(analysis.get('spam_confidence', 0) or 0)}%",
+        f"Spam Confidence: {_safe_int(analysis.get('spam_confidence'))}%",
         f"QC Issue: {_clean_report_value(analysis.get('qc_issue'))}",
     ])
 
@@ -1291,7 +1330,7 @@ def calculate_call_quality_score(analysis):
         score += 10
 
     call_type = analysis.get("call_type", "OTHER")
-    spam_confidence = int(analysis.get("spam_confidence", 0) or 0)
+    spam_confidence = _safe_int(analysis.get("spam_confidence"))
     campaign_category = str(analysis.get("campaign_category", "") or "").strip()
 
     # Strong spam is always a very low-quality call.
@@ -1310,7 +1349,7 @@ def calculate_call_quality_score(analysis):
     # Business rule: Rehab calls using government/state insurance are not qualified.
     # Keep the score as the single final source of row color, so this produces a
     # yellow-range score rather than applying a separate row color.
-   if campaign_category == "Rehab & Addiction Treatment":
+    if campaign_category == "Rehab & Addiction Treatment":
 
         rehab_status = get_rehab_insurance_status(analysis)
 
@@ -1324,59 +1363,6 @@ def calculate_call_quality_score(analysis):
             # A Rehab call without a confirmed appointment
             # can NEVER receive 100.
             score = min(score, 99)
-    # --------------------------------------------------------
-    # GOVERNMENT / STATE INSURANCE
-    # --------------------------------------------------------
-
-    government_terms = [
-        "medicaid",
-        "medicare",
-        "state insurance",
-        "state-funded",
-        "state funded",
-        "state plan",
-        "state program",
-        "government insurance",
-        "government-funded",
-        "government funded",
-        "government plan",
-        "government program",
-        "public insurance",
-        "public plan",
-        "public health insurance",
-        "chip",
-        "medi-cal",
-        "medical",
-        "county insurance",
-        "county-funded",
-        "county funded",
-    ]
-
-    if any(term in insurance for term in government_terms):
-        return "YELLOW"
-
-    # --------------------------------------------------------
-    # PRIVATE / COMMERCIAL INSURANCE
-    # --------------------------------------------------------
-
-    private_terms = [
-        "private",
-        "employer",
-        "employee",
-        "commercial",
-        "company insurance",
-        "company plan",
-        "group insurance",
-        "group plan",
-        "ppo",
-        "hmo",
-        "pos",
-        "epo",
-    ]
-
-    if any(term in insurance for term in private_terms):
-        return "GREEN"
-        
     return max(0, min(100, score))
 
 
@@ -1391,7 +1377,7 @@ SCORE_COLORS = {
 
 
 def get_score_color(score, analysis):
-    if analysis.get("spam_robot") and int(analysis.get("spam_confidence", 0) or 0) >= 90:
+    if analysis.get("spam_robot") and _safe_int(analysis.get("spam_confidence")) >= 90:
         return SCORE_COLORS["spam"]
     if score >= 95:
         return SCORE_COLORS["excellent"]
