@@ -154,7 +154,6 @@ def secret(name, default=""):
 GROQ_API_KEY=secret("Aunty_NEXT_DOOR_API_PRIMARY") or secret("GROQ_API_KEY")
 GROQ_SECONDARY_API_KEY=secret("GROQ_API_KEY_SECONDARY_2") or secret("GROQ_SECONDARY_API_KEY")
 GROQ_API_KEY_3=secret("GROQ_API_KEY_3")
-GROQ_API_KEY_4=secret("GROQ_API_KEY_4")
 GEMINI_API_KEY=secret("GEMINI_API_KEY")
 CEREBRAS_API_KEY=secret("CEREBRAS_API_KEY")
 OPENROUTER_API_KEY=secret("OPENROUTER_API_KEY")
@@ -169,7 +168,6 @@ PROVIDER_MODELS={
     "Groq-1":GROQ_SUMMARY_MODEL,
     "Groq-2":GROQ_SUMMARY_MODEL,
     "Groq-3":GROQ_SUMMARY_MODEL,
-    "Groq-4":GROQ_SUMMARY_MODEL,
     "Gemini":"gemini-2.5-flash",
     "Cerebras":"gpt-oss-120b",
     "OpenRouter":"openai/gpt-oss-20b:free",
@@ -240,6 +238,13 @@ CRITICAL:
 - main_topic should be a meaningful short topic, NOT simply "SPAM / ROBOT". For example, a Google listing solicitation should have a topic such as "Google listing / SEO solicitation".
 - Do not include unnecessary personal information such as caller name, phone number or full address.
 - If a field is not supported, use "Not clear" (or "Not mentioned" where natural).
+- IMPORTANT: Evaluate EVERY requested field independently against the entire transcript. Do not leave fields as "Not clear" merely because another field is unclear. If the transcript contains a direct or clearly implied answer, record that answer.
+- For qualification, explicitly state what information makes the caller qualified, non-qualified, or why qualification cannot be determined. Do not mark qualification as NOT CLEAR if the transcript clearly contains the required campaign qualification information.
+- For caller_intent and why_called, use the caller's actual request, not the agent's opening question.
+- For service_requested, name the actual service/product discussed.
+- For outcome, state what actually happened at the end of the call: appointment, transfer, quote, referral, callback, refusal, confusion, no response, etc. Do not invent a completed outcome.
+- For location, use the location actually stated by the caller or clearly established in the conversation. Do not replace it with a location merely mentioned by the agent.
+- For insurance, record the insurance the caller actually states, including carrier and type when available.
 - spam_robot should reflect clear spam/robot behavior supported by the call. Deterministic Python rules will also be applied after AI.
 - spam_confidence is your confidence in the spam assessment, 0-100.
 - Do not calculate a quality score. Python will calculate the final score.
@@ -336,6 +341,15 @@ def usage_text(provider, model, usage):
             return str(x)
     return f"{provider} | {model} | In: {v(u['input'])} | Out: {v(u['output'])} | Total: {v(u['total'])}"
 
+def extract_usage_from_response_dict(obj):
+    """Last-resort usage extractor for provider JSON responses."""
+    if not isinstance(obj, dict):
+        return None
+    for key in ("usage", "usageMetadata"):
+        if isinstance(obj.get(key), dict):
+            return obj[key]
+    return None
+
 def provider_specs():
     # Missing keys are intentionally skipped.
     return [
@@ -362,14 +376,14 @@ def openai_compat_analysis(api_key, model, prompt, provider_name):
     payload={"model":model,"messages":[{"role":"system","content":"Return only valid JSON. Follow the requested schema exactly."},{"role":"user","content":prompt}],"temperature":0.1,"max_tokens":1600,"response_format":{"type":"json_object"}}
     r=requests.post(base_urls[provider_name],headers=headers,json=payload,timeout=120)
     r.raise_for_status(); obj=r.json(); content=obj["choices"][0]["message"]["content"]
-    return parse_json_response(content), obj.get("usage",{})
+    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
 
 def gemini_analysis(api_key, model, prompt):
     url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload={"systemInstruction":{"parts":[{"text":"You are a careful pay-per-call QC analyst. Return only valid JSON matching the requested schema."}]},"contents":[{"role":"user","parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.1,"maxOutputTokens":1600,"responseMimeType":"application/json","responseSchema":ANALYSIS_SCHEMA}}
     r=requests.post(url,json=payload,timeout=120); r.raise_for_status(); obj=r.json()
     content="".join(p.get("text","") for p in obj.get("candidates",[{}])[0].get("content",{}).get("parts",[]))
-    return parse_json_response(content), obj.get("usageMetadata",{})
+    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
 
 def cohere_analysis(api_key, model, prompt):
     url="https://api.cohere.com/v2/chat"
@@ -378,7 +392,7 @@ def cohere_analysis(api_key, model, prompt):
     r=requests.post(url,headers=headers,json=payload,timeout=120); r.raise_for_status(); obj=r.json()
     content=obj.get("message",{}).get("content","")
     if isinstance(content,list): content="".join(x.get("text","") if isinstance(x,dict) else str(x) for x in content)
-    return parse_json_response(content), obj.get("usage",{})
+    return parse_json_response(content), extract_usage_from_response_dict(obj) or {}
 
 def groq_analysis(api_key, model, prompt):
     client=Groq(api_key=api_key)
@@ -590,8 +604,27 @@ def apply_row_score_color(worksheet,row,score):
     except Exception: pass
 
 def update_q_cell(ws,row,value):
-    try: ws.update_cell(row,17,value)
-    except Exception: pass
+    """Write Q reliably and never hide the real Sheets error."""
+    last_error=None
+    try:
+        # Some worksheets have fewer than 17 grid columns. Expand them first.
+        try:
+            if getattr(ws, "col_count", 0) < 17:
+                ws.add_cols(17 - int(ws.col_count))
+        except Exception:
+            pass
+        ws.update_cell(row,17,value)
+        return True, ""
+    except Exception as e:
+        last_error=str(e)
+
+    try:
+        ws.update(f"Q{row}", [[value]])
+        return True, ""
+    except Exception as e:
+        last_error=f"{last_error} | fallback: {e}"
+
+    return False, last_error
 
 def sync_google_sheet_batch(default_campaign_name=""):
     sheet_names=["Ringba to Sheet QC"]; total=0; status=st.empty()
@@ -612,14 +645,23 @@ def sync_google_sheet_batch(default_campaign_name=""):
                         status.text(f"Row {index}: AI QC analysis..."); campaign=get_campaign_category(raw_campaign) if raw_campaign else (default_campaign_name or "General Customer Inquiry"); a=generate_call_analysis(transcript,campaign)
                         score,reasons=calculate_quality_score(a,transcript,campaign); decision=decision_signal(score,a); k=build_k_report(a,score,reasons,decision)
                         ws.update_cell(index,7,a["long_summary"]); ws.update_cell(index,8,a["main_topic"]); ws.update_cell(index,11,k); ws.update_cell(index,12,score)
-                        update_q_cell(ws,index,usage_text(a["provider"],a["model"],a["usage"])); apply_row_score_color(ws,index,score)
+                        q_value=usage_text(a["provider"],a["model"],a["usage"])
+                        q_ok,q_error=update_q_cell(ws,index,q_value)
+                        if not q_ok:
+                            raise RuntimeError(f"Q column write failed: {q_error}")
+                        apply_row_score_color(ws,index,score)
                         total+=1; time.sleep(1)
                         try: os.remove(temp)
                         except Exception: pass
                     except Exception as row_err:
                         # Do not overwrite J. K gets the processing error and Q records failure status.
-                        try: ws.update_cell(index,11,f"Processing Error: {str(row_err)[:500]}"); update_q_cell(ws,index,"AI analysis failed: all configured providers unavailable")
-                        except Exception: pass
+                        try:
+                            ws.update_cell(index,11,f"Processing Error: {str(row_err)[:500]}")
+                            q_ok,q_error=update_q_cell(ws,index,f"FAILED | {str(row_err)[:300]}")
+                            if not q_ok:
+                                status.text(f"Row {index}: Q write failed: {q_error}")
+                        except Exception:
+                            pass
             except Exception: continue
         status.empty(); return True,f"Successfully processed {total} new call records!"
     except Exception as e:
