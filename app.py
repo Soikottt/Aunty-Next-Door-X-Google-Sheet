@@ -994,6 +994,22 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     )
     return analysis
 
+TPM_TARGET = 7000
+ANALYSIS_MAX_OUT = 650      # same as max_tokens in _call_structured_analysis
+CHARS_PER_TOKEN = 3.5       # conservative estimate, no extra library needed
+
+def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
+    """Return the transcript unchanged if it fits; otherwise keep start + end."""
+    overhead_chars = len(_analysis_prompt("", campaign_name, timeline_data)) + 100
+    budget_tokens = TPM_TARGET - ANALYSIS_MAX_OUT - int(overhead_chars / CHARS_PER_TOKEN)
+    max_chars = int(budget_tokens * CHARS_PER_TOKEN)
+
+    if len(transcript) <= max_chars:
+        return transcript  # short call: untouched
+
+    head = int(max_chars * 0.45)
+    tail = max_chars - head
+    return transcript[:head] + " ... [middle of call omitted] ... " + transcript[-tail:]
 
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
     if not full_transcript.strip():
@@ -1002,7 +1018,8 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     if not GROQ_API_KEY:
         raise RuntimeError("Primary Groq API key is not configured.")
 
-    prompt = _analysis_prompt(full_transcript, campaign_name, timeline_data)
+    ai_transcript = _trim_for_token_limit(full_transcript, campaign_name, timeline_data)
+    prompt = _analysis_prompt(ai_transcript, campaign_name, timeline_data)
     primary_error = None
 
     try:
