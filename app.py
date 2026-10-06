@@ -1106,6 +1106,37 @@ LONG SUMMARY:
 - No bullets, headings, markdown, filler, or comments about the quality of the conversation.
 - Keep the wording simple and human.
 
+SPAM / ROBOT RULES:
+- Do NOT use exact phrase matching only.
+- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Similar wording must be recognized even when the exact words differ.
+- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
+- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
+- spam_confidence must reflect the strength of the evidence from 0-100.
+
+QUALIFICATION RULES:
+- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
+- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
+- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
+
+MISSING INFORMATION:
+For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
+
+CALL TYPE:
+- QUALIFIED: relevant and clearly qualified.
+- NON-QUALIFIED: relevant but clearly not qualified.
+- WRONG NUMBER: caller was trying to reach another person/business/service.
+- SPAM / ROBOT: automated/scripted spam or marketing call.
+- INFORMATION ONLY: caller wanted information but not the campaign service/action.
+- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
+- OTHER: anything else that does not fit the categories.
+
+QC ISSUE:
+Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
+
+Read the entire transcript before deciding.
+
 TRANSCRIPT:
 {full_transcript}
 """
@@ -1204,23 +1235,13 @@ def get_score_basis(analysis):
 
 
 def build_qc_report(analysis):
-    """Build a compact but decision-oriented report for future publisher/campaign analysis."""
-    score = analysis.get("quality_score")
-    if score is None:
-        score = calculate_call_quality_score(analysis)
-    decision = get_decision_signal(int(score), analysis)
-
-    qualification = _clean_report_value(analysis.get("qualification_status"))
-    qualification_reason = _clean_report_value(analysis.get("qualification_reason"))
-    spam_reason = _clean_report_value(analysis.get("spam_reason"))
-
+    """Simple QC report for column K."""
     parts = [
         f"Call Type: {_clean_report_value(analysis.get('call_type'), 'OTHER')}",
+        f"Call Type Reason: {_clean_report_value(analysis.get('call_type_reason'))}",
         f"Caller Intent: {_clean_report_value(analysis.get('caller_intent'))}",
-        f"Why Called: {_clean_report_value(analysis.get('why_called'))}",
-        f"Service Interest: {_clean_report_value(analysis.get('service_requested'))}",
-        f"Qualification: {qualification}",
-        f"Qualification Reason: {qualification_reason}",
+        f"Why They Called: {_clean_report_value(analysis.get('why_called'))}",
+        f"Treatment/Service Interest: {_clean_report_value(analysis.get('service_requested'))}",
     ]
 
     if str(analysis.get("insurance", "")).strip():
@@ -1230,29 +1251,22 @@ def build_qc_report(analysis):
     if str(analysis.get("outcome", "")).strip():
         parts.append(f"Outcome: {_clean_report_value(analysis.get('outcome'))}")
 
-    evidence = (
-        f"2Way={'YES' if analysis.get('two_way_conversation') else 'NO'}, "
-        f"QualInfo={'YES' if analysis.get('qualification_info_present') else 'NO'}, "
-        f"Location={'YES' if analysis.get('location_or_eligibility_present') else 'NO'}, "
-        f"Outcome={'YES' if analysis.get('clear_outcome') else 'NO'}"
-    )
-
     parts.extend([
         f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
         f"Spam Confidence: {int(analysis.get('spam_confidence', 0) or 0)}%",
-        f"Spam Reason: {spam_reason}",
         f"QC Issue: {_clean_report_value(analysis.get('qc_issue'))}",
-        f"Evidence: {evidence}",
-        f"Decision Signal: {decision}",
-        f"Score Basis: {get_score_basis(analysis)}",
-        f"Quality Score: {int(score)}/100",
     ])
 
     return " | ".join(parts)
 
 
 def calculate_call_quality_score(analysis):
-    """Deterministic 0-100 score. AI supplies facts; Python supplies the final score."""
+    """Deterministic 0-100 score. AI supplies facts; Python supplies the final score.
+    Rehab special rules:
+    - Government/state insurance = never qualified.
+    - No confirmed appointment = never 100.
+    - High-confidence spam overrides everything."""
+    
     score = 0
 
     qualification_status = analysis.get("qualification_status", "NOT CLEAR")
@@ -1296,11 +1310,73 @@ def calculate_call_quality_score(analysis):
     # Business rule: Rehab calls using government/state insurance are not qualified.
     # Keep the score as the single final source of row color, so this produces a
     # yellow-range score rather than applying a separate row color.
-    if campaign_category == "Rehab & Addiction Treatment":
-        insurance_status = get_rehab_insurance_status(analysis)
-        if insurance_status == "GOVERNMENT":
+   if campaign_category == "Rehab & Addiction Treatment":
+
+        rehab_status = get_rehab_insurance_status(analysis)
+
+        # Government/state insurance is NEVER qualified.
+        if rehab_status == "YELLOW":
             score = min(score, 60)
 
+        # Private/commercial insurance can qualify,
+        # but appointment is still required for a perfect score.
+        if not analysis.get("appointment_set", False):
+            # A Rehab call without a confirmed appointment
+            # can NEVER receive 100.
+            score = min(score, 99)
+    # --------------------------------------------------------
+    # GOVERNMENT / STATE INSURANCE
+    # --------------------------------------------------------
+
+    government_terms = [
+        "medicaid",
+        "medicare",
+        "state insurance",
+        "state-funded",
+        "state funded",
+        "state plan",
+        "state program",
+        "government insurance",
+        "government-funded",
+        "government funded",
+        "government plan",
+        "government program",
+        "public insurance",
+        "public plan",
+        "public health insurance",
+        "chip",
+        "medi-cal",
+        "medical",
+        "county insurance",
+        "county-funded",
+        "county funded",
+    ]
+
+    if any(term in insurance for term in government_terms):
+        return "YELLOW"
+
+    # --------------------------------------------------------
+    # PRIVATE / COMMERCIAL INSURANCE
+    # --------------------------------------------------------
+
+    private_terms = [
+        "private",
+        "employer",
+        "employee",
+        "commercial",
+        "company insurance",
+        "company plan",
+        "group insurance",
+        "group plan",
+        "ppo",
+        "hmo",
+        "pos",
+        "epo",
+    ]
+
+    if any(term in insurance for term in private_terms):
+        return "GREEN"
+        
     return max(0, min(100, score))
 
 
