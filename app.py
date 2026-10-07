@@ -1385,9 +1385,7 @@ PRIVATE_TERMS = [
     "private", "employer", "employee", "commercial",
     "company insurance", "company plan", "group insurance", "group plan",
     "insurance through work",
-    "ppo", "hmo", "pos", "epo",
-    "blue cross", "blue shield", "bcbs", "aetna", "cigna", "humana",
-    "united healthcare", "unitedhealthcare", "anthem", "kaiser",
+    "ppo", "hmo", "pos", "epo"
 ]
 
 
@@ -1512,8 +1510,9 @@ WRONG_NUMBER_MAX_SCORE = 30      # wrong number / campaign mismatch
 OTHER_TYPE_MAX_SCORE = 49        # every call_type except QUALIFIED / NON-QUALIFIED
 NON_QUALIFIED_MAX_SCORE = 60
 QUALIFIED_UNCLEAR_MAX_SCORE = 79 # call_type QUALIFIED but qualification status not clear
+APPOINTMENT_MAX = 95
 REHAB_GOV_INSURANCE_MAX = 60
-REHAB_NO_APPOINTMENT_MAX = 99    # Rehab can never be 100 without an appointment
+REHAB_NO_APPOINTMENT_MAX = 95    # Rehab can never be 100 without an appointment
 
 
 def _score_breakdown(analysis):
