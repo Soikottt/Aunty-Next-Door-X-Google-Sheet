@@ -820,6 +820,8 @@ def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
         "Focus on the caller's reason, requested service/information, important qualification details, location/eligibility, and outcome."
     )
 
+    service_categories = ", ".join(CAMPAIGN_QC_QUESTIONS.keys())
+
     return f"""
 You are a pay-per-call call QC analyst. Analyze the complete transcript and return ONLY one valid JSON object.
 
@@ -829,7 +831,12 @@ CAMPAIGN FOCUS: {campaign_guidance}
 Return exactly these keys:
 long_summary, main_topic, call_type, qualification_status, caller_intent, why_called,
 service_requested, insurance, location, outcome, spam_robot, spam_confidence,
-qc_issue, spam_reason, qualification_reason, call_type_reason
+qc_issue, spam_reason, qualification_reason, call_type_reason,
+detected_service_category, matches_campaign, appointment_set
+
+detected_service_category = the service the CALLER actually asked for, judged only from the caller's own words (NOT from the campaign name). Choose exactly one of: {service_categories}, OTHER, UNCLEAR.
+matches_campaign = true if the caller's requested service belongs to this campaign's service; false if the caller wanted a different service (example: campaign is Dumpster but the caller is asking about rehab/addiction treatment); "unclear" if the caller never said what they wanted. This is about SERVICE TYPE only, never about insurance or eligibility.
+appointment_set = true only if an appointment, booking, delivery, consultation, or warm transfer was clearly confirmed during the call; otherwise false.
 
 Allowed call_type values: QUALIFIED, NON-QUALIFIED, WRONG NUMBER, SPAM / ROBOT, INFORMATION ONLY, SILENT / NO RESPONSE, OTHER.
 Allowed qualification_status values: QUALIFIED, NON-QUALIFIED, NOT CLEAR.
@@ -850,6 +857,8 @@ RULES:
 - For Rehab, Medicaid/Medicare/state/government/public insurance means NON-QUALIFIED. Private/commercial plans such as BCBS, Aetna, Cigna, UnitedHealthcare, Humana, PPO/HMO/EPO/POS are positive qualification signals when clearly stated by the caller.
 - qualification_reason should briefly explain why the qualification status was chosen.
 - qc_issue should contain only a real QC issue when supported; otherwise empty.
+- If the caller is asking for a different service than this campaign's service, set matches_campaign=false and call_type=WRONG NUMBER.
+- Use QUALIFIED or NON-QUALIFIED ONLY when the caller is asking for this campaign's service. Information-only, unclear, or off-campaign callers must use INFORMATION ONLY, WRONG NUMBER, or OTHER.
 
 TRANSCRIPT:
 {full_transcript}
@@ -940,6 +949,183 @@ def apply_deterministic_spam_rules(analysis, full_transcript):
     return analysis
 
 
+# ============================================================
+# NO-VOICE DETECTION, CAMPAIGN MATCHING & BUSINESS RULES
+# ============================================================
+
+NO_VOICE_MIN_WORDS = 3                      # fewer words than this = "no voice"
+MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION = 1.0   # shorter audio is not sent to Whisper
+NO_VOICE_TOPIC = "No voice / no speech in recording"
+NO_VOICE_SUMMARY = (
+    "No voice was detected in this recording. "
+    "There was no speech to transcribe or summarize."
+)
+
+# Whisper often "hallucinates" these phrases on silent audio.
+_SILENCE_HALLUCINATION_HINTS = (
+    "thanks for watching", "thank you for watching", "please subscribe",
+    "like and subscribe", "subtitles by", "amara org",
+)
+
+ALLOWED_CALL_TYPES = {
+    "QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT",
+    "INFORMATION ONLY", "SILENT / NO RESPONSE", "OTHER",
+}
+ALLOWED_QUAL_STATUSES = {"QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"}
+
+
+def is_no_voice_transcript(text):
+    """True when the recording produced no usable text (empty, 1-2 words,
+    or a typical Whisper silence hallucination)."""
+    cleaned = re.sub(r"[^a-z0-9' ]+", " ", str(text or "").lower())
+    words = cleaned.split()
+    if not words:
+        return True
+    normalized = " ".join(words)
+    if len(words) <= 8 and any(hint in normalized for hint in _SILENCE_HALLUCINATION_HINTS):
+        return True
+    return len(words) < NO_VOICE_MIN_WORDS
+
+
+def _is_short_audio_error(exc):
+    """Groq rejects extremely short / empty audio. Treat that as No Voice."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("too short", "minimum audio length", "empty"))
+
+
+def _to_bool(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return bool(value)
+
+
+def _parse_match_flag(value):
+    """True / False / None (unclear)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"true", "yes", "1"}:
+            return True
+        if v in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def get_campaign_family(campaign_name):
+    """Return the known QC campaign family for a campaign name, or None."""
+    family = get_campaign_category(campaign_name)
+    return family if family in CAMPAIGN_QC_QUESTIONS else None
+
+
+def _match_known_family(text):
+    """Map the AI's detected_service_category to a known campaign family, or None."""
+    value = str(text or "").strip()
+    if not value or value.upper() in {"OTHER", "UNCLEAR"}:
+        return None
+    for family in CAMPAIGN_QC_QUESTIONS:
+        if family.lower() == value.lower():
+            return family
+    return get_campaign_family(value)
+
+
+def build_no_voice_analysis(campaign_name=""):
+    """Default analysis for recordings with no text. Score is fixed at 30."""
+    analysis = {
+        "long_summary": NO_VOICE_SUMMARY,
+        "main_topic": NO_VOICE_TOPIC,
+        "call_type": "SILENT / NO RESPONSE",
+        "qualification_status": "NOT CLEAR",
+        "caller_intent": "",
+        "why_called": "",
+        "service_requested": "",
+        "insurance": "",
+        "location": "",
+        "outcome": "",
+        "spam_robot": False,
+        "spam_confidence": 0,
+        "qc_issue": "No voice detected in recording",
+        "spam_reason": "",
+        "qualification_reason": "",
+        "call_type_reason": "No speech or text in recording",
+        "detected_service_category": "UNCLEAR",
+        "matches_campaign": None,
+        "appointment_set": False,
+        "no_voice": True,
+        "campaign_category": campaign_name,
+    }
+    return _derive_analysis_flags(analysis, "", timeline_data=[])
+
+
+def apply_campaign_rules(analysis, campaign_name):
+    """Deterministic business rules applied AFTER the AI analysis.
+
+    1. Campaign vs service mismatch (e.g. Rehab caller on a Dumpster campaign)
+       -> WRONG NUMBER.
+    2. call_type / qualification_status must agree with each other.
+    3. Rehab + government/state insurance -> NON-QUALIFIED.
+    """
+    family = get_campaign_family(campaign_name)
+
+    call_type = str(analysis.get("call_type", "OTHER") or "OTHER").strip().upper()
+    if call_type not in ALLOWED_CALL_TYPES:
+        call_type = "OTHER"
+    status = str(analysis.get("qualification_status", "NOT CLEAR") or "NOT CLEAR").strip().upper()
+    if status not in ALLOWED_QUAL_STATUSES:
+        status = "NOT CLEAR"
+    spam = _to_bool(analysis.get("spam_robot")) or call_type == "SPAM / ROBOT"
+
+    detected = _match_known_family(analysis.get("detected_service_category"))
+    matches = _parse_match_flag(analysis.get("matches_campaign"))
+
+    # ---- 1. Campaign / service mismatch -> WRONG NUMBER ----
+    mismatch = False
+    if not spam and call_type != "SILENT / NO RESPONSE":
+        if family and detected:
+            mismatch = detected != family
+        else:
+            mismatch = matches is False
+
+    if mismatch:
+        wanted = (
+            detected
+            or str(analysis.get("service_requested") or "").strip()
+            or "a different service"
+        )
+        analysis["call_type"] = "WRONG NUMBER"
+        analysis["qualification_status"] = "NON-QUALIFIED"
+        analysis["campaign_mismatch"] = True
+        analysis["call_type_reason"] = f"Caller wanted {wanted}, but call came in on {campaign_name}"
+        issue = f"Campaign/service mismatch: caller wanted {wanted}"
+        existing = str(analysis.get("qc_issue") or "").strip()
+        analysis["qc_issue"] = issue if not existing else f"{issue}; {existing}"
+        return analysis
+
+    analysis["campaign_mismatch"] = False
+
+    # ---- 2. Keep call_type and qualification_status consistent ----
+    if call_type == "QUALIFIED" and status == "NON-QUALIFIED":
+        call_type = "NON-QUALIFIED"
+    elif call_type == "NON-QUALIFIED" and status == "QUALIFIED":
+        status = "NON-QUALIFIED"
+    elif call_type not in {"QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER"} and status == "QUALIFIED":
+        status = "NOT CLEAR"
+
+    # ---- 3. Rehab: government / state insurance is never qualified ----
+    if (
+        family == "Rehab & Addiction Treatment"
+        and call_type == "QUALIFIED"
+        and get_rehab_insurance_status(analysis) == "YELLOW"
+    ):
+        call_type = "NON-QUALIFIED"
+        status = "NON-QUALIFIED"
+        analysis["call_type_reason"] = "Government/state insurance is not qualified for Rehab"
+
+    analysis["call_type"] = call_type
+    analysis["qualification_status"] = status
+    return analysis
+
+
 def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     """Derive scoring/report flags in Python instead of spending AI tokens on them."""
     call_type = str(analysis.get("call_type", "OTHER") or "OTHER").strip().upper()
@@ -965,6 +1151,14 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
         analysis["spam_confidence"] = max(0, min(100, _safe_int(analysis.get("spam_confidence"))))
     except (TypeError, ValueError):
         analysis["spam_confidence"] = 0
+
+    analysis["appointment_set"] = _to_bool(analysis.get("appointment_set", False))
+    analysis["no_voice"] = _to_bool(analysis.get("no_voice", False))
+    analysis["campaign_mismatch"] = _to_bool(analysis.get("campaign_mismatch", False))
+    analysis["matches_campaign"] = _parse_match_flag(analysis.get("matches_campaign"))
+    analysis["detected_service_category"] = str(
+        analysis.get("detected_service_category", "") or ""
+    ).replace("*", "").strip()
 
     for key in [
         "long_summary", "main_topic", "caller_intent", "why_called", "service_requested",
@@ -1037,8 +1231,9 @@ def _with_key_fallback(call_fn, label):
     raise RuntimeError("All Groq accounts failed. " + " | ".join(errors))
 
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
-    if not full_transcript.strip():
-        raise RuntimeError("No transcription text was available for AI analysis.")
+    # No text in the recording -> "No Voice" (fixed score). No AI tokens are spent.
+    if is_no_voice_transcript(full_transcript):
+        return build_no_voice_analysis(campaign_name)
 
     if not GROQ_API_KEYS:
         raise RuntimeError("No Groq API keys are configured.")
@@ -1050,6 +1245,8 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
         lambda c, lbl: _call_structured_analysis(c, prompt, lbl), "ANALYSIS"
     )
     analysis = apply_deterministic_spam_rules(analysis, full_transcript)
+    analysis = apply_campaign_rules(analysis, campaign_name)
+    analysis["campaign_category"] = campaign_name
 
     return _derive_analysis_flags(analysis, full_transcript, timeline_data)
 
@@ -1077,8 +1274,8 @@ def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
 
 def generate_fast_summary_groq(full_transcript, campaign_name):
     """Fast manual summary: only Main Topic + Long Summary. Full QC stays separate."""
-    if not full_transcript.strip():
-        raise RuntimeError("No transcription text was available for AI summary.")
+    if is_no_voice_transcript(full_transcript):
+        return NO_VOICE_TOPIC, NO_VOICE_SUMMARY
 
     if not GROQ_API_KEYS:
         raise RuntimeError("No Groq API keys are configured.")
@@ -1189,6 +1386,8 @@ PRIVATE_TERMS = [
     "company insurance", "company plan", "group insurance", "group plan",
     "insurance through work",
     "ppo", "hmo", "pos", "epo",
+    "blue cross", "blue shield", "bcbs", "aetna", "cigna", "humana",
+    "united healthcare", "unitedhealthcare", "anthem", "kaiser",
 ]
 
 
@@ -1211,6 +1410,14 @@ def _safe_int(value, default=0) -> int:
         return default
 
 
+# "I don't have Medicaid", "not on Medicare", "no medicaid" must NOT count as government insurance.
+GOVERNMENT_NEGATED_RE = re.compile(
+    r"\b(?:no|not|don[\u2019']t have|do not have|doesn[\u2019']t have|does not have|never had|without)"
+    r"\s+(?:\w+\s+){0,2}?(?:" + "|".join(re.escape(t) for t in GOVERNMENT_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+
+
 def get_rehab_insurance_status(analysis):
     """Classify Rehab insurance for deterministic qualification scoring.
     Returns "YELLOW" (government/state), "GREEN" (private/commercial), or None."""
@@ -1220,23 +1427,29 @@ def get_rehab_insurance_status(analysis):
     if not insurance:
         return None
 
+    # Remove negated mentions first ("does not have Medicaid").
+    cleaned = GOVERNMENT_NEGATED_RE.sub(" ", insurance)
+
     # Government is checked first, so it wins if both match.
-    if GOVERNMENT_RE.search(insurance):
+    if GOVERNMENT_RE.search(cleaned):
         return "YELLOW"
 
-    if PRIVATE_RE.search(insurance):
+    if PRIVATE_RE.search(cleaned):
         return "GREEN"
 
     return None
-
 
 
 def get_decision_signal(score, analysis):
     """Convert the numeric score into a practical operations signal."""
     spam = bool(analysis.get("spam_robot"))
     spam_conf = _safe_int(analysis.get("spam_confidence"))
+    if analysis.get("no_voice"):
+        return "NO VOICE / CHECK RECORDING"
     if spam and spam_conf >= 90:
         return "REJECT / SPAM"
+    if analysis.get("call_type") == "WRONG NUMBER":
+        return "REJECT / WRONG NUMBER"
     if score >= 90:
         return "KEEP / HIGH VALUE"
     if score >= 80:
@@ -1249,26 +1462,8 @@ def get_decision_signal(score, analysis):
 
 
 def get_score_basis(analysis):
-    """Explain the deterministic score in compact terms for future decisions."""
-    items = []
-    if analysis.get("qualification_status") == "QUALIFIED":
-        items.append("Qualification +25")
-    elif analysis.get("qualification_status") == "NOT CLEAR" and analysis.get("relevant_intent"):
-        items.append("Relevant but unclear +10")
-    if str(analysis.get("service_requested", "")).strip():
-        items.append("Service +15")
-    if analysis.get("qualification_info_present"):
-        items.append("QualInfo +15")
-    if analysis.get("location_or_eligibility_present"):
-        items.append("Location +10")
-    if analysis.get("clear_outcome"):
-        items.append("Outcome +10")
-    if analysis.get("two_way_conversation"):
-        items.append("2Way +10")
-    if not analysis.get("spam_robot"):
-        items.append("NoSpam +5")
-    if not analysis.get("major_qc_issue"):
-        items.append("NoMajorQC +10")
+    """Explain the deterministic score in compact terms (single source: _score_breakdown)."""
+    _, items = _score_breakdown(analysis)
     return ", ".join(items) if items else "No positive score factors"
 
 
@@ -1282,87 +1477,158 @@ def build_qc_report(analysis):
         f"Treatment/Service Interest: {_clean_report_value(analysis.get('service_requested'))}",
     ]
 
+    if analysis.get("campaign_mismatch"):
+        parts.append(
+            f"Campaign Mismatch: YES (campaign: {_clean_report_value(analysis.get('campaign_category'))}, "
+            f"caller wanted: {_clean_report_value(analysis.get('detected_service_category') or analysis.get('service_requested'))})"
+        )
     if str(analysis.get("insurance", "")).strip():
         parts.append(f"Insurance: {_clean_report_value(analysis.get('insurance'))}")
     if str(analysis.get("location", "")).strip():
         parts.append(f"Location: {_clean_report_value(analysis.get('location'))}")
     if str(analysis.get("outcome", "")).strip():
         parts.append(f"Outcome: {_clean_report_value(analysis.get('outcome'))}")
+    if analysis.get("appointment_set"):
+        parts.append("Appointment/Booking: YES")
 
     parts.extend([
         f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
         f"Spam Confidence: {_safe_int(analysis.get('spam_confidence'))}%",
         f"QC Issue: {_clean_report_value(analysis.get('qc_issue'))}",
+        f"Score Basis: {get_score_basis(analysis)}",
     ])
 
     return " | ".join(parts)
 
 
-def calculate_call_quality_score(analysis):
-    """Deterministic 0-100 score. AI supplies facts; Python supplies the final score.
-    Rehab special rules:
-    - Government/state insurance = never qualified.
-    - No confirmed appointment = never 100.
-    - High-confidence spam overrides everything."""
-    
-    score = 0
+# ------------------------------------------------------------
+# SCORING RULES (edit the numbers here)
+# ------------------------------------------------------------
+NO_VOICE_SCORE = 30              # no text in recording / silent call: fixed
+SILENT_SCORE = 30                # AI says SILENT / NO RESPONSE: fixed
+SPAM_CONFIDENT_SCORE = 5         # spam_robot and confidence >= 90: fixed
+SPAM_MAX_SCORE = 25              # lower-confidence spam
+WRONG_NUMBER_MAX_SCORE = 30      # wrong number / campaign mismatch
+OTHER_TYPE_MAX_SCORE = 49        # every call_type except QUALIFIED / NON-QUALIFIED
+NON_QUALIFIED_MAX_SCORE = 60
+QUALIFIED_UNCLEAR_MAX_SCORE = 79 # call_type QUALIFIED but qualification status not clear
+REHAB_GOV_INSURANCE_MAX = 60
+REHAB_NO_APPOINTMENT_MAX = 99    # Rehab can never be 100 without an appointment
 
-    qualification_status = analysis.get("qualification_status", "NOT CLEAR")
-    if qualification_status == "QUALIFIED":
-        score += 25
-    elif qualification_status == "NOT CLEAR" and analysis.get("relevant_intent"):
-        score += 10
 
-    if str(analysis.get("service_requested", "")).strip():
-        score += 15
-    if analysis.get("qualification_info_present"):
-        score += 15
-    if analysis.get("location_or_eligibility_present"):
-        score += 10
-    if analysis.get("clear_outcome"):
-        score += 10
-    if analysis.get("two_way_conversation"):
-        score += 10
-    if not analysis.get("spam_robot"):
-        score += 5
-    if not analysis.get("major_qc_issue"):
-        score += 10
+def _score_breakdown(analysis):
+    """Return (final_score, list_of_reasons). AI supplies facts; Python supplies the score.
 
-    call_type = analysis.get("call_type", "OTHER")
+    Tiers:
+      QUALIFIED      base 60 (45 if status unclear) + completeness bonuses, up to 100
+      NON-QUALIFIED  base 20 + bonuses, max 60
+      everything else (INFO ONLY / OTHER / WRONG NUMBER / SPAM / SILENT): max 49
+    Hard rules: no voice = 30, silent = 30, wrong number <= 30, spam <= 25 (5 if confident).
+    """
+    call_type = str(analysis.get("call_type", "OTHER") or "OTHER").strip().upper()
+    status = str(analysis.get("qualification_status", "NOT CLEAR") or "NOT CLEAR").strip().upper()
     spam_confidence = _safe_int(analysis.get("spam_confidence"))
+    spam = bool(analysis.get("spam_robot")) or call_type == "SPAM / ROBOT"
     campaign_category = str(analysis.get("campaign_category", "") or "").strip()
 
-    # Strong spam is always a very low-quality call.
-    if analysis.get("spam_robot") and spam_confidence >= 90:
-        return 5
-    if analysis.get("spam_robot"):
-        return min(score, 25)
-
-    if call_type == "WRONG NUMBER":
-        return min(score, 30)
+    # ---- Fixed-score rules ----
+    if analysis.get("no_voice"):
+        return NO_VOICE_SCORE, [f"No voice detected = {NO_VOICE_SCORE}"]
+    if spam and spam_confidence >= 90:
+        return SPAM_CONFIDENT_SCORE, [f"Confirmed spam/robot = {SPAM_CONFIDENT_SCORE}"]
     if call_type == "SILENT / NO RESPONSE":
-        return min(score, 15)
-    if call_type in {"NON-QUALIFIED", "INFORMATION ONLY"}:
-        score = min(score, 60)
+        return SILENT_SCORE, [f"Silent / no response = {SILENT_SCORE}"]
 
-    # Business rule: Rehab calls using government/state insurance are not qualified.
-    # Keep the score as the single final source of row color, so this produces a
-    # yellow-range score rather than applying a separate row color.
+    score = 0
+    items = []
+
+    def add(points, label):
+        nonlocal score
+        score += points
+        items.append(f"{label} +{points}")
+
+    has_service = bool(str(analysis.get("service_requested", "")).strip())
+
+    # ---- Tier points ----
+    if call_type == "QUALIFIED" and status != "NON-QUALIFIED":
+        tier = "QUALIFIED"
+        add(60 if status == "QUALIFIED" else 45, "Qualified base")
+        if has_service:
+            add(10, "Service")
+        if analysis.get("location_or_eligibility_present"):
+            add(8, "Location/eligibility")
+        if analysis.get("qualification_info_present"):
+            add(6, "Qualification info")
+        if analysis.get("clear_outcome"):
+            add(8, "Outcome")
+        if analysis.get("two_way_conversation"):
+            add(4, "2-way conversation")
+        if analysis.get("appointment_set"):
+            add(4, "Appointment/booking")
+        if str(analysis.get("qc_issue", "")).strip():
+            score -= 10
+            items.append("QC issue -10")
+    elif call_type in {"QUALIFIED", "NON-QUALIFIED"}:
+        tier = "NON-QUALIFIED"
+        add(20, "Non-qualified base")
+        if analysis.get("relevant_intent"):
+            add(5, "Relevant intent")
+        if has_service:
+            add(8, "Service")
+        if analysis.get("qualification_info_present"):
+            add(7, "Qualification info")
+        if analysis.get("location_or_eligibility_present"):
+            add(5, "Location")
+        if analysis.get("clear_outcome"):
+            add(5, "Outcome")
+        if analysis.get("two_way_conversation"):
+            add(5, "2-way conversation")
+    else:
+        tier = "OTHER"
+        if analysis.get("relevant_intent"):
+            add(10, "Relevant intent")
+        if has_service:
+            add(8, "Service")
+        if analysis.get("two_way_conversation"):
+            add(8, "2-way conversation")
+        if analysis.get("clear_outcome"):
+            add(5, "Outcome")
+        if analysis.get("qualification_info_present"):
+            add(4, "Qualification info")
+
+    # ---- Caps (lowest cap wins) ----
+    caps = []
+    if spam:
+        caps.append((SPAM_MAX_SCORE, "spam"))
+    elif call_type == "WRONG NUMBER":
+        caps.append((WRONG_NUMBER_MAX_SCORE, "wrong number"))
+    elif tier == "OTHER":
+        caps.append((OTHER_TYPE_MAX_SCORE, f"call type {call_type}"))
+    elif tier == "NON-QUALIFIED":
+        caps.append((NON_QUALIFIED_MAX_SCORE, "non-qualified"))
+    elif status != "QUALIFIED":
+        caps.append((QUALIFIED_UNCLEAR_MAX_SCORE, "qualification not clear"))
+
     if campaign_category == "Rehab & Addiction Treatment":
-
-        rehab_status = get_rehab_insurance_status(analysis)
-
         # Government/state insurance is NEVER qualified.
-        if rehab_status == "YELLOW":
-            score = min(score, 60)
-
-        # Private/commercial insurance can qualify,
-        # but appointment is still required for a perfect score.
+        if get_rehab_insurance_status(analysis) == "YELLOW":
+            caps.append((REHAB_GOV_INSURANCE_MAX, "government insurance"))
+        # A Rehab call without a confirmed appointment can NEVER receive 100.
         if not analysis.get("appointment_set", False):
-            # A Rehab call without a confirmed appointment
-            # can NEVER receive 100.
-            score = min(score, 99)
-    return max(0, min(100, score))
+            caps.append((REHAB_NO_APPOINTMENT_MAX, "no appointment"))
+
+    final = max(0, score)
+    for cap_value, cap_reason in caps:
+        if final > cap_value:
+            final = cap_value
+            items.append(f"Capped at {cap_value} ({cap_reason})")
+
+    return max(0, min(100, final)), items
+
+
+def calculate_call_quality_score(analysis):
+    """Deterministic 0-100 score. See _score_breakdown for the rules."""
+    return _score_breakdown(analysis)[0]
 
 
 SCORE_COLORS = {
@@ -1515,7 +1781,15 @@ def sync_google_sheet_batch(default_campaign_name=""):
                     campaign_to_use = "General Customer Inquiry"
 
                 load_audio_url(recording_url)
-                timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+
+                # Very short audio is not sent to Whisper: it becomes "No Voice" (score 30).
+                timeline_data, raw_text_segments = [], []
+                if (st.session_state.get("duration_sec") or 0) >= MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION:
+                    try:
+                        timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                    except Exception as whisper_exc:
+                        if not _is_short_audio_error(whisper_exc):
+                            raise
                 full_transcript_str = " ".join(raw_text_segments).strip()
 
                 analysis = generate_call_analysis_groq(
