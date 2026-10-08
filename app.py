@@ -849,18 +849,7 @@ RULES:
 - call_type_reason must be one short sentence (5-15 words) explaining why you chose that call_type, e.g. "Private insurance and seeking detox".
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
 - (Write a natural, concise long_summary and a main_topic.
-
-- (Main topic: 5–25 words. State the caller’s main reason for calling in one clear sentence. Long summary: The summary length must depend on the call duration and the amount of meaningful information in the transcript. Do not use a fixed number of sentences.
-
-  Very short calls: 1 short sentence.
-  Short calls: 1–2 sentences.
-  Normal calls: 2–3 sentences.
-  Longer calls with substantial relevant information: 3–4 sentences maximum.
-  Only use more than 4 sentences when absolutely necessary to capture important details. Never make the summary longer just because the call was long.
-
-  Cover only the most important information: why the caller called, what they wanted or asked for, key details they clearly stated, what the agent said or offered, important objections or issues, and why/how the call ended.
-
-  Keep the summary concise and factual. Do not repeat information, add unnecessary details, or summarize every part of a long conversation. Longer call duration does NOT automatically mean a longer summary. Include only meaningful information that is relevant to the caller’s reason for calling and the call outcome.)
+- Write a natural 2-8 sentence long_summary and a 5-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and why the call ended.
 - If the caller is unrelated, explain what they actually wanted.
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
@@ -1507,7 +1496,6 @@ def build_qc_report(analysis):
         f"Spam/Robot: {'YES' if analysis.get('spam_robot') else 'NO'}",
         f"Spam Confidence: {_safe_int(analysis.get('spam_confidence'))}%",
         f"QC Issue: {_clean_report_value(analysis.get('qc_issue'))}",
-        f"Score Basis: {get_score_basis(analysis)}",
     ])
 
     return " | ".join(parts)
