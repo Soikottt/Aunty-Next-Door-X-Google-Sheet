@@ -848,7 +848,19 @@ RULES:
 - Use only facts supported by the transcript. Never guess or invent.
 - call_type_reason must be one short sentence (5-15 words) explaining why you chose that call_type, e.g. "Private insurance and seeking detox".
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
-- Write a natural 2-8 sentence long_summary and a 5-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and how the call ended.
+- (Write a natural, concise long_summary and a main_topic.
+
+- (Main topic: 5–25 words. State the caller’s main reason for calling in one clear sentence. Long summary: The summary length must depend on the call duration and the amount of meaningful information in the transcript. Do not use a fixed number of sentences.
+
+  Very short calls: 1 short sentence.
+  Short calls: 1–2 sentences.
+  Normal calls: 2–3 sentences.
+  Longer calls with substantial relevant information: 3–4 sentences maximum.
+  Only use more than 4 sentences when absolutely necessary to capture important details. Never make the summary longer just because the call was long.
+
+  Cover only the most important information: why the caller called, what they wanted or asked for, key details they clearly stated, what the agent said or offered, important objections or issues, and why/how the call ended.
+
+  Keep the summary concise and factual. Do not repeat information, add unnecessary details, or summarize every part of a long conversation. Longer call duration does NOT automatically mean a longer summary. Include only meaningful information that is relevant to the caller’s reason for calling and the call outcome.)
 - If the caller is unrelated, explain what they actually wanted.
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
@@ -856,7 +868,7 @@ RULES:
 - Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
 - If the caller mentions Yelp or Yellow Pages in any context, mark the call as spam.
 - A normal irrelevant or non-qualified caller is not automatically spam.
-- For Rehab, Medicaid/Medicare/state/government/public insurance means NON-QUALIFIED. Private/commercial plans such as BCBS, Aetna, Cigna, UnitedHealthcare, Humana, PPO/HMO/EPO/POS are positive qualification signals when clearly stated by the caller.
+- For Rehab, Medicaid/Medicare/state/government/marketplace/public insurance means NON-QUALIFIED. Treat private/commercial insurance as a positive qualification signal when clearly stated by the caller, including statements such as “private insurance,” “commercial insurance,” or insurance through the caller’s, parent’s, spouse’s, or another family member’s employer. PPO, HMO, EPO, and POS are also positive signals when clearly stated. Do not assume the provider or plan type if it is not stated.
 - qualification_reason should briefly explain why the qualification status was chosen.
 - qc_issue should contain only a real QC issue when supported; otherwise empty.
 - If the caller is asking for a different service than this campaign's service, set matches_campaign=false and call_type=WRONG NUMBER.
