@@ -3112,26 +3112,13 @@ def make_sync_progress_callback(container):
 
 
 def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
-    """Process Ringba recordings from the shared Google Sheet.
-
-    Sheet layout:
-    D = Campaign
-    G = Long AI Summary
-    H = Main Topic / processing flag
-    I = Recording URL
-    J = Existing carrier / VOIP data (untouched)
-    K = AI QC Report
-    L = Numeric quality score
-
-    While a row is being worked on, G/H/K/L show progress icons (see _SYNC_ICONS).
-    H is written LAST with the real topic, so a row only counts as finished when it is complete.
-    """
+    """Process Ringba recordings from the shared Google Sheet with rate-limiting and timeouts."""
     def emit(**kwargs):
         if progress_callback:
             try:
                 progress_callback(kwargs)
             except Exception:
-                pass      # a display problem must never stop the processing
+                pass
 
     try:
         gc = get_google_client()
@@ -3158,7 +3145,6 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
 
-            # Keep the existing duration formatting behavior.
             if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
                 try:
                     worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
@@ -3166,7 +3152,6 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 except Exception:
                     pass
 
-            # Trigger: recording exists + H is empty (or holds an old, dead progress marker).
             work_state = _row_work_state(recording_url, existing_main_topic)
             if work_state == "busy":
                 busy_count += 1
@@ -3184,17 +3169,33 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 if not campaign_to_use:
                     campaign_to_use = "General Customer Inquiry"
 
-                # ---- Step 1: download + transcribe ----
+                # ---- Step 1: download + transcribe with safety timeout ----
                 emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
                      label="Downloading and transcribing the recording",
                      columns={"G": "working", "H": "working", "K": "waiting", "L": "waiting"})
                 _write_row_cells(worksheet, index, "🔄 Transcribing audio…", marker, "⏳ Waiting", "⏳")
 
-                load_audio_url(recording_url)
+                # Safe download with timeout constraint to prevent hanging
+                url = recording_url.strip()
+                filename = url.split("/")[-1].split("?")[0] or "web_audio.mp3"
+                ext = Path(filename).suffix.lower()
+                safe_name = f"{uuid.uuid4().hex}{ext if ext in {'.mp3', '.wav'} else '.mp3'}"
+                path = UPLOAD_DIR / safe_name
 
-                # Very short audio is not sent to Whisper: it becomes "No Voice" (score 30).
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    with open(path, "wb") as out_file:
+                        out_file.write(response.read())
+
+                sound = AudioSegment.from_file(path)
+                duration_sec = len(sound) / 1000.0
+
+                st.session_state.source_name = filename
+                st.session_state.file_path = str(path)
+                st.session_state.duration_sec = duration_sec
+
                 timeline_data, raw_text_segments = [], []
-                if (st.session_state.get("duration_sec") or 0) >= MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION:
+                if duration_sec >= MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION:
                     try:
                         timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
                     except Exception as whisper_exc:
@@ -3221,28 +3222,25 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 analysis["quality_score"] = score
                 qc_report = build_qc_report(analysis)
 
-                # ---- Step 3: save everything (H = main topic is the "done" flag) ----
+                # ---- Step 3: save results ----
                 emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
                      label="Saving results to the sheet",
                      columns={"G": "working", "H": "working", "K": "working", "L": "working"})
                 _write_row_cells(worksheet, index, detailed_summary, main_topic, qc_report, score)
 
-                apply_row_score_color(
-                    worksheet,
-                    index,
-                    score,
-                    analysis,
-                )
+                apply_row_score_color(worksheet, index, score, analysis)
 
                 row_finished = True
                 processed_count += 1
                 emit(event="row_done", row=index, position=position, total=total_pending, campaign=campaign_to_use,
                      call_type=analysis.get("call_type", ""), score=score,
                      columns={"G": "done", "H": "done", "K": "done", "L": "done"})
-                time.sleep(1)
+                
+                # Rate-limit cushion: 2.5 second pause between rows to protect Groq quota
+                time.sleep(2.5)
 
             except Exception as e:
-                row_finished = True      # handled here: error text below, H stays empty so it is retried
+                row_finished = True
                 error_text = f"⚠️ Processing error: {str(e)}"
                 try:
                     _write_row_cells(worksheet, index, error_text, "", error_text, "")
@@ -3251,9 +3249,8 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 emit(event="row_error", row=index, position=position, total=total_pending,
                      campaign=campaign_to_use, message=str(e),
                      columns={"G": "error", "H": "error", "K": "error", "L": "error"})
+                time.sleep(1.5)
             finally:
-                # If the run was stopped half-way (for example the page reran), remove the
-                # progress icons so the row is picked up again on the next sync.
                 if not row_finished:
                     try:
                         _write_row_cells(worksheet, index, "", "", "", "")
