@@ -796,6 +796,97 @@ def transcribe_groq_whisper(audio_file_path):
 GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 
 
+# ============================================================
+# SUMMARY STYLE (short, relevant, no filler)
+# ============================================================
+
+SUMMARY_STYLE_RULES = """
+SUMMARY STYLE (applies to long_summary and main_topic):
+- long_summary = ONE short plain-text paragraph of 2 to 4 short sentences (about 35-80 words). Never more than 4 sentences.
+- Order: why the caller called -> only the campaign-relevant details the caller clearly stated -> what the agent actually provided or did -> how the call ended.
+- Include ONLY facts that are clearly stated in the transcript AND relevant to the campaign QC questions below. Leave out everything else.
+- Do NOT include: greetings or small talk, the caller's name, phone number or address, company or agent names, repeated information, opinions or comments about the quality of the call, statements about what was missing, guesses, or filler.
+- Never write "not mentioned", "not provided", "not stated", "unknown", "no clear resolution", "no confirmed appointment", "no referral", or similar. If something is unclear, leave it out silently.
+- Never say the same fact twice. Combine related facts into one sentence.
+- An agent's question is NOT the caller's answer. Treat something as caller information only when the caller clearly said or confirmed it.
+- Use simple natural wording such as "The caller was looking for...", "The caller asked about...", "The agent provided...", "The call ended after...".
+- If the call is spam / robot / solicitation (for example Yelp, Yellow Pages, Google listing, SEO, marketing), say in one or two sentences what it was promoting. Do not describe it as a normal caller.
+- If the caller wanted a different service than this campaign, say what the caller actually wanted in one sentence.
+- If only one side spoke, say so in one short sentence (for example "The agent spoke, but the caller did not respond."). If neither side responded, write "The call had dead air with no response from either side."
+- Plain text only. No bullets, headings, markdown, asterisks, or bold, even if the QC questions below mention bold text.
+- main_topic = ONE sentence of 5-18 words stating the caller's real reason for calling. No filler.
+"""
+
+
+def build_summary_instructions(campaign_name):
+    """Style rules + the campaign-specific QC questions (these decide what belongs in the summary)."""
+    family = get_campaign_category(campaign_name) if campaign_name else campaign_name
+    qc_questions = get_qc_questions(family)
+    return (
+        SUMMARY_STYLE_RULES
+        + "\nCAMPAIGN QC QUESTIONS (use them only to decide what belongs in the summary; never mention them):\n"
+        + qc_questions.strip()
+        + "\n"
+    )
+
+
+_BANNED_SUMMARY_RE = re.compile(
+    r"\b(?:not|never|wasn't|was not|were not|weren't|isn't|is not|no)\s+(?:clearly\s+|further\s+|any\s+)?"
+    r"(?:mentioned|provided|stated|specified|discussed|given|disclosed|details?|information)\b"
+    r"|\bunknown\b|\bno clear (?:resolution|outcome|details?)\b|\bno confirmed appointment\b"
+    r"|\bno referral\b|\bnot clear\b|\bthe transcript\b|\bas an ai\b|\bqc questions?\b"
+    r"|\b(?:said|says|greeted|greeting)\s+(?:hello|hi|hey|good (?:morning|afternoon|evening))\b"
+    r"|\bthanked (?:the )?(?:caller|agent)\b",
+    re.IGNORECASE,
+)
+_PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b")
+
+
+def clean_summary_text(text, max_sentences=4, max_chars=700):
+    """Final safety net: strip markdown, filler/'not mentioned' sentences, phone numbers,
+    duplicate sentences, and cap the length."""
+    raw = str(text or "")
+    raw = re.sub(r"[*`#>]+", "", raw)
+    raw = re.sub(r"^\s*(?:[-\u2022]|\d+[.)])\s+", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    raw = _PHONE_RE.sub("a phone number", raw)
+    if not raw:
+        return ""
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw) if s.strip()]
+    kept, seen = [], set()
+    for sentence in sentences:
+        if _BANNED_SUMMARY_RE.search(sentence):
+            continue
+        key = re.sub(r"[^a-z0-9]+", " ", sentence.lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(sentence)
+        if len(kept) >= max_sentences:
+            break
+
+    result = " ".join(kept) if kept else " ".join(sentences[:2])
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit(" ", 1)[0].rstrip(",;:") + "."
+    return result
+
+
+def clean_main_topic(text, max_words=25):
+    """One short sentence, no markdown."""
+    raw = re.sub(r"[*`#>]+", "", str(text or ""))
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", raw)[0].strip()
+    words = first.split()
+    if len(words) > max_words:
+        first = " ".join(words[:max_words]).rstrip(",;:") + "..."
+    return first
+
+
+
+
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     """Build a compact analysis prompt. Keep the transcript, but avoid sending
     timestamps, speaker-label instructions, or the old long JSON schema."""
@@ -823,6 +914,7 @@ def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     )
 
     service_categories = ", ".join(CAMPAIGN_QC_QUESTIONS.keys())
+    summary_instructions = build_summary_instructions(campaign_name)
 
     return f"""
 You are a pay-per-call call QC analyst. Analyze the complete transcript and return ONLY one valid JSON object.
@@ -848,20 +940,21 @@ RULES:
 - Use only facts supported by the transcript. Never guess or invent.
 - call_type_reason must be one short sentence (5-15 words) explaining why you chose that call_type, e.g. "Private insurance and seeking detox".
 - An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
-- (Write a natural, concise long_summary and a main_topic.
-- Write a natural 2-8 sentence long_summary and a 5-25 word main_topic. Cover the caller's reason for calling, what they asked for, key details they stated, what the agent said or offered, any objections, and why the call ended.
+- long_summary and main_topic MUST follow the SUMMARY STYLE and the campaign QC questions given after these rules. Keep them short and free of unnecessary detail.
 - If the caller is unrelated, explain what they actually wanted.
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
 - If spam/robot, describe what the call was promoting or asking the recipient to do.
-- Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, Yelp mentioned, Yellow Page, Google business, Google Voice, insurance/debt marketing robots, and similar behavior.
-- If the caller mentions Yelp or Yellow Pages in any context, mark the call as spam.
+- Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
+- ANY mention of Yelp or Yellow Pages, in any context, means spam_robot=true, spam_confidence=99, call_type=SPAM / ROBOT.
 - A normal irrelevant or non-qualified caller is not automatically spam.
 - For Rehab, Medicaid/Medicare/state/government/marketplace/public insurance means NON-QUALIFIED. Treat private/commercial insurance as a positive qualification signal when clearly stated by the caller, including statements such as “private insurance,” “commercial insurance,” or insurance through the caller’s, parent’s, spouse’s, or another family member’s employer. PPO, HMO, EPO, and POS are also positive signals when clearly stated. Do not assume the provider or plan type if it is not stated.
 - qualification_reason should briefly explain why the qualification status was chosen.
 - qc_issue should contain only a real QC issue when supported; otherwise empty.
 - If the caller is asking for a different service than this campaign's service, set matches_campaign=false and call_type=WRONG NUMBER.
 - Use QUALIFIED or NON-QUALIFIED ONLY when the caller is asking for this campaign's service. Information-only, unclear, or off-campaign callers must use INFORMATION ONLY, WRONG NUMBER, or OTHER.
+
+{summary_instructions}
 
 TRANSCRIPT:
 {full_transcript}
@@ -916,39 +1009,89 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
     return _parse_json_object(content)
 
 
+# ------------------------------------------------------------
+# SPAM RULES (strict)
+# ------------------------------------------------------------
+# Any mention of Yelp or Yellow Pages = SPAM, no other condition needed.
+# Set True to treat ANY mention of the word "yellow" as spam as well.
+STRICT_YELLOW_ANY = False
+
+_YELP_RE = re.compile(r"\by\W{0,2}e\W{0,2}l\W{0,2}p\b|\byelp\w*", re.IGNORECASE)
+_YELLOW_DIRECTORY_RE = re.compile(
+    r"\byellow\s*[-.]?\s*(?:pag\w*|book)\b"
+    r"|\byellowpag\w*"
+    r"|\byp\s*(?:dot\s*)?(?:\.\s*)?com\b"
+    r"|\byellow\b(?:\W+\w+){0,3}?\W+(?:listing|listings|directory|ads?|advertis\w*|business|profile)\b",
+    re.IGNORECASE,
+)
+_ANY_YELLOW_RE = re.compile(r"\byellow\b", re.IGNORECASE)
+
+# Strong robot / solicitation patterns: one hit is enough.
+_STRONG_SPAM_RES = [
+    (re.compile(r"\bautomated (?:message|call|voice|system)\b|\bthis is a recorded message\b|\bpre-?recorded (?:message|call)\b", re.I),
+     "Automated / recorded message"),
+    (re.compile(r"\bpress (?:the )?(?:number |key )?(?:zero|one|two|three|four|five|six|seven|eight|nine|[0-9]|star|pound)\b", re.I),
+     "Press-a-key instruction"),
+    (re.compile(r"\bgoogle\s+(?:my\s+)?(?:business|listing|maps?|profile)\b.{0,120}?\b(?:verify|verification|claim|update|rank\w*|first page|suspend\w*|remov\w*|expire\w*)\b", re.I | re.S),
+     "Google listing solicitation"),
+]
+
+# Softer solicitation phrases: 3 different kinds in one call = spam.
+_MEDIUM_SPAM_PATTERNS = {
+    "SEO": r"\bseo\b|search engine optimi[sz]ation",
+    "Google listing": r"\bgoogle\s+(?:listing|business|maps?|profile)\b",
+    "Google first page": r"\bfirst page of google\b|\btop of google\b",
+    "Business listing": r"\bbusiness listing\b|\bclaim your\b|\bverify your business\b|\byour business profile\b",
+    "Website/marketing": r"\bonline presence\b|\bwebsite traffic\b|\bweb design\b|\bdigital marketing\b|\bsocial media (?:marketing|management)\b",
+    "Advertising": r"\badvertis\w*\b|\blead generation\b",
+    "Warranty": r"\bextended (?:car )?warranty\b|\bvehicle warranty\b",
+    "Rates/loans": r"\blower your (?:interest|rate|monthly)\b|\bcredit card rates\b|\bstudent loan forgiveness\b",
+    "Robo promo": r"\blimited time offer\b|\bspecial offer\b|\bthis is not a sales call\b|\byou(?:'ve| have) been (?:selected|chosen|pre-?approved)\b",
+}
+_MEDIUM_SPAM_RES = [(re.compile(p, re.I), label) for label, p in _MEDIUM_SPAM_PATTERNS.items()]
+
+
+def detect_spam_signals(full_transcript):
+    """Return (confidence 0-100, reason, label). 0 means no deterministic spam signal."""
+    text = str(full_transcript or "")
+    if not text.strip():
+        return 0, "", ""
+
+    if _YELP_RE.search(text):
+        return 99, "Yelp mentioned on the call (strict network spam rule)", "Yelp"
+    if _YELLOW_DIRECTORY_RE.search(text) or (STRICT_YELLOW_ANY and _ANY_YELLOW_RE.search(text)):
+        return 99, "Yellow Pages mentioned on the call (strict network spam rule)", "Yellow Pages"
+
+    for rx, label in _STRONG_SPAM_RES:
+        if rx.search(text):
+            return 92, f"{label} detected in transcript", label
+
+    hits = [label for rx, label in _MEDIUM_SPAM_RES if rx.search(text)]
+    if len(hits) >= 3:
+        return 90, "Multiple solicitation phrases: " + ", ".join(hits[:4]), "Solicitation"
+
+    return 0, "", ""
+
+
 def apply_deterministic_spam_rules(analysis, full_transcript):
-    """Apply high-confidence network spam rules after AI analysis.
+    """Strict spam rules applied to the FULL transcript after the AI analysis.
 
-    This is intentionally conservative: directory names such as Yelp or Yellow Pages
-    are only treated as spam when the transcript also shows business-listing,
-    advertising, verification, optimization, or similar solicitation behavior.
+    - Any Yelp / Yellow Pages mention = SPAM (confidence 99).
+    - Robot patterns (automated message, press-a-key, Google listing scripts) = SPAM.
+    - 3+ different solicitation phrases = SPAM.
     """
-    text = str(full_transcript or "").lower()
+    confidence, reason, label = detect_spam_signals(full_transcript)
+    if not confidence:
+        return analysis
 
-    directory_terms = ["yelp", "yellow pages", "yp.com"]
-    solicitation_terms = [
-        "business listing", "listing", "advertising", "advertise", "marketing",
-        "promote", "promotion", "verification", "verify your listing",
-        "update your listing", "claim your listing", "optimize", "optimization",
-        "profile", "visibility", "search ranking", "ranking", "lead generation",
-        "featured listing", "paid listing", "upgrade", "sales",
-    ]
-
-    directory_hit = any(term in text for term in directory_terms)
-    solicitation_hit = any(term in text for term in solicitation_terms)
-
-    # A directory name + business solicitation is a strong spam signal.
-    if directory_hit and solicitation_hit:
-        analysis["spam_robot"] = True
-        analysis["spam_confidence"] = max(_safe_int(analysis.get("spam_confidence")), 97)
-        current_reason = str(analysis.get("spam_reason", "") or "").strip()
-        directory_name = "Yelp" if "yelp" in text else "Yellow Pages"
-        forced_reason = f"{directory_name} business-listing/advertising solicitation"
-        analysis["spam_reason"] = forced_reason if not current_reason else f"{forced_reason}; {current_reason}"
-        analysis["call_type"] = "SPAM / ROBOT"
-        if not str(analysis.get("qc_issue", "") or "").strip():
-            analysis["qc_issue"] = "Business directory advertising or listing solicitation"
-
+    analysis["spam_robot"] = True
+    analysis["spam_confidence"] = max(_safe_int(analysis.get("spam_confidence")), confidence)
+    current_reason = str(analysis.get("spam_reason", "") or "").strip()
+    analysis["spam_reason"] = reason if not current_reason else f"{reason}; {current_reason}"
+    analysis["call_type"] = "SPAM / ROBOT"
+    analysis["qualification_status"] = "NOT CLEAR"
+    if not str(analysis.get("qc_issue", "") or "").strip():
+        analysis["qc_issue"] = f"{label} spam / solicitation call"
     return analysis
 
 
@@ -958,11 +1101,8 @@ def apply_deterministic_spam_rules(analysis, full_transcript):
 
 NO_VOICE_MIN_WORDS = 3                      # fewer words than this = "no voice"
 MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION = 1.0   # shorter audio is not sent to Whisper
-NO_VOICE_TOPIC = "No voice / no speech in recording"
-NO_VOICE_SUMMARY = (
-    "No voice was detected in this recording. "
-    "There was no speech to transcribe or summarize."
-)
+NO_VOICE_TOPIC = "No voice"
+NO_VOICE_SUMMARY = "No voice"
 
 # Whisper often "hallucinates" these phrases on silent audio.
 _SILENCE_HALLUCINATION_HINTS = (
@@ -1060,13 +1200,14 @@ def build_no_voice_analysis(campaign_name=""):
     return _derive_analysis_flags(analysis, "", timeline_data=[])
 
 
-def apply_campaign_rules(analysis, campaign_name):
-    """Deterministic business rules applied AFTER the AI analysis.
+def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_data=None):
+    """Deterministic business rules applied AFTER the AI analysis, using the FULL transcript.
 
     1. Campaign vs service mismatch (e.g. Rehab caller on a Dumpster campaign)
-       -> WRONG NUMBER.
+       -> WRONG NUMBER. The transcript keywords decide first, the AI decides when the
+       transcript is not clear enough.
     2. call_type / qualification_status must agree with each other.
-    3. Rehab + government/state insurance -> NON-QUALIFIED.
+    3. Rehab + government/state insurance (caller's own words) -> NON-QUALIFIED.
     """
     family = get_campaign_family(campaign_name)
 
@@ -1078,13 +1219,28 @@ def apply_campaign_rules(analysis, campaign_name):
         status = "NOT CLEAR"
     spam = _to_bool(analysis.get("spam_robot")) or call_type == "SPAM / ROBOT"
 
+    # Insurance read from the caller's own words in the transcript.
+    if full_transcript:
+        analysis["transcript_insurance_status"] = detect_transcript_insurance(full_transcript, timeline_data)
+
     detected = _match_known_family(analysis.get("detected_service_category"))
     matches = _parse_match_flag(analysis.get("matches_campaign"))
+
+    verdict, transcript_family = detect_transcript_family(full_transcript, family)
+    analysis["transcript_family"] = transcript_family or ""
+    if verdict == "other":
+        detected = transcript_family
+    elif verdict == "campaign":
+        detected = family
 
     # ---- 1. Campaign / service mismatch -> WRONG NUMBER ----
     mismatch = False
     if not spam and call_type != "SILENT / NO RESPONSE":
-        if family and detected:
+        if verdict == "other":
+            mismatch = True
+        elif verdict == "campaign":
+            mismatch = False
+        elif family and detected:
             mismatch = detected != family
         else:
             mismatch = matches is False
@@ -1098,6 +1254,7 @@ def apply_campaign_rules(analysis, campaign_name):
         analysis["call_type"] = "WRONG NUMBER"
         analysis["qualification_status"] = "NON-QUALIFIED"
         analysis["campaign_mismatch"] = True
+        analysis["detected_service_category"] = detected or analysis.get("detected_service_category", "")
         analysis["call_type_reason"] = f"Caller wanted {wanted}, but call came in on {campaign_name}"
         issue = f"Campaign/service mismatch: caller wanted {wanted}"
         existing = str(analysis.get("qc_issue") or "").strip()
@@ -1129,7 +1286,7 @@ def apply_campaign_rules(analysis, campaign_name):
     return analysis
 
 
-def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
+def _derive_analysis_flags(analysis, full_transcript, timeline_data=None, campaign_name=""):
     """Derive scoring/report flags in Python instead of spending AI tokens on them."""
     call_type = str(analysis.get("call_type", "OTHER") or "OTHER").strip().upper()
     allowed_call_types = {
@@ -1170,6 +1327,12 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     ]:
         analysis[key] = str(analysis.get(key, "") or "").replace("*", "").strip()
 
+    # Keep the summary short and free of filler / "not mentioned" sentences.
+    analysis["long_summary"] = clean_summary_text(analysis["long_summary"]) or (
+        "No summary could be generated from the transcript."
+    )
+    analysis["main_topic"] = clean_main_topic(analysis["main_topic"])
+
     meaningful_reason = bool(analysis["caller_intent"] or analysis["why_called"] or analysis["service_requested"])
     analysis["relevant_intent"] = meaningful_reason and call_type not in {
         "WRONG NUMBER", "SPAM / ROBOT", "SILENT / NO RESPONSE"
@@ -1194,6 +1357,9 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None):
     else:
         two_way = meaningful_reason and len(full_transcript.split()) >= 20
     analysis["two_way_conversation"] = bool(two_way)
+
+    # Scoring facts are re-measured on the FULL transcript (not the summary).
+    analysis = _apply_transcript_signals(analysis, full_transcript, timeline_data, campaign_name)
 
     analysis["major_qc_issue"] = bool(
         analysis["spam_robot"] or
@@ -1247,11 +1413,13 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     analysis = _with_key_fallback(
         lambda c, lbl: _call_structured_analysis(c, prompt, lbl), "ANALYSIS"
     )
+
+    # Rules below run on the FULL transcript (not the trimmed AI copy and not the summary).
     analysis = apply_deterministic_spam_rules(analysis, full_transcript)
-    analysis = apply_campaign_rules(analysis, campaign_name)
+    analysis = apply_campaign_rules(analysis, campaign_name, full_transcript, timeline_data)
     analysis["campaign_category"] = campaign_name
 
-    return _derive_analysis_flags(analysis, full_transcript, timeline_data)
+    return _derive_analysis_flags(analysis, full_transcript, timeline_data, campaign_name)
 
 
 def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
@@ -1284,62 +1452,27 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
         raise RuntimeError("No Groq API keys are configured.")
 
     campaign_family = get_campaign_category(campaign_name)
+    summary_instructions = build_summary_instructions(campaign_family)
+
+    spam_hint = ""
+    spam_confidence, spam_reason, _ = detect_spam_signals(full_transcript)
+    if spam_confidence:
+        spam_hint = (
+            f"\nNOTE: This is a spam / solicitation call ({spam_reason}). "
+            "Say what it was promoting. Do not describe it as a normal caller.\n"
+        )
+
     prompt = f"""
-You are a fast call-summary assistant for a pay-per-call network.
+You are a call QC note writer for a pay-per-call network.
 
 CAMPAIGN:
 {campaign_family}
 
-Create only two outputs from the transcript: a short Main Topic and a factual Long Summary.
+Return ONLY one valid JSON object with exactly two keys: main_topic and long_summary.
+{spam_hint}
+{summary_instructions}
 
-MAIN TOPIC:
-- One short sentence, normally 5-25 words.
-- State what the caller was actually calling about.
-- If unrelated, describe what they actually wanted.
-- If spam/robot, describe the actual subject of the spam, such as a Google listing, Yelp mentioned, Yellow Page, Google business, Google Voice or SEO solicitation.
-
-LONG SUMMARY:
-- Write 2-8 short, natural sentences.
-- Include the caller's actual reason for calling, requested service, important information clearly provided, and the actual outcome when supported.
-- Use only facts clearly supported by the transcript.
-- Never invent insurance, location, qualification, appointments, transfers, or outcomes.
-- An agent's question is NOT the caller's answer. Only treat information as caller-provided when the caller clearly states or confirms it.
-- If the caller did not respond, do not invent a reason for the call.
-- If the call is clearly an automated solicitation, summarize what it was promoting or asking the recipient to do. Yelp business-listing/advertising/verification/optimization calls and Yellow Pages business-listing/advertising/verification calls should be treated as spam when they are soliciting the business rather than acting as a normal consumer.
-- No bullets, headings, markdown, filler, or comments about the quality of the conversation.
-- Keep the wording simple and human.
-
-SPAM / ROBOT RULES:
-- Do NOT use exact phrase matching only.
-- Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
-- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, Yelp mentioned, Yellow Page, Google business, Google Voice and repeated press-0/press-9 scripts.
-- Similar wording must be recognized even when the exact words differ.
-- Any type of yelp or yellow mention will be mark as spam.
-- A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
-- Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
-- spam_confidence must reflect the strength of the evidence from 0-100.
-
-QUALIFICATION RULES:
-- Use QUALIFIED only when the campaign-specific qualification requirements are clearly met.
-- Use NON-QUALIFIED when the caller is clearly relevant but fails or does not meet the campaign requirements.
-- Use NOT CLEAR when the transcript does not provide enough information to determine qualification.
-
-MISSING INFORMATION:
-For string fields, use an empty string when the information was not clearly discussed. Do not invent values.
-
-CALL TYPE:
-- QUALIFIED: relevant and clearly qualified.
-- NON-QUALIFIED: relevant but clearly not qualified.
-- WRONG NUMBER: caller was trying to reach another person/business/service.
-- SPAM / ROBOT: automated/scripted spam or marketing call.
-- INFORMATION ONLY: caller wanted information but not the campaign service/action.
-- SILENT / NO RESPONSE: no meaningful caller response or no meaningful two-way interaction.
-- OTHER: anything else that does not fit the categories.
-
-QC ISSUE:
-Mention only a real issue supported by the transcript, such as automated solicitation, wrong number, agent handling problem, caller objection, silence, or a clear qualification problem. Otherwise use an empty string.
-
-Read the entire transcript before deciding.
+Read the whole transcript before writing. Use only facts clearly supported by the transcript.
 
 TRANSCRIPT:
 {full_transcript}
@@ -1348,10 +1481,9 @@ TRANSCRIPT:
     result = _with_key_fallback(
         lambda c, lbl: _call_fast_summary(c, prompt, lbl), "FAST SUMMARY"
     )
-    
 
-    main_topic = str(result.get("main_topic", "")).replace("*", "").strip()
-    long_summary = str(result.get("long_summary", "")).replace("*", "").strip()
+    main_topic = clean_main_topic(result.get("main_topic", ""))
+    long_summary = clean_summary_text(result.get("long_summary", ""))
 
     if not main_topic:
         main_topic = "No clear main topic identified."
@@ -1389,7 +1521,9 @@ PRIVATE_TERMS = [
     "private", "employer", "employee", "commercial",
     "company insurance", "company plan", "group insurance", "group plan",
     "insurance through work",
-    "ppo", "hmo", "pos", "epo"
+    "ppo", "hmo", "pos", "epo",
+    "blue cross", "blue shield", "bcbs", "aetna", "cigna", "humana",
+    "united healthcare", "unitedhealthcare", "anthem", "kaiser",
 ]
 
 
@@ -1420,9 +1554,307 @@ GOVERNMENT_NEGATED_RE = re.compile(
 )
 
 
+# ============================================================
+# TRANSCRIPT-BASED SIGNALS
+# Scoring facts come from the FULL TRANSCRIPT (not the summary).
+# The AI fields are only a fallback / second opinion.
+# ============================================================
+
+FAMILY_KEYWORDS = {
+    "Rehab & Addiction Treatment": [
+        r"\brehab\w*", r"\bdetox\w*", r"\baddict\w*", r"\balcohol\w*", r"\bdrugs?\b",
+        r"\bopioids?\b", r"\bheroin\b", r"\bfentanyl\b", r"\bmeth\b|\bmethamphetamine\b",
+        r"\bcocaine\b", r"\bsober\w*", r"\bwithdrawals?\b", r"\binpatient\b|\boutpatient\b",
+        r"\btreatment (?:center|program|facility|facilities)s?\b", r"\bsubstance\b",
+        r"\brelapse\w*", r"\bresidential treatment\b", r"\bmental health\b",
+    ],
+    "Dumpster & Porta Potty Services": [
+        r"\bdumpsters?\b", r"\broll[\s-]?off\b",
+        r"\bporta[\s-]?(?:potty|potties|john)\b|\bport[\s-]?a[\s-]?potty\b",
+        r"\bportable (?:toilet|restroom|bathroom)s?\b",
+        r"\b(?:10|15|20|30|40)[\s-]*(?:yard|yd)s?\b", r"\bdebris\b", r"\bjunk removal\b", r"\bdemolition\b",
+    ],
+    "Pest Control & Home Services": [
+        r"\bpest\w*", r"\btermites?\b", r"\bcockroach\w*|\broach(?:es)?\b", r"\bbed ?bugs?\b",
+        r"\brodents?\b|\bmice\b|\brats?\b", r"\bexterminat\w*", r"\broof(?:ing|er|ers)?\b",
+        r"\bplumb\w*", r"\bhvac\b|\bair conditioning\b|\bfurnace\b",
+        r"\bmov(?:ing company|ers)\b", r"\bants\b",
+    ],
+    "Insurance (Health / Auto / Home)": [
+        r"\bauto insurance\b|\bcar insurance\b", r"\bhome(?:owners?)? insurance\b",
+        r"\blife insurance\b", r"\bfinal expense\b|\bburial\b", r"\binsurance quote\b",
+        r"\binsurance (?:policy|agent|broker)\b", r"\bmedicare (?:advantage|supplement|part)\b",
+        r"\bopen enrollment\b", r"\bhealth insurance plan\b",
+    ],
+    "Debt Relief & Financial Services": [
+        r"\bdebts?\b", r"\bdebt (?:relief|settlement)\b|\bconsolidat\w*", r"\bcredit cards?\b",
+        r"\bcreditors?\b|\bcollections?\b", r"\bbankruptcy\b", r"\bmerchant cash\b|\bmca\b",
+        r"\bpersonal loans?\b|\bloan\b",
+    ],
+}
+_FAMILY_KEY_RES = {
+    family: [re.compile(p, re.IGNORECASE) for p in patterns]
+    for family, patterns in FAMILY_KEYWORDS.items()
+}
+
+
+def score_transcript_families(full_transcript):
+    """How strongly the transcript points to each campaign family (repeat mentions count up to 2x)."""
+    text = str(full_transcript or "")
+    scores = {}
+    for family, regexes in _FAMILY_KEY_RES.items():
+        scores[family] = sum(min(len(rx.findall(text)), 2) for rx in regexes)
+    return scores
+
+
+def detect_transcript_family(full_transcript, campaign_family):
+    """Compare what the caller talks about vs the campaign.
+
+    Returns ("other", family)    -> transcript clearly points to a DIFFERENT service
+            ("campaign", family) -> transcript clearly matches the campaign service
+            (None, None)         -> not clear enough, let the AI decide
+    """
+    if not full_transcript or not campaign_family or campaign_family not in _FAMILY_KEY_RES:
+        return None, None
+
+    scores = score_transcript_families(full_transcript)
+    campaign_hits = scores.get(campaign_family, 0)
+    others = {k: v for k, v in scores.items() if k != campaign_family}
+    best_family, best_hits = max(others.items(), key=lambda kv: kv[1])
+
+    if best_hits >= 3 and best_hits >= 2 * campaign_hits + 1:
+        return "other", best_family
+    if campaign_hits >= 2 and campaign_hits >= best_hits:
+        return "campaign", campaign_family
+    return None, None
+
+
+# ---- Insurance from the caller's own words ----
+_GOV_ALT = "|".join(re.escape(t) for t in GOVERNMENT_TERMS)
+_NEG_PREFIX = (
+    r"(?:no|not|don[\u2019']t have|do not have|doesn[\u2019']t have|does not have|never had|without)"
+)
+PRIVATE_NEGATED_RE = re.compile(
+    r"\b" + _NEG_PREFIX + r"\s+(?:\w+\s+){0,2}?(?:" + "|".join(re.escape(t) for t in PRIVATE_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+_CALLER_PREFIX = (
+    r"i have|i[\u2019']ve got|i got|i am on|i[\u2019']m on|i am with|i[\u2019']m with|"
+    r"i am covered by|i[\u2019']m covered by|i am under|i[\u2019']m under|my insurance is|"
+    r"my insurance would be|my insurance|my coverage is|insurance is|i use|i get|i receive|"
+    r"mine is|it[\u2019']s|it is|that[\u2019']s|that is|through|just|yes|yeah|yep|uh|um"
+)
+_CALLER_GOV_RE = re.compile(
+    r"\b(?:" + _CALLER_PREFIX + r")\W+(?:\w+\W+){0,3}?(?:" + _GOV_ALT + r")\b", re.IGNORECASE
+)
+_CALLER_PRIV_RE = re.compile(
+    r"\b(?:" + _CALLER_PREFIX + r")\W+(?:\w+\W+){0,3}?(?:" + "|".join(re.escape(t) for t in PRIVATE_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+_EMPLOYER_RE = re.compile(
+    r"\b(?:through|from|with|by)\s+(?:my|his|her|their|our)\s+"
+    r"(?:job|work|employer|company|parents?|mom|mother|dad|father|husband|wife|spouse|boyfriend|girlfriend)\b"
+    r"|\b(?:private|commercial|employer|company|group)\s+(?:health\s+)?(?:insurance|plan|coverage)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_transcript_insurance(full_transcript, timeline_data=None):
+    """Read insurance type from what the CALLER says. Returns "YELLOW" (government/state),
+    "GREEN" (private/commercial) or None.
+
+    Whisper has no speaker labels, so this ignores sentences that end with "?" (agent questions)
+    and ignores negated mentions ("I don't have Medicaid"). Government wins if both appear."""
+    if timeline_data:
+        units = [str(x.get("line", "")) for x in timeline_data]
+    else:
+        units = [str(full_transcript or "")]
+
+    sentences = []
+    for unit in units:
+        sentences.extend(s.strip() for s in re.split(r"(?<=[.!?])\s+", unit) if s.strip())
+
+    gov = priv = False
+    for sentence in sentences:
+        if sentence.endswith("?"):
+            continue
+        cleaned = GOVERNMENT_NEGATED_RE.sub(" ", sentence)
+        cleaned = PRIVATE_NEGATED_RE.sub(" ", cleaned)
+        short_answer = len(re.findall(r"[A-Za-z']+", cleaned)) <= 4
+
+        if _CALLER_GOV_RE.search(cleaned) or (short_answer and GOVERNMENT_RE.search(cleaned)):
+            gov = True
+        if (
+            _CALLER_PRIV_RE.search(cleaned)
+            or _EMPLOYER_RE.search(cleaned)
+            or (short_answer and PRIVATE_RE.search(cleaned))
+        ):
+            priv = True
+
+    if gov:
+        return "YELLOW"
+    if priv:
+        return "GREEN"
+    return None
+
+
+# ---- Other transcript facts used by the score ----
+_US_STATES = (
+    "alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|"
+    "hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|"
+    "michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|"
+    "new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|"
+    "rhode island|south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|"
+    "west virginia|wisconsin|wyoming"
+)
+_ZIP_RE = re.compile(r"(?<![\d-])\d{5}(?![\d-])")
+_STATE_RE = re.compile(r"\b(?:" + _US_STATES + r")\b", re.IGNORECASE)
+_LOCATION_PHRASE_RE = re.compile(
+    r"\b(?:i live in|i[\u2019']m in|i am in|i[\u2019']m located in|calling from|located in|my zip(?: code)?|zip code|my address)\b",
+    re.IGNORECASE,
+)
+
+_QUAL_INFO_RES = {
+    "Rehab & Addiction Treatment": re.compile(
+        r"\binsurance\b|\bcoverage\b|\bmedicaid\b|\bmedicare\b|\bblue cross\b|\baetna\b|\bcigna\b|\bhumana\b|"
+        r"\bunited ?healthcare\b|\bself[\s-]?pay\b|\bcash pay\b|\bout of pocket\b|\byears old\b",
+        re.IGNORECASE),
+    "Dumpster & Porta Potty Services": re.compile(
+        r"\b(?:10|15|20|30|40)[\s-]*(?:yard|yd)s?\b|\bdeliver\w*\b|\baddress\b|\bresidential\b|\bcommercial\b|\bconstruction\b",
+        re.IGNORECASE),
+    "Pest Control & Home Services": re.compile(
+        r"\bhome ?owner\b|\bi own\b|\brent(?:er|ing)?\b|\blandlord\b|\bsquare (?:feet|foot)\b|\bsq\.? ?ft\b",
+        re.IGNORECASE),
+    "Insurance (Health / Auto / Home)": re.compile(
+        r"\byears old\b|\bage\b|\bdate of birth\b|\bcurrent(?:ly)? (?:insured|policy|coverage)\b|\bzip\b",
+        re.IGNORECASE),
+    "Debt Relief & Financial Services": re.compile(
+        r"\$\s?\d|\b\d[\d,]*\s?(?:thousand|k|dollars)\b|\bcredit cards?\b|\bunsecured\b|\bi owe\b",
+        re.IGNORECASE),
+}
+_GENERIC_QUAL_INFO_RE = re.compile(r"\binsurance\b|\bzip\b|\bage\b|\$\s?\d|\byears old\b", re.IGNORECASE)
+
+_OUTCOME_RE = re.compile(
+    r"\btransfer\w*\b|\bconnect(?:ing)? you\b|\bput you through\b|\bhold\b|\bcall you back\b|\bcalling you back\b|"
+    r"\bgive you a call\b|\breach out\b|\bappointment\b|\bschedul\w*\b|\bbook(?:ed|ing)?\b|\bsend you\b|\btext you\b|"
+    r"\bemail you\b|\bfollow up\b|\bthank you for calling\b|\bhave a (?:good|great|nice) (?:day|one)\b|"
+    r"\bgoodbye\b|\bbye\b|\btake care\b|\bconfirmation\b",
+    re.IGNORECASE,
+)
+_TRANSFER_RE = re.compile(
+    r"\btransfer(?:r)?ing you\b|\bconnect(?:ing)? you (?:with|to)\b|\bput you through to\b|\bwarm transfer\b|\blet me transfer you\b",
+    re.IGNORECASE,
+)
+_APPT_HIT_RE = re.compile(
+    r"\bappointment\b|\bschedul\w*\b|\bbooked\b|\bbooking\b|\badmission\b|\bintake\b|\bconsultation\b|\breservation\b",
+    re.IGNORECASE,
+)
+_APPT_STRONG_RE = re.compile(
+    r"\b(?:appointment|scheduled|booked|booking|delivery|consultation|intake|admission)\b[^.?!]{0,60}?"
+    r"\b(?:confirmed?|set|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"\d{1,2}(?::\d{2})?\s?(?:am|pm|a\.m\.|p\.m\.))\b"
+    r"|\b(?:i[\u2019']ve|i have|we[\u2019']ve|we have|you[\u2019']re|you are|you[\u2019']ve|you have)\s+(?:been\s+)?(?:scheduled|booked|set up)\b",
+    re.IGNORECASE,
+)
+_AGENT_MARKER_RE = re.compile(
+    r"\bthank you for calling\b|\bhow (?:can|may) i (?:help|assist)\b|\bcan i (?:get|have)\b|\bmay i have\b|"
+    r"\bwhat(?:[\u2019']s| is) your\b|\bare you looking\b|\bdo you have\b|\blet me (?:transfer|connect|check)\b|"
+    r"\bi can help\b|\bone moment\b|\bhold on\b|\bplease hold\b",
+    re.IGNORECASE,
+)
+_CALLER_MARKER_RE = re.compile(
+    r"\bi need\b|\bi[\u2019']m looking\b|\bi am looking\b|\bi want\b|\bi[\u2019']d like\b|\bi would like\b|"
+    r"\blooking for\b|\bmy (?:son|daughter|husband|wife|brother|sister|mother|father|mom|dad|friend)\b|"
+    r"\bhow much\b|\bcan you\b|\bi have\b|\bi don[\u2019']t\b|\byes\b|\byeah\b|\bokay\b",
+    re.IGNORECASE,
+)
+
+
+def extract_transcript_signals(full_transcript, timeline_data, campaign_family):
+    """Scoring facts measured directly on the full transcript."""
+    text = str(full_transcript or "")
+    words = re.findall(r"[A-Za-z0-9']+", text.lower())
+    word_count = len(words)
+    segment_count = len([x for x in (timeline_data or []) if str(x.get("line", "")).strip()])
+
+    tail_words = max(40, int(word_count * 0.30))
+    tail = " ".join(words[-tail_words:])
+
+    qual_re = _QUAL_INFO_RES.get(campaign_family, _GENERIC_QUAL_INFO_RE)
+
+    # Whisper has no speakers, so "two-way" = both caller-style and agent-style language
+    # in a transcript that is long enough and split into several segments.
+    question_count = text.count("?")
+    caller_hit = bool(_CALLER_MARKER_RE.search(text))
+    agent_hit = bool(_AGENT_MARKER_RE.search(text))
+    enough_segments = segment_count >= 3 if timeline_data is not None else True
+    two_way = (
+        word_count >= 20
+        and enough_segments
+        and ((caller_hit and agent_hit) or (question_count >= 2 and word_count >= 40))
+    )
+
+    scores = score_transcript_families(text)
+    family_hits = scores.get(campaign_family, 0) if campaign_family else 0
+
+    service_keyword = ""
+    if campaign_family in _FAMILY_KEY_RES:
+        for rx in _FAMILY_KEY_RES[campaign_family]:
+            match = rx.search(text)
+            if match:
+                service_keyword = match.group(0).lower().strip()
+                break
+
+    return {
+        "word_count": word_count,
+        "segment_count": segment_count,
+        "two_way": bool(two_way),
+        "location": bool(_ZIP_RE.search(text) or _STATE_RE.search(text) or _LOCATION_PHRASE_RE.search(text)),
+        "qual_info": bool(qual_re.search(text)),
+        "outcome": bool(_OUTCOME_RE.search(tail)),
+        "appointment_hit": bool(_APPT_HIT_RE.search(text) or _TRANSFER_RE.search(text)),
+        "appointment_strong": bool(_APPT_STRONG_RE.search(text) or _TRANSFER_RE.search(text)),
+        "family_hits": family_hits,
+        "service_keyword": service_keyword,
+    }
+
+
+def _apply_transcript_signals(analysis, full_transcript, timeline_data, campaign_name):
+    """Let the transcript decide the score facts. AI fields only fill gaps."""
+    if analysis.get("no_voice") or not str(full_transcript or "").strip():
+        return analysis
+
+    family = get_campaign_family(campaign_name)
+    sig = extract_transcript_signals(full_transcript, timeline_data, family)
+    call_type = analysis.get("call_type", "OTHER")
+
+    # Appointment / booking / transfer: must be visible in the transcript.
+    ai_appt = bool(analysis.get("appointment_set"))
+    analysis["appointment_set"] = bool(sig["appointment_strong"] or (ai_appt and sig["appointment_hit"]))
+
+    analysis["two_way_conversation"] = bool(sig["two_way"]) and call_type != "SILENT / NO RESPONSE"
+    analysis["location_or_eligibility_present"] = bool(analysis.get("location_or_eligibility_present") or sig["location"])
+    analysis["qualification_info_present"] = bool(analysis.get("qualification_info_present") or sig["qual_info"])
+    analysis["clear_outcome"] = bool(analysis.get("clear_outcome") or sig["outcome"])
+
+    if not str(analysis.get("service_requested", "")).strip() and sig["service_keyword"]:
+        analysis["service_requested"] = sig["service_keyword"]
+
+    if call_type not in {"WRONG NUMBER", "SPAM / ROBOT", "SILENT / NO RESPONSE"}:
+        analysis["relevant_intent"] = bool(analysis.get("relevant_intent") or sig["family_hits"] >= 1)
+
+    analysis["transcript_word_count"] = sig["word_count"]
+    return analysis
+
+
 def get_rehab_insurance_status(analysis):
     """Classify Rehab insurance for deterministic qualification scoring.
     Returns "YELLOW" (government/state), "GREEN" (private/commercial), or None."""
+    # The caller's own words in the transcript come first.
+    transcript_status = analysis.get("transcript_insurance_status")
+    if transcript_status in {"YELLOW", "GREEN"}:
+        return transcript_status
+
     insurance = " ".join(
         str(analysis.get(key) or "") for key in INSURANCE_KEYS
     ).strip()
@@ -1610,6 +2042,9 @@ def _score_breakdown(analysis):
         caps.append((NON_QUALIFIED_MAX_SCORE, "non-qualified"))
     elif status != "QUALIFIED":
         caps.append((QUALIFIED_UNCLEAR_MAX_SCORE, "qualification not clear"))
+
+    if tier == "QUALIFIED" and not analysis.get("appointment_set", False):
+        caps.append((APPOINTMENT_MAX, "no appointment/booking"))
 
     if campaign_category == "Rehab & Addiction Treatment":
         # Government/state insurance is NEVER qualified.
