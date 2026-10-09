@@ -2978,7 +2978,140 @@ def render_campaign_rules_page(current_user):
         _cr_backup_tab(cfg, ver)
 
 
-def sync_google_sheet_batch(default_campaign_name=""):
+# ============================================================
+# SHEET SYNC WITH LIVE PROGRESS
+# While a row is being worked on, its output cells show an icon:
+#   ⏳ waiting   🔄 working now   (final value = done)   ⚠️ error
+# The app shows the same state live (which column is being filled right now).
+# ============================================================
+
+PROCESSING_STALE_MINUTES = 10          # a 🔄/⏳ marker older than this is treated as a crashed run
+_PROGRESS_ICONS = ("⏳", "🔄")
+_SYNC_ICONS = {"waiting": "⏳", "working": "🔄", "done": "✅", "error": "⚠️"}
+_SYNC_COLUMN_LABELS = [("G", "Summary"), ("H", "Main topic"), ("K", "QC report"), ("L", "Score")]
+
+
+def _progress_stamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _is_progress_marker(text):
+    return str(text or "").strip().startswith(_PROGRESS_ICONS)
+
+
+def _progress_marker_age_minutes(text):
+    """Minutes since a '... since YYYY-MM-DD HH:MM:SS' marker was written (None if unreadable)."""
+    match = re.search(r"since (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", str(text or ""))
+    if not match:
+        return None
+    try:
+        started = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return (datetime.now() - started).total_seconds() / 60.0
+
+
+def _row_work_state(recording_url, existing_main_topic):
+    """'process' = needs work, 'busy' = another run is working on it, 'skip' = nothing to do."""
+    if not recording_url or not recording_url.startswith("http"):
+        return "skip"
+    if not existing_main_topic:
+        return "process"
+    if _is_progress_marker(existing_main_topic):
+        age = _progress_marker_age_minutes(existing_main_topic)
+        if age is not None and age < PROCESSING_STALE_MINUTES:
+            return "busy"
+        return "process"      # stale or unreadable marker: the earlier run died, do it again
+    return "skip"
+
+
+def _write_row_cells(worksheet, row_number, g, h, k, l):
+    """Write G:H and K:L of one row in a single API call (H = done flag, so it is written with the rest)."""
+    worksheet.batch_update(
+        [
+            {"range": f"G{row_number}:H{row_number}", "values": [[g, h]]},
+            {"range": f"K{row_number}:L{row_number}", "values": [[k, l]]},
+        ],
+        value_input_option="RAW",
+    )
+
+
+def make_sync_progress_callback(container):
+    """Live progress panel for the app. Returns a callback for sync_google_sheet_batch()."""
+    with container:
+        bar_slot = st.empty()
+        panel_slot = st.empty()
+    log = []
+
+    def chips(columns):
+        html_out = ""
+        for col, label in _SYNC_COLUMN_LABELS:
+            state = columns.get(col, "waiting")
+            emphasis = "font-weight:600;border-color:var(--blue-accent);" if state == "working" else ""
+            html_out += (
+                "<span style=\"display:inline-block;margin:2px 6px 2px 0;padding:4px 10px;border-radius:999px;"
+                "border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:13px;"
+                f"{emphasis}\">{_SYNC_ICONS.get(state, '⏳')} Column {col} · {label}</span>"
+            )
+        return html_out
+
+    def draw(title, subtitle, columns):
+        log_html = "".join(
+            f"<div style=\"color:var(--muted);font-size:12.5px;\">{html.escape(line)}</div>" for line in log[-6:]
+        )
+        panel_slot.markdown(
+            "<div style=\"border:1px solid var(--border);border-radius:12px;padding:14px 16px;"
+            "background:var(--card-bg);margin-bottom:10px;\">"
+            f"<div style=\"font-weight:600;color:var(--text);\">{html.escape(title)}</div>"
+            f"<div style=\"color:var(--muted);margin:4px 0 8px;\">{html.escape(subtitle)}</div>"
+            f"<div>{chips(columns)}</div>{log_html}</div>",
+            unsafe_allow_html=True,
+        )
+
+    def set_bar(fraction, text):
+        try:
+            bar_slot.progress(max(0.0, min(1.0, fraction)), text=text)
+        except TypeError:
+            bar_slot.progress(max(0.0, min(1.0, fraction)))
+
+    def callback(event):
+        kind = event.get("event")
+        total = int(event.get("total") or 0)
+        position = int(event.get("position") or 0)
+
+        if kind == "start":
+            if total == 0:
+                bar_slot.empty()
+                draw("Nothing to process", "No new recordings were found in the sheet.", {})
+            else:
+                set_bar(0.0, f"0 of {total} rows done")
+                draw("Starting", f"{total} row(s) waiting to be processed.", {})
+        elif kind == "row":
+            set_bar((position - 1) / max(total, 1), f"Row {position} of {total} (sheet row {event.get('row')})")
+            draw(
+                f"Sheet row {event.get('row')} · {event.get('campaign', '')}",
+                event.get("label", "Working..."),
+                event.get("columns", {}),
+            )
+        elif kind == "row_done":
+            log.append(f"Row {event.get('row')}: {event.get('call_type')} · score {event.get('score')}")
+            set_bar(position / max(total, 1), f"{position} of {total} rows done")
+            draw(f"Row {event.get('row')} finished", f"{event.get('call_type')} · score {event.get('score')}",
+                 event.get("columns", {}))
+        elif kind == "row_error":
+            log.append(f"Row {event.get('row')}: error - {str(event.get('message', ''))[:90]}")
+            set_bar(position / max(total, 1), f"{position} of {total} rows done")
+            draw(f"Row {event.get('row')} failed", str(event.get("message", ""))[:160], event.get("columns", {}))
+        elif kind == "finished":
+            if total:
+                set_bar(1.0, f"Finished: {event.get('processed', 0)} of {total} rows processed")
+            all_done = {col: "done" for col, _ in _SYNC_COLUMN_LABELS} if event.get("processed") else {}
+            draw("Finished", event.get("message", ""), all_done)
+
+    return callback
+
+
+def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
     """Process Ringba recordings from the shared Google Sheet.
 
     Sheet layout:
@@ -2989,7 +3122,17 @@ def sync_google_sheet_batch(default_campaign_name=""):
     J = Existing carrier / VOIP data (untouched)
     K = AI QC Report
     L = Numeric quality score
+
+    While a row is being worked on, G/H/K/L show progress icons (see _SYNC_ICONS).
+    H is written LAST with the real topic, so a row only counts as finished when it is complete.
     """
+    def emit(**kwargs):
+        if progress_callback:
+            try:
+                progress_callback(kwargs)
+            except Exception:
+                pass      # a display problem must never stop the processing
+
     try:
         gc = get_google_client()
         sheet = gc.open("Ringba to Sheet QC")
@@ -2997,6 +3140,17 @@ def sync_google_sheet_batch(default_campaign_name=""):
 
         rows = worksheet.get_all_values()
         processed_count = 0
+        busy_count = 0
+        position = 0
+
+        total_pending = sum(
+            1 for row in rows[1:]
+            if _row_work_state(
+                row[8].strip() if len(row) > 8 else "",
+                row[7].strip() if len(row) > 7 else "",
+            ) == "process"
+        )
+        emit(event="start", total=total_pending)
 
         for index, row in enumerate(rows[1:], start=2):
             raw_campaign = row[3].strip() if len(row) > 3 else ""
@@ -3012,14 +3166,29 @@ def sync_google_sheet_batch(default_campaign_name=""):
                 except Exception:
                     pass
 
-            # Existing trigger stays: recording exists + H is empty.
-            if not recording_url or not recording_url.startswith("http") or existing_main_topic:
+            # Trigger: recording exists + H is empty (or holds an old, dead progress marker).
+            work_state = _row_work_state(recording_url, existing_main_topic)
+            if work_state == "busy":
+                busy_count += 1
                 continue
+            if work_state != "process":
+                continue
+
+            position += 1
+            marker = f"🔄 Processing since {_progress_stamp()}"
+            campaign_to_use = "General Customer Inquiry"
+            row_finished = False
 
             try:
                 campaign_to_use = get_campaign_category(raw_campaign) if raw_campaign else default_campaign_name
                 if not campaign_to_use:
                     campaign_to_use = "General Customer Inquiry"
+
+                # ---- Step 1: download + transcribe ----
+                emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                     label="Downloading and transcribing the recording",
+                     columns={"G": "working", "H": "working", "K": "waiting", "L": "waiting"})
+                _write_row_cells(worksheet, index, "🔄 Transcribing audio…", marker, "⏳ Waiting", "⏳")
 
                 load_audio_url(recording_url)
 
@@ -3032,6 +3201,12 @@ def sync_google_sheet_batch(default_campaign_name=""):
                         if not _is_short_audio_error(whisper_exc):
                             raise
                 full_transcript_str = " ".join(raw_text_segments).strip()
+
+                # ---- Step 2: AI summary + analysis ----
+                emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                     label="Writing the summary and checking the call",
+                     columns={"G": "working", "H": "working", "K": "working", "L": "waiting"})
+                _write_row_cells(worksheet, index, "🔄 Writing summary…", marker, "🔄 Checking call…", "⏳")
 
                 analysis = generate_call_analysis_groq(
                     full_transcript_str,
@@ -3046,10 +3221,11 @@ def sync_google_sheet_batch(default_campaign_name=""):
                 analysis["quality_score"] = score
                 qc_report = build_qc_report(analysis)
 
-                worksheet.update_cell(index, 7, detailed_summary)  # G
-                worksheet.update_cell(index, 8, main_topic)        # H
-                worksheet.update_cell(index, 11, qc_report)        # K
-                worksheet.update_cell(index, 12, score)             # L
+                # ---- Step 3: save everything (H = main topic is the "done" flag) ----
+                emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                     label="Saving results to the sheet",
+                     columns={"G": "working", "H": "working", "K": "working", "L": "working"})
+                _write_row_cells(worksheet, index, detailed_summary, main_topic, qc_report, score)
 
                 apply_row_score_color(
                     worksheet,
@@ -3058,18 +3234,37 @@ def sync_google_sheet_batch(default_campaign_name=""):
                     analysis,
                 )
 
+                row_finished = True
                 processed_count += 1
+                emit(event="row_done", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                     call_type=analysis.get("call_type", ""), score=score,
+                     columns={"G": "done", "H": "done", "K": "done", "L": "done"})
                 time.sleep(1)
 
             except Exception as e:
-                error_text = f"Processing error: {str(e)}"
+                row_finished = True      # handled here: error text below, H stays empty so it is retried
+                error_text = f"⚠️ Processing error: {str(e)}"
                 try:
-                    worksheet.update_cell(index, 7, error_text)
-                    worksheet.update_cell(index, 11, error_text)
+                    _write_row_cells(worksheet, index, error_text, "", error_text, "")
                 except Exception:
                     pass
+                emit(event="row_error", row=index, position=position, total=total_pending,
+                     campaign=campaign_to_use, message=str(e),
+                     columns={"G": "error", "H": "error", "K": "error", "L": "error"})
+            finally:
+                # If the run was stopped half-way (for example the page reran), remove the
+                # progress icons so the row is picked up again on the next sync.
+                if not row_finished:
+                    try:
+                        _write_row_cells(worksheet, index, "", "", "", "")
+                    except Exception:
+                        pass
 
-        return True, f"Successfully processed {processed_count} new recordings!"
+        message = f"Successfully processed {processed_count} new recordings!"
+        if busy_count:
+            message += f" {busy_count} row(s) are being processed by another run and were skipped."
+        emit(event="finished", total=total_pending, processed=processed_count, message=message)
+        return True, message
     except Exception as e:
         return False, f"Google Sheets error: {str(e)}"
 
@@ -3250,6 +3445,9 @@ if not st.session_state.logged_in_user:
 
 current_user = st.session_state.logged_in_user
 
+# Live sync progress panel (shows at the top of the page while the sheet is processed).
+sync_progress_container = st.container()
+
 with st.sidebar:
     render_html("""
         <div class="brand">
@@ -3300,7 +3498,10 @@ with st.sidebar:
     """)
     if st.button("🔄 Sync & Process Sheet", use_container_width=True):
         with st.spinner("Scanning sheet and processing recordings..."):
-            success, message = sync_google_sheet_batch(selected_campaign)
+            success, message = sync_google_sheet_batch(
+                selected_campaign,
+                progress_callback=make_sync_progress_callback(sync_progress_container),
+            )
             if success:
                 st.success(message)
             else:
