@@ -80,27 +80,28 @@ if not os.path.exists(MODEL_DIR):
 
 
 def get_campaign_category(raw_campaign_text):
-    """Map real Ringba campaign names to the closest QC campaign family."""
+    """Map real Ringba campaign names to the closest QC campaign.
+    The keywords for each campaign are edited in the app (Campaign Rules page)."""
     raw = (raw_campaign_text or "").strip()
     text = raw.lower()
 
     if not raw:
         return "General Customer Inquiry"
 
-    if any(k in text for k in ["rehab", "addiction", "mental health", "substance", "treatment"]):
-        return "Rehab & Addiction Treatment"
+    campaigns = (globals().get("QC_CONFIG") or {}).get("campaigns") or {}
 
-    if any(k in text for k in ["dumpster", "porta potty", "portable toilet"]):
-        return "Dumpster & Porta Potty Services"
+    # Exact campaign name first.
+    for name in campaigns:
+        if name.strip().lower() == text:
+            return name
 
-    if any(k in text for k in ["pest", "roofing", "roof", "home service", "plumbing", "hvac", "moving"]):
-        return "Pest Control & Home Services"
-
-    if any(k in text for k in ["insurance", "medicare", "medicaid", "auto insurance", "home insurance", "final expense", "health insurance"]):
-        return "Insurance (Health / Auto / Home)"
-
-    if any(k in text for k in ["debt", "debt relief", "settlement", "financial", "loan", "mca"]):
-        return "Debt Relief & Financial Services"
+    # Then the name keywords, lowest "match priority" first.
+    ordered = sorted(campaigns.items(), key=lambda item: item[1].get("match_priority", 100))
+    for name, camp in ordered:
+        for keyword in camp.get("name_keywords") or []:
+            keyword = str(keyword).strip().lower()
+            if keyword and keyword in text:
+                return name
 
     return raw
 
@@ -890,31 +891,15 @@ def clean_main_topic(text, max_words=25):
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     """Build a compact analysis prompt. Keep the transcript, but avoid sending
     timestamps, speaker-label instructions, or the old long JSON schema."""
-    campaign_guidance = {
-        "Rehab & Addiction Treatment": (
-            "Focus on treatment/service requested, caller reason, insurance, location, "
-            "qualification, and outcome. Medicaid/Medicare/state/government/public insurance "
-            "is NON-QUALIFIED for this network rule; private/commercial insurance is a positive signal."
-        ),
-        "Dumpster & Porta Potty Services": (
-            "Focus on dumpster/porta-potty service, size/type, use, price, location, delivery date, and booking."
-        ),
-        "Pest Control & Home Services": (
-            "Focus on the home/pest problem, service requested, homeowner/renter status, location, quote, appointment, and outcome."
-        ),
-        "Insurance (Health / Auto / Home)": (
-            "Focus on coverage type, current policy situation, quote/new policy/existing policy, eligibility, and outcome."
-        ),
-        "Debt Relief & Financial Services": (
-            "Focus on debt/financial need, debt amount/type when stated, requested help, qualification, transfer/consultation, and outcome."
-        ),
-    }.get(
-        campaign_name,
-        "Focus on the caller's reason, requested service/information, important qualification details, location/eligibility, and outcome."
-    )
+    campaign_guidance = get_campaign_focus(campaign_name)
 
     service_categories = ", ".join(CAMPAIGN_QC_QUESTIONS.keys())
     summary_instructions = build_summary_instructions(campaign_name)
+    yelp_rule = (
+        "- ANY mention of Yelp or Yellow Pages, in any context, means spam_robot=true, spam_confidence=99, call_type=SPAM / ROBOT."
+        if SPAM_YELP_YELLOW_ENABLED
+        else "- A caller mentioning Yelp or Yellow Pages is not automatically spam."
+    )
 
     return f"""
 You are a pay-per-call call QC analyst. Analyze the complete transcript and return ONLY one valid JSON object.
@@ -946,7 +931,7 @@ RULES:
 - If the call is silent/no-response, do not invent caller intent.
 - If spam/robot, describe what the call was promoting or asking the recipient to do.
 - Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
-- ANY mention of Yelp or Yellow Pages, in any context, means spam_robot=true, spam_confidence=99, call_type=SPAM / ROBOT.
+{yelp_rule}
 - A normal irrelevant or non-qualified caller is not automatically spam.
 - For Rehab, Medicaid/Medicare/state/government/marketplace/public insurance means NON-QUALIFIED. Treat private/commercial insurance as a positive qualification signal when clearly stated by the caller, including statements such as “private insurance,” “commercial insurance,” or insurance through the caller’s, parent’s, spouse’s, or another family member’s employer. PPO, HMO, EPO, and POS are also positive signals when clearly stated. Do not assume the provider or plan type if it is not stated.
 - qualification_reason should briefly explain why the qualification status was chosen.
@@ -1015,6 +1000,8 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
 # Any mention of Yelp or Yellow Pages = SPAM, no other condition needed.
 # Set True to treat ANY mention of the word "yellow" as spam as well.
 STRICT_YELLOW_ANY = False
+SPAM_YELP_YELLOW_ENABLED = True   # editable in the app (Campaign Rules -> Spam)
+EXTRA_SPAM_RES = []               # extra always-spam words, editable in the app
 
 _YELP_RE = re.compile(r"\by\W{0,2}e\W{0,2}l\W{0,2}p\b|\byelp\w*", re.IGNORECASE)
 _YELLOW_DIRECTORY_RE = re.compile(
@@ -1057,10 +1044,15 @@ def detect_spam_signals(full_transcript):
     if not text.strip():
         return 0, "", ""
 
-    if _YELP_RE.search(text):
+    if SPAM_YELP_YELLOW_ENABLED and _YELP_RE.search(text):
         return 99, "Yelp mentioned on the call (strict network spam rule)", "Yelp"
-    if _YELLOW_DIRECTORY_RE.search(text) or (STRICT_YELLOW_ANY and _ANY_YELLOW_RE.search(text)):
+    if SPAM_YELP_YELLOW_ENABLED and (_YELLOW_DIRECTORY_RE.search(text) or (STRICT_YELLOW_ANY and _ANY_YELLOW_RE.search(text))):
         return 99, "Yellow Pages mentioned on the call (strict network spam rule)", "Yellow Pages"
+
+    for rx in EXTRA_SPAM_RES:
+        hit = rx.search(text)
+        if hit:
+            return 99, f"Blocked spam word '{hit.group(0)}' mentioned on the call", "Blocked word"
 
     for rx, label in _STRONG_SPAM_RES:
         if rx.search(text):
@@ -1273,7 +1265,7 @@ def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_d
 
     # ---- 3. Rehab: government / state insurance is never qualified ----
     if (
-        family == "Rehab & Addiction Treatment"
+        campaign_flag(family, "block_government_insurance")
         and call_type == "QUALIFIED"
         and get_rehab_insurance_status(analysis) == "YELLOW"
     ):
@@ -1935,43 +1927,120 @@ def build_qc_report(analysis):
 
 
 # ------------------------------------------------------------
-# SCORING RULES (edit the numbers here)
+# SCORING RULES
+# These are the BUILT-IN DEFAULTS. You normally do NOT edit them here:
+# change them in the app -> sidebar "Campaign Rules" -> "Scoring" (all campaigns)
+# or inside a campaign's own "Score settings" (only that campaign).
 # ------------------------------------------------------------
-NO_VOICE_SCORE = 30              # no text in recording / silent call: fixed
-SILENT_SCORE = 30                # AI says SILENT / NO RESPONSE: fixed
-SPAM_CONFIDENT_SCORE = 5         # spam_robot and confidence >= 90: fixed
-SPAM_MAX_SCORE = 25              # lower-confidence spam
-WRONG_NUMBER_MAX_SCORE = 30      # wrong number / campaign mismatch
-OTHER_TYPE_MAX_SCORE = 49        # every call_type except QUALIFIED / NON-QUALIFIED
-NON_QUALIFIED_MAX_SCORE = 60
-QUALIFIED_UNCLEAR_MAX_SCORE = 79 # call_type QUALIFIED but qualification status not clear
-APPOINTMENT_MAX = 95
-REHAB_GOV_INSURANCE_MAX = 60
-REHAB_NO_APPOINTMENT_MAX = 95    # Rehab can never be 100 without an appointment
+SCORE_WEIGHT_FIELDS = [
+    # key, label, default, max, group, can be overridden per campaign
+    ("q_base_clear",   "Base points (status QUALIFIED)",          60, 100, "Qualified calls", True),
+    ("q_base_unclear", "Base points (status not clear)",          45, 100, "Qualified calls", True),
+    ("q_service",      "+ Service requested",                     10, 100, "Qualified calls", True),
+    ("q_location",     "+ Location / eligibility",                 8, 100, "Qualified calls", True),
+    ("q_qualinfo",     "+ Qualification info",                     6, 100, "Qualified calls", True),
+    ("q_outcome",      "+ Clear outcome",                          8, 100, "Qualified calls", True),
+    ("q_twoway",       "+ Two-way conversation",                   4, 100, "Qualified calls", True),
+    ("q_appointment",  "+ Appointment / booking / transfer",       4, 100, "Qualified calls", True),
+    ("q_qc_penalty",   "- Penalty when a QC issue exists",        10, 100, "Qualified calls", True),
+
+    ("nq_base",        "Base points",                             20, 100, "Non-qualified calls", True),
+    ("nq_intent",      "+ Relevant intent",                        5, 100, "Non-qualified calls", True),
+    ("nq_service",     "+ Service requested",                      8, 100, "Non-qualified calls", True),
+    ("nq_qualinfo",    "+ Qualification info",                     7, 100, "Non-qualified calls", True),
+    ("nq_location",    "+ Location",                               5, 100, "Non-qualified calls", True),
+    ("nq_outcome",     "+ Clear outcome",                          5, 100, "Non-qualified calls", True),
+    ("nq_twoway",      "+ Two-way conversation",                   5, 100, "Non-qualified calls", True),
+
+    ("o_intent",       "+ Relevant intent",                       10, 49, "Other call types (max 49)", True),
+    ("o_service",      "+ Service requested",                      8, 49, "Other call types (max 49)", True),
+    ("o_twoway",       "+ Two-way conversation",                   8, 49, "Other call types (max 49)", True),
+    ("o_outcome",      "+ Clear outcome",                          5, 49, "Other call types (max 49)", True),
+    ("o_qualinfo",     "+ Qualification info",                     4, 49, "Other call types (max 49)", True),
+
+    ("non_qualified_max",     "Non-qualified: highest score",                    60, 100, "Caps", True),
+    ("qualified_unclear_max", "Qualified but status not clear: highest score",   79, 100, "Caps", True),
+    ("appointment_max",       "Qualified without appointment/booking: highest",  95, 100, "Caps", True),
+    ("government_cap",        "Government insurance: highest score",             60, 100, "Caps", True),
+
+    ("no_voice_score",        "No voice / no text in recording (fixed)",         30, 49, "Hard rules (all campaigns, max 49)", False),
+    ("silent_score",          "Silent / no response call type (fixed)",          30, 49, "Hard rules (all campaigns, max 49)", False),
+    ("spam_confident_score",  "Confirmed spam, confidence 90+ (fixed)",           5, 49, "Hard rules (all campaigns, max 49)", False),
+    ("spam_max_score",        "Other spam: highest score",                       25, 49, "Hard rules (all campaigns, max 49)", False),
+    ("wrong_number_max",      "Wrong number / campaign mismatch: highest score", 30, 49, "Hard rules (all campaigns, max 49)", False),
+    ("other_type_max",        "Any call type except Qualified / Non-qualified",  49, 49, "Hard rules (all campaigns, max 49)", False),
+]
+DEFAULT_WEIGHTS = {f[0]: f[2] for f in SCORE_WEIGHT_FIELDS}
+
+
+def _qc_cfg():
+    return globals().get("QC_CONFIG") or {}
+
+
+def get_campaign_cfg(campaign_key):
+    return (_qc_cfg().get("campaigns") or {}).get(str(campaign_key or "").strip(), {})
+
+
+def campaign_flag(campaign_key, flag, default=False):
+    """Per-campaign on/off rule (for example block_government_insurance)."""
+    camp = get_campaign_cfg(campaign_key)
+    return bool(camp.get(flag, default)) if camp else default
+
+
+def get_effective_weights(campaign_key):
+    """Global score numbers, replaced by the campaign's own values where it has overrides."""
+    weights = dict(DEFAULT_WEIGHTS)
+    weights.update((_qc_cfg().get("global") or {}).get("weights") or {})
+    camp = get_campaign_cfg(campaign_key)
+    for key, value in (camp.get("score_overrides") or {}).items():
+        if key in weights:
+            weights[key] = value
+    return weights
+
+
+def get_campaign_focus(campaign_key):
+    camp = get_campaign_cfg(campaign_key)
+    focus = str(camp.get("focus", "") or "").strip() if camp else ""
+    return focus or (
+        "Focus on the caller's reason, requested service/information, important "
+        "qualification details, location/eligibility, and outcome."
+    )
 
 
 def _score_breakdown(analysis):
     """Return (final_score, list_of_reasons). AI supplies facts; Python supplies the score.
+    All numbers come from the editable settings (Campaign Rules page).
 
     Tiers:
-      QUALIFIED      base 60 (45 if status unclear) + completeness bonuses, up to 100
-      NON-QUALIFIED  base 20 + bonuses, max 60
-      everything else (INFO ONLY / OTHER / WRONG NUMBER / SPAM / SILENT): max 49
-    Hard rules: no voice = 30, silent = 30, wrong number <= 30, spam <= 25 (5 if confident).
+      QUALIFIED      base points + completeness bonuses, up to 100
+      NON-QUALIFIED  base points + bonuses, capped (default 60)
+      everything else (INFO ONLY / OTHER / WRONG NUMBER / SPAM / SILENT): always under 50
+    Hard rules: no voice = fixed, silent = fixed, wrong number capped, spam capped.
     """
     call_type = str(analysis.get("call_type", "OTHER") or "OTHER").strip().upper()
     status = str(analysis.get("qualification_status", "NOT CLEAR") or "NOT CLEAR").strip().upper()
     spam_confidence = _safe_int(analysis.get("spam_confidence"))
     spam = bool(analysis.get("spam_robot")) or call_type == "SPAM / ROBOT"
-    campaign_category = str(analysis.get("campaign_category", "") or "").strip()
+    campaign_key = str(analysis.get("campaign_category", "") or "").strip()
+
+    weights = get_effective_weights(campaign_key)
+
+    def W(key):
+        try:
+            return int(weights.get(key, DEFAULT_WEIGHTS[key]))
+        except (TypeError, ValueError):
+            return int(DEFAULT_WEIGHTS[key])
+
+    def under50(value):
+        return min(49, value)
 
     # ---- Fixed-score rules ----
     if analysis.get("no_voice"):
-        return NO_VOICE_SCORE, [f"No voice detected = {NO_VOICE_SCORE}"]
+        return under50(W("no_voice_score")), [f"No voice detected = {under50(W('no_voice_score'))}"]
     if spam and spam_confidence >= 90:
-        return SPAM_CONFIDENT_SCORE, [f"Confirmed spam/robot = {SPAM_CONFIDENT_SCORE}"]
+        return under50(W("spam_confident_score")), [f"Confirmed spam/robot = {under50(W('spam_confident_score'))}"]
     if call_type == "SILENT / NO RESPONSE":
-        return SILENT_SCORE, [f"Silent / no response = {SILENT_SCORE}"]
+        return under50(W("silent_score")), [f"Silent / no response = {under50(W('silent_score'))}"]
 
     score = 0
     items = []
@@ -1986,73 +2055,75 @@ def _score_breakdown(analysis):
     # ---- Tier points ----
     if call_type == "QUALIFIED" and status != "NON-QUALIFIED":
         tier = "QUALIFIED"
-        add(60 if status == "QUALIFIED" else 45, "Qualified base")
+        if status == "QUALIFIED":
+            add(W("q_base_clear"), "Qualified base")
+        else:
+            add(W("q_base_unclear"), "Qualified base (status not clear)")
         if has_service:
-            add(10, "Service")
+            add(W("q_service"), "Service")
         if analysis.get("location_or_eligibility_present"):
-            add(8, "Location/eligibility")
+            add(W("q_location"), "Location/eligibility")
         if analysis.get("qualification_info_present"):
-            add(6, "Qualification info")
+            add(W("q_qualinfo"), "Qualification info")
         if analysis.get("clear_outcome"):
-            add(8, "Outcome")
+            add(W("q_outcome"), "Outcome")
         if analysis.get("two_way_conversation"):
-            add(4, "2-way conversation")
+            add(W("q_twoway"), "2-way conversation")
         if analysis.get("appointment_set"):
-            add(4, "Appointment/booking")
+            add(W("q_appointment"), "Appointment/booking")
         if str(analysis.get("qc_issue", "")).strip():
-            score -= 10
-            items.append("QC issue -10")
+            score -= W("q_qc_penalty")
+            items.append(f"QC issue -{W('q_qc_penalty')}")
     elif call_type in {"QUALIFIED", "NON-QUALIFIED"}:
         tier = "NON-QUALIFIED"
-        add(20, "Non-qualified base")
+        add(W("nq_base"), "Non-qualified base")
         if analysis.get("relevant_intent"):
-            add(5, "Relevant intent")
+            add(W("nq_intent"), "Relevant intent")
         if has_service:
-            add(8, "Service")
+            add(W("nq_service"), "Service")
         if analysis.get("qualification_info_present"):
-            add(7, "Qualification info")
+            add(W("nq_qualinfo"), "Qualification info")
         if analysis.get("location_or_eligibility_present"):
-            add(5, "Location")
+            add(W("nq_location"), "Location")
         if analysis.get("clear_outcome"):
-            add(5, "Outcome")
+            add(W("nq_outcome"), "Outcome")
         if analysis.get("two_way_conversation"):
-            add(5, "2-way conversation")
+            add(W("nq_twoway"), "2-way conversation")
     else:
         tier = "OTHER"
         if analysis.get("relevant_intent"):
-            add(10, "Relevant intent")
+            add(W("o_intent"), "Relevant intent")
         if has_service:
-            add(8, "Service")
+            add(W("o_service"), "Service")
         if analysis.get("two_way_conversation"):
-            add(8, "2-way conversation")
+            add(W("o_twoway"), "2-way conversation")
         if analysis.get("clear_outcome"):
-            add(5, "Outcome")
+            add(W("o_outcome"), "Outcome")
         if analysis.get("qualification_info_present"):
-            add(4, "Qualification info")
+            add(W("o_qualinfo"), "Qualification info")
 
     # ---- Caps (lowest cap wins) ----
     caps = []
     if spam:
-        caps.append((SPAM_MAX_SCORE, "spam"))
+        caps.append((under50(W("spam_max_score")), "spam"))
     elif call_type == "WRONG NUMBER":
-        caps.append((WRONG_NUMBER_MAX_SCORE, "wrong number"))
+        caps.append((under50(W("wrong_number_max")), "wrong number"))
     elif tier == "OTHER":
-        caps.append((OTHER_TYPE_MAX_SCORE, f"call type {call_type}"))
+        caps.append((under50(W("other_type_max")), f"call type {call_type}"))
     elif tier == "NON-QUALIFIED":
-        caps.append((NON_QUALIFIED_MAX_SCORE, "non-qualified"))
+        caps.append((W("non_qualified_max"), "non-qualified"))
     elif status != "QUALIFIED":
-        caps.append((QUALIFIED_UNCLEAR_MAX_SCORE, "qualification not clear"))
+        caps.append((W("qualified_unclear_max"), "qualification not clear"))
 
-    if tier == "QUALIFIED" and not analysis.get("appointment_set", False):
-        caps.append((APPOINTMENT_MAX, "no appointment/booking"))
+    # Campaign rule: a qualified call without an appointment/booking can never reach the top score.
+    if tier == "QUALIFIED" and not analysis.get("appointment_set", False) \
+            and campaign_flag(campaign_key, "appointment_cap_enabled", True):
+        caps.append((W("appointment_max"), "no appointment/booking"))
 
-    if campaign_category == "Rehab & Addiction Treatment":
-        # Government/state insurance is NEVER qualified.
-        if get_rehab_insurance_status(analysis) == "YELLOW":
-            caps.append((REHAB_GOV_INSURANCE_MAX, "government insurance"))
-        # A Rehab call without a confirmed appointment can NEVER receive 100.
-        if not analysis.get("appointment_set", False):
-            caps.append((REHAB_NO_APPOINTMENT_MAX, "no appointment"))
+    # Campaign rule: government / state insurance is never fully qualified.
+    if campaign_flag(campaign_key, "block_government_insurance") \
+            and get_rehab_insurance_status(analysis) == "YELLOW":
+        caps.append((W("government_cap"), "government insurance"))
 
     final = max(0, score)
     for cap_value, cap_reason in caps:
@@ -2172,6 +2243,739 @@ def get_google_client():
         raise RuntimeError(
             "Google Sheets credentials not found. Add service_account.json or gcp_service_account to Streamlit Secrets."
         ) from exc
+
+
+# ============================================================
+# EDITABLE QC CONFIG
+# Campaign QC note rules, keywords, scoring and spam settings are stored in
+# qc_config.json (+ backup in the Google Sheet tab "QC_Config") and edited from the
+# app: sidebar -> "Campaign Rules" (admin only). Everything below is read on every
+# run, so saved changes apply to the next call processed without a restart.
+# ============================================================
+import copy
+
+QC_CONFIG_PATH = Path("qc_config.json")
+QC_CONFIG_PREVIOUS_PATH = Path("qc_config.previous.json")
+QC_CONFIG_SHEET_NAME = "Ringba to Sheet QC"
+QC_CONFIG_TAB = "QC_Config"
+
+# Snapshot of the built-in (in-code) values, used for "Reset to defaults".
+_BUILTIN_CAMPAIGN_QC = dict(CAMPAIGN_QC_QUESTIONS)
+_BUILTIN_DEFAULT_QC = DEFAULT_QC_QUESTIONS
+_BUILTIN_SUMMARY_STYLE = SUMMARY_STYLE_RULES
+_BUILTIN_GOV_TERMS = list(GOVERNMENT_TERMS)
+_BUILTIN_PRIVATE_TERMS = list(PRIVATE_TERMS)
+
+_GENERIC_FOCUS = (
+    "Focus on the caller's reason, requested service/information, important "
+    "qualification details, location/eligibility, and outcome."
+)
+
+# Built-in details for the original campaigns (everything is editable in the app).
+_BUILTIN_CAMPAIGN_DETAILS = {
+    "Rehab & Addiction Treatment": {
+        "match_priority": 10,
+        "name_keywords": ["rehab", "addiction", "mental health", "substance", "treatment"],
+        "focus": (
+            "Focus on treatment/service requested, caller reason, insurance, location, "
+            "qualification, and outcome. Medicaid/Medicare/state/government/public insurance "
+            "is NON-QUALIFIED for this network rule; private/commercial insurance is a positive signal."
+        ),
+        "service_keywords": [
+            "rehab*", "detox*", "addict*", "alcohol*", "drug", "opioid", "heroin", "fentanyl",
+            "meth", "methamphetamine", "cocaine", "sober*", "withdrawal", "inpatient", "outpatient",
+            "treatment center", "treatment program", "treatment facility", "substance", "relapse*",
+            "residential treatment", "mental health",
+        ],
+        "qual_keywords": [
+            "insurance", "coverage", "medicaid", "medicare", "blue cross", "aetna", "cigna",
+            "humana", "united healthcare", "self pay", "cash pay", "out of pocket", "years old",
+        ],
+        "block_government_insurance": True,
+    },
+    "Dumpster & Porta Potty Services": {
+        "match_priority": 20,
+        "name_keywords": ["dumpster", "porta potty", "portable toilet"],
+        "focus": "Focus on dumpster/porta-potty service, size/type, use, price, location, delivery date, and booking.",
+        "service_keywords": [
+            "dumpster", "roll off", "porta potty", "porta john", "port a potty", "portable toilet",
+            "portable restroom", "portable bathroom", "10 yard", "15 yard", "20 yard", "30 yard",
+            "40 yard", "debris", "junk removal", "demolition",
+        ],
+        "qual_keywords": [
+            "10 yard", "15 yard", "20 yard", "30 yard", "40 yard", "deliver*", "address",
+            "residential", "commercial", "construction",
+        ],
+    },
+    "Pest Control & Home Services": {
+        "match_priority": 30,
+        "name_keywords": ["pest", "roofing", "roof", "home service", "plumbing", "hvac", "moving"],
+        "focus": "Focus on the home/pest problem, service requested, homeowner/renter status, location, quote, appointment, and outcome.",
+        "service_keywords": [
+            "pest*", "termite", "cockroach*", "roach", "bed bug", "rodent", "mice", "rat",
+            "exterminat*", "roof*", "plumb*", "hvac", "air conditioning", "furnace",
+            "moving company", "mover", "ant",
+        ],
+        "qual_keywords": ["homeowner", "i own", "rent*", "landlord", "square feet", "sq ft"],
+    },
+    "Insurance (Health / Auto / Home)": {
+        "match_priority": 40,
+        "name_keywords": ["insurance", "medicare", "medicaid", "auto insurance", "home insurance", "final expense", "health insurance"],
+        "focus": "Focus on coverage type, current policy situation, quote/new policy/existing policy, eligibility, and outcome.",
+        "service_keywords": [
+            "auto insurance", "car insurance", "home insurance", "homeowners insurance",
+            "homeowner insurance", "life insurance", "final expense", "burial", "insurance quote",
+            "insurance policy", "insurance agent", "insurance broker", "medicare advantage",
+            "medicare supplement", "medicare part", "open enrollment", "health insurance plan",
+        ],
+        "qual_keywords": ["years old", "age", "date of birth", "current policy", "current coverage", "zip"],
+    },
+    "Debt Relief & Financial Services": {
+        "match_priority": 50,
+        "name_keywords": ["debt", "debt relief", "settlement", "financial", "loan", "mca"],
+        "focus": "Focus on debt/financial need, debt amount/type when stated, requested help, qualification, transfer/consultation, and outcome.",
+        "service_keywords": [
+            "debt", "debt relief", "debt settlement", "consolidat*", "credit card", "creditor",
+            "collection", "bankruptcy", "merchant cash", "mca", "personal loan", "loan",
+        ],
+        "qual_keywords": [r"regex:\$\s?\d", "thousand", "dollars", "credit card", "unsecured", "i owe"],
+    },
+}
+
+
+def _blank_campaign():
+    return {
+        "match_priority": 100,
+        "name_keywords": [],
+        "qc_note_rules": _BUILTIN_DEFAULT_QC,
+        "focus": _GENERIC_FOCUS,
+        "service_keywords": [],
+        "qual_keywords": [],
+        "block_government_insurance": False,
+        "appointment_cap_enabled": True,
+        "score_overrides": {},
+    }
+
+
+def _default_qc_config():
+    campaigns = {}
+    for name, rules in _BUILTIN_CAMPAIGN_QC.items():
+        camp = _blank_campaign()
+        camp.update(copy.deepcopy(_BUILTIN_CAMPAIGN_DETAILS.get(name, {})))
+        camp["qc_note_rules"] = rules
+        if not camp["name_keywords"]:
+            camp["name_keywords"] = [name.lower()]
+        campaigns[name] = camp
+    return {
+        "meta": {"version": 2, "updated_at": "", "updated_by": ""},
+        "global": {
+            "weights": dict(DEFAULT_WEIGHTS),
+            "spam": {"yelp_yellow_is_spam": True, "strict_yellow_any": False, "extra_terms": []},
+            "voice": {"no_voice_min_words": 3, "min_audio_seconds": 1.0},
+            "government_terms": list(_BUILTIN_GOV_TERMS),
+            "private_terms": list(_BUILTIN_PRIVATE_TERMS),
+            "summary_style_rules": _BUILTIN_SUMMARY_STYLE,
+            "default_qc_questions": _BUILTIN_DEFAULT_QC,
+        },
+        "campaigns": campaigns,
+    }
+
+
+def _merge_config(saved, defaults):
+    """Saved settings on top of the built-in defaults (new settings added later still get a value)."""
+    cfg = copy.deepcopy(defaults)
+    if not isinstance(saved, dict):
+        return cfg
+    cfg["meta"].update(saved.get("meta") or {})
+    for key, value in (saved.get("global") or {}).items():
+        if key in ("weights", "spam", "voice") and isinstance(value, dict):
+            cfg["global"][key].update(value)
+        else:
+            cfg["global"][key] = value
+    if isinstance(saved.get("campaigns"), dict) and saved["campaigns"]:
+        cfg["campaigns"] = {}
+        for name, camp in saved["campaigns"].items():
+            merged = _blank_campaign()
+            merged["qc_note_rules"] = cfg["global"].get("default_qc_questions", _BUILTIN_DEFAULT_QC)
+            merged.update(camp or {})
+            cfg["campaigns"][str(name).strip()] = merged
+    return cfg
+
+
+# ---- keyword helpers ----
+def _keyword_to_regex(entry):
+    """Plain word/phrase -> regex.  'rehab*' = starts with rehab.  'regex:...' = raw regex."""
+    text = str(entry or "").strip()
+    if not text:
+        return None
+    if text.lower().startswith("regex:"):
+        return text[6:].strip() or None
+    prefix_match = text.endswith("*")
+    text = text.rstrip("*").strip()
+    parts = [p for p in re.split(r"[\s-]+", text) if p]
+    if not parts:
+        return None
+    body = r"[\s-]?".join(re.escape(p) for p in parts)
+    if prefix_match:
+        return r"\b" + body + r"\w*"
+    return r"\b" + body + r"(?:s|es)?\b"
+
+
+def _valid_patterns(entries):
+    patterns = []
+    for entry in entries or []:
+        pattern = _keyword_to_regex(entry)
+        if not pattern:
+            continue
+        try:
+            re.compile(pattern)
+        except re.error:
+            continue
+        patterns.append(pattern)
+    return patterns
+
+
+def _alt(terms):
+    return "|".join(re.escape(str(t)) for t in terms if str(t).strip()) or "(?!x)x"
+
+
+def _rebuild_insurance_regexes():
+    global GOVERNMENT_RE, PRIVATE_RE, GOVERNMENT_NEGATED_RE, PRIVATE_NEGATED_RE
+    global _GOV_ALT, _CALLER_GOV_RE, _CALLER_PRIV_RE
+    GOVERNMENT_RE = _compile(GOVERNMENT_TERMS) if GOVERNMENT_TERMS else re.compile(r"(?!x)x")
+    PRIVATE_RE = _compile(PRIVATE_TERMS) if PRIVATE_TERMS else re.compile(r"(?!x)x")
+    _GOV_ALT = _alt(GOVERNMENT_TERMS)
+    private_alt = _alt(PRIVATE_TERMS)
+    GOVERNMENT_NEGATED_RE = re.compile(
+        r"\b" + _NEG_PREFIX + r"\s+(?:\w+\s+){0,2}?(?:" + _GOV_ALT + r")\b", re.IGNORECASE)
+    PRIVATE_NEGATED_RE = re.compile(
+        r"\b" + _NEG_PREFIX + r"\s+(?:\w+\s+){0,2}?(?:" + private_alt + r")\b", re.IGNORECASE)
+    _CALLER_GOV_RE = re.compile(
+        r"\b(?:" + _CALLER_PREFIX + r")\W+(?:\w+\W+){0,3}?(?:" + _GOV_ALT + r")\b", re.IGNORECASE)
+    _CALLER_PRIV_RE = re.compile(
+        r"\b(?:" + _CALLER_PREFIX + r")\W+(?:\w+\W+){0,3}?(?:" + private_alt + r")\b", re.IGNORECASE)
+
+
+def apply_qc_config(cfg):
+    """Push the settings into the running app (rules, scoring, keywords, spam, summaries)."""
+    global QC_CONFIG, NO_VOICE_MIN_WORDS, MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION
+    global STRICT_YELLOW_ANY, SPAM_YELP_YELLOW_ENABLED, EXTRA_SPAM_RES
+    global SUMMARY_STYLE_RULES, DEFAULT_QC_QUESTIONS
+
+    QC_CONFIG = cfg
+    g = cfg["global"]
+
+    NO_VOICE_MIN_WORDS = int(g["voice"].get("no_voice_min_words", 3))
+    MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION = float(g["voice"].get("min_audio_seconds", 1.0))
+    STRICT_YELLOW_ANY = bool(g["spam"].get("strict_yellow_any", False))
+    SPAM_YELP_YELLOW_ENABLED = bool(g["spam"].get("yelp_yellow_is_spam", True))
+    EXTRA_SPAM_RES = []
+    for pattern in _valid_patterns(g["spam"].get("extra_terms")):
+        EXTRA_SPAM_RES.append(re.compile(pattern, re.IGNORECASE))
+
+    SUMMARY_STYLE_RULES = g.get("summary_style_rules") or _BUILTIN_SUMMARY_STYLE
+    DEFAULT_QC_QUESTIONS = g.get("default_qc_questions") or _BUILTIN_DEFAULT_QC
+
+    CAMPAIGN_QC_QUESTIONS.clear()
+    FAMILY_KEYWORDS.clear()
+    _FAMILY_KEY_RES.clear()
+    _QUAL_INFO_RES.clear()
+    for name, camp in cfg["campaigns"].items():
+        CAMPAIGN_QC_QUESTIONS[name] = camp.get("qc_note_rules") or DEFAULT_QC_QUESTIONS
+        patterns = _valid_patterns(camp.get("service_keywords"))
+        FAMILY_KEYWORDS[name] = patterns
+        _FAMILY_KEY_RES[name] = [re.compile(p, re.IGNORECASE) for p in patterns]
+        qual_patterns = _valid_patterns(camp.get("qual_keywords"))
+        if qual_patterns:
+            _QUAL_INFO_RES[name] = re.compile("|".join(f"(?:{p})" for p in qual_patterns), re.IGNORECASE)
+
+    GOVERNMENT_TERMS[:] = [str(t).strip() for t in g.get("government_terms", []) if str(t).strip()]
+    PRIVATE_TERMS[:] = [str(t).strip() for t in g.get("private_terms", []) if str(t).strip()]
+    _rebuild_insurance_regexes()
+
+
+def validate_qc_config(cfg):
+    errors = []
+    campaigns = cfg.get("campaigns") or {}
+    if not campaigns:
+        errors.append("At least one campaign is required.")
+    seen = set()
+    for name, camp in campaigns.items():
+        if not str(name).strip():
+            errors.append("A campaign has an empty name.")
+            continue
+        low = str(name).strip().lower()
+        if low in seen:
+            errors.append(f"Duplicate campaign name: {name}")
+        seen.add(low)
+        if not str(camp.get("qc_note_rules", "")).strip():
+            errors.append(f"'{name}': QC note rules cannot be empty.")
+        for field in ("service_keywords", "qual_keywords"):
+            for entry in camp.get(field) or []:
+                pattern = _keyword_to_regex(entry)
+                if not pattern:
+                    continue
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    errors.append(f"'{name}' {field}: invalid pattern '{entry}' ({exc})")
+    limits = {f[0]: f[3] for f in SCORE_WEIGHT_FIELDS}
+    for key, value in (cfg["global"].get("weights") or {}).items():
+        if key in limits and not (0 <= float(value) <= limits[key]):
+            errors.append(f"Score '{key}' must be between 0 and {limits[key]}.")
+    for name, camp in campaigns.items():
+        for key, value in (camp.get("score_overrides") or {}).items():
+            if key in limits and not (0 <= float(value) <= limits[key]):
+                errors.append(f"'{name}': score '{key}' must be between 0 and {limits[key]}.")
+    for entry in cfg["global"]["spam"].get("extra_terms") or []:
+        pattern = _keyword_to_regex(entry)
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                errors.append(f"Extra spam term '{entry}' is invalid ({exc})")
+    return errors
+
+
+# ---- storage: local file + Google Sheet backup ----
+def _save_qc_config_to_sheet(cfg):
+    try:
+        sheet = get_google_client().open(QC_CONFIG_SHEET_NAME)
+        try:
+            ws = sheet.worksheet(QC_CONFIG_TAB)
+        except Exception:
+            ws = sheet.add_worksheet(title=QC_CONFIG_TAB, rows=60, cols=2)
+        payload = json.dumps(cfg, ensure_ascii=False)
+        chunks = [payload[i:i + 40000] for i in range(0, len(payload), 40000)] or [""]
+        ws.clear()
+        ws.update(values=[[chunk] for chunk in chunks], range_name="A1")
+        return True, f"Backed up to Google Sheet tab '{QC_CONFIG_TAB}'."
+    except Exception as exc:
+        return False, f"Saved on the server, but the Google Sheet backup failed ({exc})."
+
+
+def _load_qc_config_from_sheet():
+    try:
+        ws = get_google_client().open(QC_CONFIG_SHEET_NAME).worksheet(QC_CONFIG_TAB)
+        text = "".join(ws.col_values(1))
+        return json.loads(text) if text.strip() else None
+    except Exception:
+        return None
+
+
+def save_qc_config(cfg, updated_by=""):
+    """Validate-free save: write file (keeping the previous version), back up to the sheet, apply."""
+    cfg["meta"]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cfg["meta"]["updated_by"] = updated_by
+    if QC_CONFIG_PATH.exists():
+        try:
+            QC_CONFIG_PREVIOUS_PATH.write_text(QC_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+    tmp_path = QC_CONFIG_PATH.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path.replace(QC_CONFIG_PATH)
+    sheet_ok, sheet_msg = _save_qc_config_to_sheet(cfg)
+    apply_qc_config(cfg)
+    return sheet_ok, sheet_msg
+
+
+def _bootstrap_qc_config():
+    defaults = _default_qc_config()
+    data = None
+    if QC_CONFIG_PATH.exists():
+        try:
+            data = json.loads(QC_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+    if data is None:
+        try:
+            already_tried = st.session_state.get("qc_sheet_restore_tried", False)
+            st.session_state["qc_sheet_restore_tried"] = True
+        except Exception:
+            already_tried = True
+        if not already_tried:
+            data = _load_qc_config_from_sheet()
+            if data:
+                try:
+                    QC_CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+    return _merge_config(data, defaults) if data else defaults
+
+
+QC_CONFIG = _bootstrap_qc_config()
+apply_qc_config(QC_CONFIG)
+
+
+# ============================================================
+# CAMPAIGN RULES PAGE (admin)
+# ============================================================
+def _lines(text):
+    out, seen = [], set()
+    for line in str(text or "").splitlines():
+        item = line.strip()
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+def _flash(kind, message):
+    st.session_state["cr_flash"] = (kind, message)
+
+
+def _commit_qc_config(cfg, label="Saved"):
+    errors = validate_qc_config(cfg)
+    if errors:
+        for err in errors:
+            st.error(err)
+        return False
+    who = (st.session_state.get("logged_in_user") or {}).get("email", "")
+    sheet_ok, sheet_msg = save_qc_config(cfg, updated_by=who)
+    _flash("success" if sheet_ok else "warning", f"{label}. {sheet_msg}")
+    return True
+
+
+def _weight_inputs(cfg, ver, key_prefix, values, only_overridable=False, camp_name=None):
+    """Number inputs grouped like the score table. Returns {key: value}."""
+    if camp_name:
+        base = get_effective_weights(camp_name)
+    else:
+        base = cfg["global"]["weights"]
+    groups = []
+    for field in SCORE_WEIGHT_FIELDS:
+        if only_overridable and not field[5]:
+            continue
+        if field[4] not in groups:
+            groups.append(field[4])
+    result = {}
+    for group in groups:
+        st.markdown(f"**{group}**")
+        cols = st.columns(3)
+        group_fields = [f for f in SCORE_WEIGHT_FIELDS if f[4] == group and (f[5] or not only_overridable)]
+        for i, (key, label, default, mx, _grp, _ov) in enumerate(group_fields):
+            with cols[i % 3]:
+                current = int(base.get(key, default))
+                result[key] = st.number_input(
+                    label, min_value=0, max_value=int(mx), value=min(current, int(mx)), step=1,
+                    key=f"cr_{ver}_{key_prefix}_{key}",
+                )
+    return result
+
+
+def _cr_campaign_editor(cfg, name, ver):
+    camp = cfg["campaigns"][name]
+    kp = re.sub(r"\W+", "_", name)
+    global_weights = cfg["global"]["weights"]
+
+    with st.form(f"cr_form_{ver}_{kp}"):
+        st.markdown(f"### {name}")
+        c1, c2 = st.columns(2)
+        with c1:
+            name_kw = st.text_area(
+                "Campaign name keywords (one per line)",
+                value="\n".join(camp.get("name_keywords", [])), height=150,
+                help="If the campaign name from Ringba contains any of these words, this campaign's rules are used.",
+                key=f"cr_{ver}_{kp}_namekw")
+            priority = st.number_input(
+                "Match priority (lower = checked first)", min_value=1, max_value=999,
+                value=int(camp.get("match_priority", 100)), step=1, key=f"cr_{ver}_{kp}_prio",
+                help="Use this when two campaigns could match the same Ringba campaign name.")
+        with c2:
+            focus = st.text_area(
+                "Campaign focus (1-2 sentences for the AI analysis)",
+                value=camp.get("focus", ""), height=150, key=f"cr_{ver}_{kp}_focus")
+
+        qc_rules = st.text_area(
+            "QC note rules - what the summary must include and avoid for this campaign",
+            value=camp.get("qc_note_rules", ""), height=420, key=f"cr_{ver}_{kp}_qc",
+            help="These rules decide what goes into the call summary for this campaign.")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            service_kw = st.text_area(
+                "Service keywords (one per line)",
+                value="\n".join(camp.get("service_keywords", [])), height=200, key=f"cr_{ver}_{kp}_svc",
+                help="Words a caller says when they want THIS service. Used to catch wrong numbers "
+                     "(for example a rehab caller on a dumpster campaign). End a word with * to match "
+                     "any ending (rehab* = rehab, rehabilitation). Start a line with regex: for a raw pattern.")
+        with c4:
+            qual_kw = st.text_area(
+                "Qualification keywords (one per line)",
+                value="\n".join(camp.get("qual_keywords", [])), height=200, key=f"cr_{ver}_{kp}_qual",
+                help="Words that show the caller gave qualification information (insurance, size, budget, age...). "
+                     "Same format as service keywords.")
+
+        c5, c6 = st.columns(2)
+        with c5:
+            block_gov = st.checkbox(
+                "Government / state insurance is NOT qualified (blocks Qualified)",
+                value=bool(camp.get("block_government_insurance", False)), key=f"cr_{ver}_{kp}_gov")
+        with c6:
+            appt_cap = st.checkbox(
+                "Qualified calls without an appointment/booking cannot get the top score",
+                value=bool(camp.get("appointment_cap_enabled", True)), key=f"cr_{ver}_{kp}_appt")
+
+        st.markdown("#### Score settings for this campaign")
+        st.caption("Pre-filled with the current values. Only numbers you change are saved as this campaign's own; "
+                   "the rest keep following the global Scoring tab.")
+        values = _weight_inputs(cfg, ver, kp, None, only_overridable=True, camp_name=name)
+
+        submitted = st.form_submit_button("💾 Save campaign", type="primary")
+
+    if submitted:
+        camp["name_keywords"] = _lines(name_kw)
+        camp["match_priority"] = int(priority)
+        camp["focus"] = focus.strip()
+        camp["qc_note_rules"] = qc_rules.strip()
+        camp["service_keywords"] = _lines(service_kw)
+        camp["qual_keywords"] = _lines(qual_kw)
+        camp["block_government_insurance"] = bool(block_gov)
+        camp["appointment_cap_enabled"] = bool(appt_cap)
+        camp["score_overrides"] = {
+            k: int(v) for k, v in values.items() if int(v) != int(global_weights.get(k, DEFAULT_WEIGHTS[k]))
+        }
+        if _commit_qc_config(cfg, f"Saved campaign '{name}'"):
+            st.rerun()
+
+    b1, b2, b3 = st.columns([1, 1, 2])
+    with b1:
+        if st.button("📄 Duplicate", key=f"cr_dup_{ver}_{kp}"):
+            new_name, n = f"{name} (copy)", 2
+            while new_name.lower() in {x.lower() for x in cfg["campaigns"]}:
+                new_name, n = f"{name} (copy {n})", n + 1
+            cfg["campaigns"][new_name] = copy.deepcopy(camp)
+            cfg["campaigns"][new_name]["match_priority"] = 100
+            cfg["campaigns"][new_name]["name_keywords"] = []
+            if _commit_qc_config(cfg, f"Duplicated as '{new_name}'"):
+                st.session_state["cr_pending_choice"] = new_name
+                st.rerun()
+    with b2:
+        confirm = st.checkbox("Confirm delete", key=f"cr_delconfirm_{ver}_{kp}")
+    with b3:
+        if st.button("🗑 Delete campaign", key=f"cr_del_{ver}_{kp}"):
+            if len(cfg["campaigns"]) <= 1:
+                st.error("You need at least one campaign.")
+            elif not confirm:
+                st.warning("Tick 'Confirm delete' first.")
+            else:
+                del cfg["campaigns"][name]
+                if _commit_qc_config(cfg, f"Deleted campaign '{name}'"):
+                    st.rerun()
+
+
+def _cr_add_campaign(cfg, ver):
+    names = list(cfg["campaigns"].keys())
+    st.markdown("### Add a new campaign")
+    with st.form(f"cr_add_{ver}"):
+        new_name = st.text_input("Campaign name", placeholder="e.g. Solar Leads", key=f"cr_{ver}_new_name")
+        template = st.selectbox("Start from", ["Blank template"] + names, key=f"cr_{ver}_new_tpl",
+                                help="Copy an existing campaign's rules and edit them, or start blank.")
+        created = st.form_submit_button("➕ Create campaign", type="primary")
+    if created:
+        clean = new_name.strip()
+        if not clean:
+            st.error("Enter a campaign name.")
+        elif clean.lower() in {n.lower() for n in names}:
+            st.error("A campaign with this name already exists.")
+        else:
+            if template == "Blank template":
+                camp = _blank_campaign()
+                camp["qc_note_rules"] = cfg["global"].get("default_qc_questions", _BUILTIN_DEFAULT_QC)
+            else:
+                camp = copy.deepcopy(cfg["campaigns"][template])
+                camp["match_priority"] = 100
+            camp["name_keywords"] = [clean.lower()]
+            cfg["campaigns"][clean] = camp
+            if _commit_qc_config(cfg, f"Created campaign '{clean}'"):
+                st.session_state["cr_pending_choice"] = clean
+                st.rerun()
+    st.caption("After creating it, open it from the list above to set its QC note rules, keywords and scores.")
+
+
+def _cr_campaigns_tab(cfg, ver):
+    names = list(cfg["campaigns"].keys())
+    add_label = "➕ Add new campaign"
+    pending = st.session_state.pop("cr_pending_choice", None)
+    if pending in names:
+        st.session_state["cr_campaign_choice"] = pending
+    if st.session_state.get("cr_campaign_choice") not in names + [add_label]:
+        st.session_state["cr_campaign_choice"] = names[0]
+    choice = st.selectbox("Campaign to edit", names + [add_label], key="cr_campaign_choice")
+    if choice == add_label:
+        _cr_add_campaign(cfg, ver)
+    else:
+        _cr_campaign_editor(cfg, choice, ver)
+
+
+def _cr_simulator(cfg, ver):
+    st.markdown("#### 🧪 Score simulator (uses the saved settings)")
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        sim_campaign = st.selectbox("Campaign", list(cfg["campaigns"].keys()), key=f"sim_c_{ver}")
+        sim_type = st.selectbox("Call type", sorted(ALLOWED_CALL_TYPES), index=sorted(ALLOWED_CALL_TYPES).index("QUALIFIED"), key=f"sim_t_{ver}")
+        sim_status = st.selectbox("Qualification status", ["QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"], key=f"sim_s_{ver}")
+    with s2:
+        sim_service = st.checkbox("Service requested", value=True, key=f"sim_svc_{ver}")
+        sim_loc = st.checkbox("Location / eligibility", value=True, key=f"sim_loc_{ver}")
+        sim_qual = st.checkbox("Qualification info", value=True, key=f"sim_q_{ver}")
+        sim_out = st.checkbox("Clear outcome", value=True, key=f"sim_o_{ver}")
+    with s3:
+        sim_two = st.checkbox("Two-way conversation", value=True, key=f"sim_two_{ver}")
+        sim_appt = st.checkbox("Appointment / booking / transfer", value=False, key=f"sim_a_{ver}")
+        sim_issue = st.checkbox("QC issue", value=False, key=f"sim_i_{ver}")
+        sim_gov = st.checkbox("Caller has government insurance", value=False, key=f"sim_g_{ver}")
+        sim_novoice = st.checkbox("No voice in recording", value=False, key=f"sim_nv_{ver}")
+    analysis = {
+        "call_type": sim_type, "qualification_status": sim_status, "campaign_category": sim_campaign,
+        "service_requested": "service" if sim_service else "",
+        "location_or_eligibility_present": sim_loc, "qualification_info_present": sim_qual,
+        "clear_outcome": sim_out, "two_way_conversation": sim_two, "appointment_set": sim_appt,
+        "qc_issue": "issue" if sim_issue else "", "relevant_intent": True,
+        "spam_robot": sim_type == "SPAM / ROBOT", "spam_confidence": 95 if sim_type == "SPAM / ROBOT" else 0,
+        "no_voice": sim_novoice, "transcript_insurance_status": "YELLOW" if sim_gov else None,
+    }
+    score, items = _score_breakdown(analysis)
+    st.metric("Score", score)
+    st.caption(", ".join(items) if items else "No points")
+
+
+def _cr_scoring_tab(cfg, ver):
+    st.caption("These numbers apply to every campaign unless a campaign sets its own value "
+               "(Campaigns tab -> Score settings). Qualified and Non-qualified calls can score above 49; "
+               "every other call type is always kept under 50.")
+    with st.form(f"cr_scoring_{ver}"):
+        values = _weight_inputs(cfg, ver, "global", None, only_overridable=False)
+        submitted = st.form_submit_button("💾 Save scoring", type="primary")
+    if submitted:
+        cfg["global"]["weights"].update({k: int(v) for k, v in values.items()})
+        if _commit_qc_config(cfg, "Saved scoring"):
+            st.rerun()
+    st.divider()
+    _cr_simulator(cfg, ver)
+
+
+def _cr_spam_tab(cfg, ver):
+    g = cfg["global"]
+    with st.form(f"cr_spam_{ver}"):
+        st.markdown("#### Spam rules")
+        yelp = st.checkbox("Any mention of Yelp or Yellow Pages = spam", value=bool(g["spam"].get("yelp_yellow_is_spam", True)), key=f"cr_{ver}_yelp")
+        strict_yellow = st.checkbox("Even the single word \"yellow\" = spam", value=bool(g["spam"].get("strict_yellow_any", False)), key=f"cr_{ver}_yellow")
+        extra = st.text_area("Extra words that always mark a call as spam (one per line)", value="\n".join(g["spam"].get("extra_terms", [])), height=110, key=f"cr_{ver}_extra")
+
+        st.markdown("#### No voice")
+        v1, v2 = st.columns(2)
+        with v1:
+            min_words = st.number_input("Fewer words than this = no voice", min_value=1, max_value=20, value=int(g["voice"].get("no_voice_min_words", 3)), step=1, key=f"cr_{ver}_minwords")
+        with v2:
+            min_secs = st.number_input("Audio shorter than this (seconds) is not transcribed", min_value=0.0, max_value=30.0, value=float(g["voice"].get("min_audio_seconds", 1.0)), step=0.5, key=f"cr_{ver}_minsecs")
+
+        st.markdown("#### Insurance words")
+        i1, i2 = st.columns(2)
+        with i1:
+            gov = st.text_area("Government / state insurance words (one per line)", value="\n".join(g.get("government_terms", [])), height=200, key=f"cr_{ver}_gov")
+        with i2:
+            priv = st.text_area("Private / commercial insurance words (one per line)", value="\n".join(g.get("private_terms", [])), height=200, key=f"cr_{ver}_priv")
+
+        st.markdown("#### Summary style (all campaigns)")
+        style = st.text_area("Summary style rules", value=g.get("summary_style_rules", ""), height=320, key=f"cr_{ver}_style",
+                             help="Short-summary rules used for every campaign. Each campaign's own QC note rules are added after these.")
+        default_qc = st.text_area("QC note rules for campaigns with no rules of their own", value=g.get("default_qc_questions", ""), height=200, key=f"cr_{ver}_defqc")
+        submitted = st.form_submit_button("💾 Save", type="primary")
+    if submitted:
+        g["spam"].update({"yelp_yellow_is_spam": bool(yelp), "strict_yellow_any": bool(strict_yellow), "extra_terms": _lines(extra)})
+        g["voice"].update({"no_voice_min_words": int(min_words), "min_audio_seconds": float(min_secs)})
+        g["government_terms"] = _lines(gov)
+        g["private_terms"] = _lines(priv)
+        g["summary_style_rules"] = style.strip() or _BUILTIN_SUMMARY_STYLE
+        g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
+        if _commit_qc_config(cfg, "Saved spam / voice / insurance settings"):
+            st.rerun()
+
+
+def _cr_backup_tab(cfg, ver):
+    st.markdown("#### Download / import")
+    st.download_button("⬇️ Download settings (JSON)", data=json.dumps(cfg, indent=2, ensure_ascii=False),
+                       file_name="qc_config.json", mime="application/json", key=f"cr_dl_{ver}")
+    uploaded = st.file_uploader("Import settings from a JSON file", type=["json"], key=f"cr_up_{ver}")
+    if uploaded is not None and st.button("Import this file", key=f"cr_import_{ver}"):
+        try:
+            imported = _merge_config(json.loads(uploaded.getvalue().decode("utf-8")), _default_qc_config())
+        except Exception as exc:
+            st.error(f"Could not read the file: {exc}")
+        else:
+            if _commit_qc_config(imported, "Imported settings"):
+                st.rerun()
+
+    st.markdown("#### Undo / restore")
+    r1, r2 = st.columns(2)
+    with r1:
+        if st.button("↩️ Restore previous version", key=f"cr_prev_{ver}"):
+            if QC_CONFIG_PREVIOUS_PATH.exists():
+                try:
+                    previous = _merge_config(json.loads(QC_CONFIG_PREVIOUS_PATH.read_text(encoding="utf-8")), _default_qc_config())
+                except Exception as exc:
+                    st.error(f"Previous version unreadable: {exc}")
+                else:
+                    if _commit_qc_config(previous, "Restored previous version"):
+                        st.rerun()
+            else:
+                st.info("No previous version saved yet.")
+    with r2:
+        if st.button("☁️ Restore from Google Sheet backup", key=f"cr_sheet_{ver}"):
+            data = _load_qc_config_from_sheet()
+            if not data:
+                st.error("No backup found in the Google Sheet (or the sheet is not reachable).")
+            elif _commit_qc_config(_merge_config(data, _default_qc_config()), "Restored from Google Sheet"):
+                st.rerun()
+
+    st.markdown("#### Reset")
+    confirm = st.checkbox("I understand this replaces ALL campaigns and settings with the built-in defaults", key=f"cr_reset_ok_{ver}")
+    if st.button("⚠️ Reset everything to built-in defaults", key=f"cr_reset_{ver}"):
+        if not confirm:
+            st.warning("Tick the confirmation first.")
+        elif _commit_qc_config(_default_qc_config(), "Reset to built-in defaults"):
+            st.rerun()
+
+
+def render_campaign_rules_page(current_user):
+    if not current_user.get("is_admin"):
+        st.error("Access denied. Admin permissions required.")
+        st.stop()
+
+    render_html("""
+        <div class="page-title">
+            Campaign Rules &amp; Scoring
+            <span class="online" style="background: rgba(37,99,235,0.12); border-color: rgba(37,99,235,0.25); color: #2563eb;">● Editable</span>
+        </div>
+        <p class="subtitle">
+            Edit each campaign's QC note rules, keywords and scores, add new campaigns, and tune spam and voice settings.
+            Saved changes apply to the next call processed.
+        </p>
+    """)
+
+    flash = st.session_state.pop("cr_flash", None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+
+    cfg = copy.deepcopy(QC_CONFIG)
+    updated_at = cfg["meta"].get("updated_at") or ""
+    ver = re.sub(r"\W+", "", updated_at) or "0"
+    st.caption(
+        f"Last saved: {updated_at or 'never (using built-in defaults)'}"
+        + (f" by {cfg['meta'].get('updated_by')}" if cfg["meta"].get("updated_by") else "")
+    )
+
+    tabs = st.tabs(["📋 Campaigns", "🎯 Scoring", "🚫 Spam, Voice & Insurance", "💾 Backup & Reset"])
+    with tabs[0]:
+        _cr_campaigns_tab(cfg, ver)
+    with tabs[1]:
+        _cr_scoring_tab(cfg, ver)
+    with tabs[2]:
+        _cr_spam_tab(cfg, ver)
+    with tabs[3]:
+        _cr_backup_tab(cfg, ver)
 
 
 def sync_google_sheet_batch(default_campaign_name=""):
@@ -2474,6 +3278,10 @@ with st.sidebar:
             st.session_state.current_view = "admin"
             st.rerun()
 
+        if st.button("⚙️ &nbsp; Campaign Rules", use_container_width=True, type="primary" if st.session_state.current_view == "campaign_rules" else "secondary"):
+            st.session_state.current_view = "campaign_rules"
+            st.rerun()
+
     render_html("""
         <div class="sidebar-divider"></div>
         <div class="sidebar-label">Campaign</div>
@@ -2611,6 +3419,15 @@ if st.session_state.current_view == "admin":
                 else:
                     st.warning("Please fill out all fields.")
 
+    st.stop()
+
+
+# ============================================================
+# CAMPAIGN RULES VIEW (ADMIN)
+# ============================================================
+
+if st.session_state.current_view == "campaign_rules":
+    render_campaign_rules_page(current_user)
     st.stop()
 
 
