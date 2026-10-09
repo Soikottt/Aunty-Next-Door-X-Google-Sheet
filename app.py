@@ -854,7 +854,7 @@ RULES:
 - If the call is a wrong number, describe what they were trying to reach when clear.
 - If the call is silent/no-response, do not invent caller intent.
 - If spam/robot, describe what the call was promoting or asking the recipient to do.
-- Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
+- Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, Yelp mentioned, Yellow Page, Google business, Google Voice, insurance/debt marketing robots, and similar behavior.
 - If the caller mentions Yelp or Yellow Pages in any context, mark the call as spam.
 - A normal irrelevant or non-qualified caller is not automatically spam.
 - For Rehab, Medicaid/Medicare/state/government/marketplace/public insurance means NON-QUALIFIED. Treat private/commercial insurance as a positive qualification signal when clearly stated by the caller, including statements such as “private insurance,” “commercial insurance,” or insurance through the caller’s, parent’s, spouse’s, or another family member’s employer. PPO, HMO, EPO, and POS are also positive signals when clearly stated. Do not assume the provider or plan type if it is not stated.
@@ -1296,7 +1296,7 @@ MAIN TOPIC:
 - One short sentence, normally 5-25 words.
 - State what the caller was actually calling about.
 - If unrelated, describe what they actually wanted.
-- If spam/robot, describe the actual subject of the spam, such as a Google listing or SEO solicitation.
+- If spam/robot, describe the actual subject of the spam, such as a Google listing, Yelp mentioned, Yellow Page, Google business, Google Voice or SEO solicitation.
 
 LONG SUMMARY:
 - Write 2-8 short, natural sentences.
@@ -1312,8 +1312,9 @@ LONG SUMMARY:
 SPAM / ROBOT RULES:
 - Do NOT use exact phrase matching only.
 - Use semantic similarity, conversation behavior, repeated scripted language, press-0/press-9 instructions, automated promotional language, fake verification claims, marketing solicitations, synthetic/automated behavior, and known spam patterns together.
-- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, and repeated press-0/press-9 scripts.
+- Known reference patterns include Google listing/SEO solicitations, fake business verification, insurance sales robots, debt/loan marketing robots, Yelp mentioned, Yellow Page, Google business, Google Voice and repeated press-0/press-9 scripts.
 - Similar wording must be recognized even when the exact words differ.
+- Any type of yelp or yellow mention will be mark as spam.
 - A normal caller who is simply irrelevant or non-qualified is NOT automatically spam.
 - Set spam_robot=true only when the transcript gives strong evidence of an automated/spam call.
 - spam_confidence must reflect the strength of the evidence from 0-100.
