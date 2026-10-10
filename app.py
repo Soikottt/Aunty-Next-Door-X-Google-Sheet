@@ -756,18 +756,30 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def transcribe_groq_whisper(audio_file_path):
-    if not GROQ_API_KEY:
+    stt_keys = list(GROQ_API_KEYS) or ([GROQ_API_KEY] if GROQ_API_KEY else [])
+    if not stt_keys:
         raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
 
-    client = Groq(api_key=GROQ_API_KEY)
-
     with open(audio_file_path, "rb") as file:
-        transcription = client.audio.transcriptions.create(
-            file=(os.path.basename(audio_file_path), file.read()),
+        audio_bytes = file.read()
+    file_name = os.path.basename(audio_file_path)
+
+    def _transcribe(client, label):
+        return client.audio.transcriptions.create(
+            file=(file_name, audio_bytes),
             model="whisper-large-v3-turbo",
             response_format="verbose_json",
             language="en",
         )
+
+    # Uses the first key that still has quota; limit errors stop the run instead of looping.
+    transcription = _with_key_fallback(
+        _transcribe, "WHISPER", kind="stt", keys=stt_keys, timeout=GROQ_WHISPER_TIMEOUT_SEC
+    )
+    try:
+        record_stt_usage(getattr(transcription, "duration", None) or st.session_state.get("duration_sec") or 0)
+    except Exception:
+        pass
 
     timeline_data = []
     raw_text_segments = []
@@ -802,6 +814,37 @@ GROQ_SUMMARY_MODEL = "openai/gpt-oss-20b"
 # ============================================================
 
 SUMMARY_STYLE_RULES = """
+SUMMARY STYLE (long_summary and main_topic):
+- long_summary: ONE plain-text paragraph, 2-4 short sentences (about 35-80 words): why the caller called -> campaign-relevant details the caller clearly stated -> what the agent provided -> how the call ended.
+- Only clearly stated, campaign-relevant facts. No greetings, names, phone numbers, addresses, repeated facts, call-quality comments or guesses. Never write "not mentioned", "not provided", "unknown", "no clear resolution" or similar; if something is unclear, leave it out.
+- Spam/solicitation: say in 1-2 sentences what it promoted. Different service than the campaign: say what the caller wanted. Only one side spoke: say so in one short sentence. Nobody responded: "The call had dead air with no response from either side."
+- Plain text only: no bullets, markdown, asterisks or bold.
+- main_topic: ONE sentence, 5-18 words, the caller's real reason for calling.
+"""
+
+
+def compact_rules_text(text):
+    """Same rules, fewer tokens: drop bold markers, extra spaces and blank lines."""
+    out = str(text or "").replace("\r", "")
+    out = re.sub(r"\*\*|__", "", out)
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\n\s*\n+", "\n", out)
+    return out.strip()
+
+
+def build_summary_instructions(campaign_name):
+    """Style rules + the campaign-specific QC note rules (these decide what goes in the summary)."""
+    family = get_campaign_category(campaign_name) if campaign_name else campaign_name
+    qc_questions = compact_rules_text(get_qc_questions(family))
+    return (
+        SUMMARY_STYLE_RULES.rstrip()
+        + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
+        + qc_questions
+        + "\n"
+    )
+
+
+_OLD_SUMMARY_STYLE_V2 = """
 SUMMARY STYLE (applies to long_summary and main_topic):
 - long_summary = ONE short plain-text paragraph of 2 to 4 short sentences (about 35-80 words). Never more than 4 sentences.
 - Order: why the caller called -> only the campaign-relevant details the caller clearly stated -> what the agent actually provided or did -> how the call ended.
@@ -817,18 +860,6 @@ SUMMARY STYLE (applies to long_summary and main_topic):
 - Plain text only. No bullets, headings, markdown, asterisks, or bold, even if the QC questions below mention bold text.
 - main_topic = ONE sentence of 5-18 words stating the caller's real reason for calling. No filler.
 """
-
-
-def build_summary_instructions(campaign_name):
-    """Style rules + the campaign-specific QC questions (these decide what belongs in the summary)."""
-    family = get_campaign_category(campaign_name) if campaign_name else campaign_name
-    qc_questions = get_qc_questions(family)
-    return (
-        SUMMARY_STYLE_RULES
-        + "\nCAMPAIGN QC QUESTIONS (use them only to decide what belongs in the summary; never mention them):\n"
-        + qc_questions.strip()
-        + "\n"
-    )
 
 
 _BANNED_SUMMARY_RE = re.compile(
@@ -889,58 +920,48 @@ def clean_main_topic(text, max_words=25):
 
 
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
-    """Build a compact analysis prompt. Keep the transcript, but avoid sending
-    timestamps, speaker-label instructions, or the old long JSON schema."""
+    """Compact analysis prompt. Everything fixed comes FIRST and the transcript comes LAST, so Groq's
+    automatic prompt caching can reuse the fixed part (cached tokens do not count toward your limits)."""
     campaign_guidance = get_campaign_focus(campaign_name)
 
     service_categories = ", ".join(CAMPAIGN_QC_QUESTIONS.keys())
     summary_instructions = build_summary_instructions(campaign_name)
     yelp_rule = (
-        "- ANY mention of Yelp or Yellow Pages, in any context, means spam_robot=true, spam_confidence=99, call_type=SPAM / ROBOT."
+        "Any mention of Yelp or Yellow Pages, in any context = spam_robot true, spam_confidence 99, call_type SPAM / ROBOT."
         if SPAM_YELP_YELLOW_ENABLED
-        else "- A caller mentioning Yelp or Yellow Pages is not automatically spam."
+        else "Mentioning Yelp or Yellow Pages is not automatically spam."
     )
+    insurance_rule = ""
+    if campaign_flag(campaign_name, "block_government_insurance"):
+        insurance_rule = (
+            "\n- Medicaid/Medicare/state/government/marketplace/public insurance = NON-QUALIFIED. "
+            "Private/commercial insurance (including through the caller's or a family member's employer; PPO, HMO, EPO, POS) "
+            "is a positive signal only when the caller clearly states it. Never assume the plan type."
+        )
 
-    return f"""
-You are a pay-per-call call QC analyst. Analyze the complete transcript and return ONLY one valid JSON object.
+    return f"""You are a pay-per-call QC analyst. Analyze the complete transcript and return ONLY one valid JSON object.
+
+KEYS: long_summary, main_topic, call_type, qualification_status, caller_intent, why_called, service_requested, insurance, location, outcome, spam_robot, spam_confidence, qc_issue, spam_reason, qualification_reason, call_type_reason, detected_service_category, matches_campaign, appointment_set
+
+VALUES:
+- call_type: QUALIFIED | NON-QUALIFIED | WRONG NUMBER | SPAM / ROBOT | INFORMATION ONLY | SILENT / NO RESPONSE | OTHER
+- qualification_status: QUALIFIED | NON-QUALIFIED | NOT CLEAR
+- spam_robot true/false. spam_confidence 0-100. Unknown strings = "".
+- detected_service_category: the service the CALLER asked for, from the caller's own words (not the campaign). One of: {service_categories}, OTHER, UNCLEAR.
+- matches_campaign: true / false / "unclear". Is the caller's requested SERVICE TYPE this campaign's service? (Never about insurance or eligibility.)
+- appointment_set: true only if an appointment, booking, delivery, consultation or warm transfer was clearly confirmed.
+
+RULES:
+- Use only facts in the transcript; never guess. An agent's question is NOT the caller's answer: caller details (insurance, needs, location) must come from the caller.
+- call_type_reason: one short sentence (5-15 words). qualification_reason: brief. qc_issue: only a real, supported issue, else "".
+- Use QUALIFIED or NON-QUALIFIED ONLY when the caller wants this campaign's service. Information-only, unclear or off-campaign callers: INFORMATION ONLY, WRONG NUMBER or OTHER. A different service than the campaign: matches_campaign=false and call_type=WRONG NUMBER (say what they wanted).
+- Silent/no-response: do not invent intent. Spam/robot: say what it promoted.
+- Detect spam semantically: scripted/repeated language, press-0/press-9 prompts, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt robots. {yelp_rule}
+- A normal irrelevant or non-qualified caller is not automatically spam.{insurance_rule}
 
 CAMPAIGN: {campaign_name}
 CAMPAIGN FOCUS: {campaign_guidance}
-
-Return exactly these keys:
-long_summary, main_topic, call_type, qualification_status, caller_intent, why_called,
-service_requested, insurance, location, outcome, spam_robot, spam_confidence,
-qc_issue, spam_reason, qualification_reason, call_type_reason,
-detected_service_category, matches_campaign, appointment_set
-
-detected_service_category = the service the CALLER actually asked for, judged only from the caller's own words (NOT from the campaign name). Choose exactly one of: {service_categories}, OTHER, UNCLEAR.
-matches_campaign = true if the caller's requested service belongs to this campaign's service; false if the caller wanted a different service (example: campaign is Dumpster but the caller is asking about rehab/addiction treatment); "unclear" if the caller never said what they wanted. This is about SERVICE TYPE only, never about insurance or eligibility.
-appointment_set = true only if an appointment, booking, delivery, consultation, or warm transfer was clearly confirmed during the call; otherwise false.
-
-Allowed call_type values: QUALIFIED, NON-QUALIFIED, WRONG NUMBER, SPAM / ROBOT, INFORMATION ONLY, SILENT / NO RESPONSE, OTHER.
-Allowed qualification_status values: QUALIFIED, NON-QUALIFIED, NOT CLEAR.
-Use empty strings for unknown string values. spam_robot must be true/false. spam_confidence must be 0-100.
-
-RULES:
-- Use only facts supported by the transcript. Never guess or invent.
-- call_type_reason must be one short sentence (5-15 words) explaining why you chose that call_type, e.g. "Private insurance and seeking detox".
-- An agent's question is NOT the caller's answer. Insurance must come from the caller's own statement/response.
-- long_summary and main_topic MUST follow the SUMMARY STYLE and the campaign QC questions given after these rules. Keep them short and free of unnecessary detail.
-- If the caller is unrelated, explain what they actually wanted.
-- If the call is a wrong number, describe what they were trying to reach when clear.
-- If the call is silent/no-response, do not invent caller intent.
-- If spam/robot, describe what the call was promoting or asking the recipient to do.
-- Detect spam semantically: scripted/repeated language, press-0/press-9 instructions, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt marketing robots, and similar behavior.
-{yelp_rule}
-- A normal irrelevant or non-qualified caller is not automatically spam.
-- For Rehab, Medicaid/Medicare/state/government/marketplace/public insurance means NON-QUALIFIED. Treat private/commercial insurance as a positive qualification signal when clearly stated by the caller, including statements such as “private insurance,” “commercial insurance,” or insurance through the caller’s, parent’s, spouse’s, or another family member’s employer. PPO, HMO, EPO, and POS are also positive signals when clearly stated. Do not assume the provider or plan type if it is not stated.
-- qualification_reason should briefly explain why the qualification status was chosen.
-- qc_issue should contain only a real QC issue when supported; otherwise empty.
-- If the caller is asking for a different service than this campaign's service, set matches_campaign=false and call_type=WRONG NUMBER.
-- Use QUALIFIED or NON-QUALIFIED ONLY when the caller is asking for this campaign's service. Information-only, unclear, or off-campaign callers must use INFORMATION ONLY, WRONG NUMBER, or OTHER.
-
 {summary_instructions}
-
 TRANSCRIPT:
 {full_transcript}
 """
@@ -961,16 +982,300 @@ def _parse_json_object(content):
         raise
 
 
+# ============================================================
+# API LIMITS, TOKEN BUDGET & USAGE TRACKING
+# - counts the tokens that really count toward your Groq limits (cached tokens excluded)
+# - stops BEFORE the daily budget is used up (no wasted failed calls)
+# - remembers which keys are out of quota and skips them
+# - never retries rate-limit errors in a loop
+# ============================================================
+
+DEFAULT_API_SETTINGS = {
+    "daily_token_limit": 600000,    # total tokens per day across your Groq keys (0 = no limit check)
+    "token_reserve_pct": 5,         # keep this % unused as a safety margin
+    "max_transcript_tokens": 2500,  # longest transcript sent to the AI (start + end kept); 0 = no cap
+    "ai_min_words": 12,             # calls shorter than this with no service words are scored locally (0 = always use AI)
+    "skip_ai_for_spam": True,       # confirmed spam (Yelp etc.) is finished locally, zero tokens
+    "max_retry_attempts": 3,        # a row that keeps failing is parked after this many tries
+    "sheet_write_interval": 1.2,    # seconds between Google Sheet writes (keeps you under the 60/min limit)
+}
+
+USAGE_PATH = Path("api_usage.json")
+GROQ_TIMEOUT_SEC = 60
+GROQ_WHISPER_TIMEOUT_SEC = 120
+MAX_RATE_WAIT_SEC = 60
+_USAGE_LOCK = threading.Lock()
+
+
+class GroqLimitReached(Exception):
+    """Daily/minute quota or the app's own token budget is used up. Stop and try later."""
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class TokenBudgetReached(GroqLimitReached):
+    pass
+
+
+def get_api_settings():
+    saved = (((globals().get("QC_CONFIG") or {}).get("global") or {}).get("api")) or {}
+    settings = dict(DEFAULT_API_SETTINGS)
+    settings.update({k: v for k, v in saved.items() if k in settings})
+    return settings
+
+
+def _utc_now():
+    return datetime.utcnow()
+
+
+def _utc_day():
+    return _utc_now().strftime("%Y-%m-%d")
+
+
+def _seconds_to_utc_midnight():
+    now = _utc_now()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(60, int((tomorrow - now).total_seconds()))
+
+
+def _fresh_usage(day):
+    return {"day": day, "counted_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "llm_calls": 0,
+            "audio_seconds": 0.0, "stt_calls": 0, "by_key": {}, "exhausted": {}}
+
+
+def load_usage():
+    with _USAGE_LOCK:
+        data = None
+        try:
+            data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        today = _utc_day()
+        if not isinstance(data, dict) or data.get("day") != today:
+            data = _fresh_usage(today)
+        for key, value in _fresh_usage(today).items():
+            data.setdefault(key, value)
+        return data
+
+
+def _save_usage(data):
+    with _USAGE_LOCK:
+        try:
+            tmp = USAGE_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(USAGE_PATH)
+        except Exception:
+            pass
+
+
+def _key_index_from_label(label):
+    match = re.search(r"KEY (\d+)", str(label or ""))
+    return int(match.group(1)) if match else 0
+
+
+def record_llm_usage(key_index, total_tokens, cached_tokens=0):
+    """Tokens that count toward the limit = total - cached."""
+    data = load_usage()
+    total_tokens = int(total_tokens or 0)
+    cached_tokens = int(cached_tokens or 0)
+    counted = max(0, total_tokens - cached_tokens)
+    data["counted_tokens"] += counted
+    data["total_tokens"] += total_tokens
+    data["cached_tokens"] += cached_tokens
+    data["llm_calls"] += 1
+    by_key = data["by_key"]
+    by_key[str(key_index)] = int(by_key.get(str(key_index), 0)) + counted
+    _save_usage(data)
+
+
+def record_stt_usage(seconds):
+    data = load_usage()
+    data["audio_seconds"] = float(data.get("audio_seconds", 0.0)) + float(seconds or 0)
+    data["stt_calls"] = int(data.get("stt_calls", 0)) + 1
+    _save_usage(data)
+
+
+def mark_key_exhausted(kind, key_index, wait_seconds=None):
+    data = load_usage()
+    seconds = int(wait_seconds) if wait_seconds else _seconds_to_utc_midnight()
+    until = _utc_now() + timedelta(seconds=max(30, seconds))
+    data["exhausted"][f"{kind}{key_index}"] = until.strftime("%Y-%m-%dT%H:%M:%S")
+    _save_usage(data)
+
+
+def is_key_exhausted(kind, key_index):
+    data = load_usage()
+    stamp = (data.get("exhausted") or {}).get(f"{kind}{key_index}")
+    if not stamp:
+        return False
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S") > _utc_now()
+    except ValueError:
+        return False
+
+
+def get_token_budget_status():
+    settings = get_api_settings()
+    usage = load_usage()
+    limit = int(settings["daily_token_limit"])
+    usable = int(limit * (1 - float(settings["token_reserve_pct"]) / 100.0)) if limit > 0 else 0
+    used = int(usage["counted_tokens"])
+    return {
+        "limit": limit, "usable": usable, "used": used,
+        "remaining": max(0, usable - used) if limit > 0 else None,
+        "cached": int(usage["cached_tokens"]), "total": int(usage["total_tokens"]),
+        "calls": int(usage["llm_calls"]), "audio_seconds": float(usage["audio_seconds"]),
+        "stt_calls": int(usage["stt_calls"]), "exhausted": usage.get("exhausted") or {},
+    }
+
+
+def ensure_token_budget(estimated_next=0):
+    """Stop BEFORE spending tokens that would push the day over the budget."""
+    status = get_token_budget_status()
+    if status["limit"] <= 0:
+        return
+    if status["used"] + int(estimated_next) > status["usable"]:
+        raise TokenBudgetReached(
+            f"Daily token budget reached ({status['used']:,} of {status['limit']:,} tokens used). "
+            "It resets at 00:00 UTC, or raise the limit in Campaign Rules -> Spam, Voice & Insurance.",
+            retry_after=_seconds_to_utc_midnight(),
+        )
+
+
+def reset_usage_today():
+    _save_usage(_fresh_usage(_utc_day()))
+
+
+# ---- error handling ----
+def _parse_retry_seconds(text):
+    match = re.search(r"try again in\s*(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:(\d+(?:\.\d+)?)s)?", str(text or ""), re.I)
+    if match and any(match.groups()):
+        hours, minutes, seconds = (float(x) if x else 0.0 for x in match.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    match = re.search(r"try again in\s*(\d+(?:\.\d+)?)\s*ms", str(text or ""), re.I)
+    if match:
+        return float(match.group(1)) / 1000.0
+    return None
+
+
+def _classify_groq_error(exc):
+    """-> (kind, wait_seconds). kind: daily_limit | minute_limit | too_large | transient | bad_output | other"""
+    name = type(exc).__name__
+    text = str(exc).lower()
+    if isinstance(exc, ValueError):          # includes json.JSONDecodeError (model output not valid JSON)
+        return "bad_output", None
+    wait = _parse_retry_seconds(text)
+    if "413" in text or "request too large" in text or "too large" in text:
+        return "too_large", None
+    is_limit = (
+        name == "RateLimitError" or "429" in text or "rate limit" in text or "rate_limit" in text
+        or "tokens per" in text or "requests per" in text or "seconds per" in text
+    )
+    if is_limit:
+        daily = any(k in text for k in ("per day", "(tpd)", "(rpd)", "(asd)", "daily"))
+        return ("daily_limit" if daily else "minute_limit"), wait
+    if (name in {"APITimeoutError", "APIConnectionError", "InternalServerError"}
+            or any(k in text for k in ("timed out", "timeout", "connection", "502", "503", "504", "500", "overloaded"))):
+        return "transient", None
+    return "other", None
+
+
+def _groq_client(key, timeout=None):
+    # max_retries=0: the SDK's hidden automatic retries would resend the whole request; we control retries.
+    return Groq(api_key=key, timeout=timeout or GROQ_TIMEOUT_SEC, max_retries=0)
+
+
+def _with_key_fallback(call_fn, label, estimated_tokens=0, kind="llm", keys=None, timeout=None):
+    """Run call_fn(client, label) on the first Groq key that still has quota.
+
+    - checks the daily token budget first (kind="llm")
+    - skips keys already known to be out of quota (and remembers new ones)
+    - waits a few seconds and retries ONCE on a per-minute limit
+    - raises GroqLimitReached when every key is limited, so the caller stops instead of looping
+    """
+    key_list = list(keys if keys is not None else GROQ_API_KEYS)
+    if not key_list:
+        raise RuntimeError("No Groq API keys are configured.")
+    if kind == "llm":
+        ensure_token_budget(estimated_tokens)
+
+    candidates = [(i, k) for i, k in enumerate(key_list, start=1) if not is_key_exhausted(kind, i)]
+    if not candidates:
+        raise GroqLimitReached("All Groq keys have reached their daily limit. Try again later.",
+                               retry_after=_seconds_to_utc_midnight())
+
+    errors, limit_hits, longest_wait = [], 0, None
+    for i, key in candidates:
+        for attempt in range(2):
+            try:
+                return call_fn(_groq_client(key, timeout), f"{label} KEY {i}")
+            except Exception as exc:
+                error_kind, wait = _classify_groq_error(exc)
+                errors.append(f"Key {i}: {exc}")
+                if error_kind == "too_large":
+                    raise RuntimeError(f"Request too large for Groq (413): {exc}")
+                if error_kind == "bad_output":
+                    raise RuntimeError(f"AI returned an unreadable answer: {exc}")
+                if error_kind == "minute_limit" and attempt == 0 and (wait is None or wait <= MAX_RATE_WAIT_SEC):
+                    time.sleep((wait or 5.0) + 0.5)
+                    continue
+                if error_kind in ("minute_limit", "daily_limit"):
+                    limit_hits += 1
+                    longest_wait = max(longest_wait or 0, wait or 0) or None
+                    if error_kind == "daily_limit":
+                        mark_key_exhausted(kind, i, wait)
+                    break
+                if error_kind == "transient" and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+
+    if limit_hits and limit_hits == len(candidates):
+        raise GroqLimitReached("Groq limit reached on every key: " + " | ".join(errors)[:300], retry_after=longest_wait)
+    raise RuntimeError("All Groq accounts failed. " + " | ".join(errors))
+
+
 def _log_groq_token_usage(response, label="GROQ"):
     usage = getattr(response, "usage", None)
     if not usage:
         return
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = 0
+    if details:
+        cached = details.get("cached_tokens", 0) if isinstance(details, dict) else getattr(details, "cached_tokens", 0)
+    total = getattr(usage, "total_tokens", 0) or 0
+    record_llm_usage(_key_index_from_label(label), total, cached or 0)
     print("========== GROQ TOKEN USAGE ==========")
     print(f"Request:      {label}")
-    print(f"Input tokens:  {getattr(usage, 'prompt_tokens', 0)}")
+    print(f"Input tokens:  {getattr(usage, 'prompt_tokens', 0)} (cached: {cached or 0})")
     print(f"Output tokens: {getattr(usage, 'completion_tokens', 0)}")
-    print(f"Total tokens:  {getattr(usage, 'total_tokens', 0)}")
+    print(f"Total tokens:  {total}")
     print("======================================")
+
+
+def render_api_usage_meter():
+    """Small usage panel for the sidebar."""
+    status = get_token_budget_status()
+    with st.expander("📊 API usage today (UTC)", expanded=False):
+        if status["limit"] > 0:
+            fraction = min(1.0, status["used"] / max(status["limit"], 1))
+            text = f"Tokens: {status['used']:,} / {status['limit']:,}"
+            try:
+                st.progress(fraction, text=text)
+            except TypeError:
+                st.progress(fraction)
+                st.caption(text)
+        else:
+            st.caption(f"Tokens used: {status['used']:,} (no daily limit set)")
+        cached_pct = int(round(100 * status["cached"] / status["total"])) if status["total"] else 0
+        st.caption(
+            f"AI calls: {status['calls']} · cached tokens: {status['cached']:,} ({cached_pct}%) · "
+            f"Whisper audio: {status['audio_seconds'] / 60:.0f} min ({status['stt_calls']} calls)"
+        )
+        blocked = [k for k in status["exhausted"] if is_key_exhausted(k.rstrip("0123456789"), int(re.sub(r"\D", "", k) or 0))]
+        if blocked:
+            st.caption("Keys at their limit: " + ", ".join(blocked))
 
 
 def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
@@ -1364,11 +1669,15 @@ TPM_TARGET = 7400
 ANALYSIS_MAX_OUT = 900      # same as max_tokens in _call_structured_analysis
 CHARS_PER_TOKEN = 3.5       # conservative estimate, no extra library needed
 
+
 def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
-    """Return the transcript unchanged if it fits; otherwise keep start + end."""
+    """Return the transcript unchanged if it fits; otherwise keep start + end.
+    The cap is the smaller of the per-minute limit and 'max_transcript_tokens' (settings)."""
     overhead_chars = len(_analysis_prompt("", campaign_name, timeline_data)) + 100
-    budget_tokens = TPM_TARGET - ANALYSIS_MAX_OUT - int(overhead_chars / CHARS_PER_TOKEN)
-    max_chars = int(budget_tokens * CHARS_PER_TOKEN)
+    tpm_budget = TPM_TARGET - ANALYSIS_MAX_OUT - int(overhead_chars / CHARS_PER_TOKEN)
+    cap = int(get_api_settings().get("max_transcript_tokens") or 0)
+    budget_tokens = min(tpm_budget, cap) if cap > 0 else tpm_budget
+    max_chars = int(max(budget_tokens, 300) * CHARS_PER_TOKEN)
 
     if len(transcript) <= max_chars:
         return transcript  # short call: untouched
@@ -1377,33 +1686,107 @@ def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
     tail = max_chars - head
     return transcript[:head] + " ... [middle of call omitted] ... " + transcript[-tail:]
 
-def _with_key_fallback(call_fn, label):
-    """Try each configured Groq key in order until one succeeds."""
-    if not GROQ_API_KEYS:
-        raise RuntimeError("No Groq API keys are configured.")
-    errors = []
-    for i, key in enumerate(GROQ_API_KEYS, start=1):
-        try:
-            return call_fn(Groq(api_key=key), f"{label} KEY {i}")
-        except Exception as exc:
-            errors.append(f"Key {i}: {exc}")
-            if "413" in str(exc):
-                break  # request too large: every key would fail the same way
-    raise RuntimeError("All Groq accounts failed. " + " | ".join(errors))
+
+def build_spam_analysis(full_transcript, campaign_name, confidence, reason, label):
+    """Confirmed spam (Yelp, Yellow Pages, robot scripts...) is finished locally: zero AI tokens."""
+    reason_clean = re.sub(r"\s*\(.*?\)", "", str(reason or "")).strip().rstrip(".")
+    opening = " ".join(str(full_transcript or "").split()[:22])
+    if label in ("Yelp", "Yellow Pages"):
+        topic = f"Spam call mentioning {label}"
+    else:
+        topic = f"Spam / solicitation call ({label})" if label else "Spam / solicitation call"
+    analysis = {
+        "long_summary": f"Spam / solicitation call. {reason_clean}. The recording starts with: \"{opening}\".",
+        "main_topic": topic,
+        "call_type": "SPAM / ROBOT",
+        "qualification_status": "NOT CLEAR",
+        "caller_intent": "", "why_called": "", "service_requested": "", "insurance": "",
+        "location": "", "outcome": "",
+        "spam_robot": True,
+        "spam_confidence": int(confidence),
+        "qc_issue": f"{label or 'Spam'} spam / solicitation call",
+        "spam_reason": reason_clean,
+        "qualification_reason": "",
+        "call_type_reason": reason_clean[:120],
+        "detected_service_category": "UNCLEAR",
+        "matches_campaign": None,
+        "appointment_set": False,
+        "ai_skipped": "spam",
+        "campaign_category": campaign_name,
+    }
+    return analysis
+
+
+def build_short_call_analysis(full_transcript, campaign_name):
+    """Very short call with no service words: scored locally (under 50), zero AI tokens."""
+    text = " ".join(str(full_transcript or "").split())
+    analysis = {
+        "long_summary": f"Very short call with no clear request. The recording says: \"{text}\".",
+        "main_topic": "Very short call, no clear request",
+        "call_type": "OTHER",
+        "qualification_status": "NOT CLEAR",
+        "caller_intent": "", "why_called": "", "service_requested": "", "insurance": "",
+        "location": "", "outcome": "",
+        "spam_robot": False, "spam_confidence": 0,
+        "qc_issue": "",
+        "spam_reason": "", "qualification_reason": "",
+        "call_type_reason": "Very short call with no clear request",
+        "detected_service_category": "UNCLEAR",
+        "matches_campaign": None,
+        "appointment_set": False,
+        "ai_skipped": "short",
+        "campaign_category": campaign_name,
+    }
+    return analysis
+
+
+def plan_call_analysis(full_transcript, campaign_name):
+    """Decide how a call is analysed BEFORE spending any tokens.
+    -> ("no_voice" | "spam" | "short" | "ai", info)"""
+    if is_no_voice_transcript(full_transcript):
+        return "no_voice", {}
+
+    settings = get_api_settings()
+    if settings.get("skip_ai_for_spam", True):
+        confidence, reason, label = detect_spam_signals(full_transcript)
+        if confidence >= 90:
+            return "spam", {"confidence": confidence, "reason": reason, "label": label}
+
+    min_words = int(settings.get("ai_min_words") or 0)
+    if min_words > 0:
+        words = len(re.findall(r"[A-Za-z0-9']+", str(full_transcript or "")))
+        if words < min_words:
+            family = get_campaign_family(campaign_name)
+            hits = score_transcript_families(full_transcript).get(family, 0) if family else 0
+            if hits == 0:
+                return "short", {"words": words}
+
+    return "ai", {}
+
 
 def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=None):
-    # No text in the recording -> "No Voice" (fixed score). No AI tokens are spent.
-    if is_no_voice_transcript(full_transcript):
+    mode, info = plan_call_analysis(full_transcript, campaign_name)
+
+    # Zero-token paths.
+    if mode == "no_voice":
         return build_no_voice_analysis(campaign_name)
+    if mode == "spam":
+        analysis = build_spam_analysis(full_transcript, campaign_name, info["confidence"], info["reason"], info["label"])
+        return _derive_analysis_flags(analysis, full_transcript, timeline_data, campaign_name)
+    if mode == "short":
+        analysis = build_short_call_analysis(full_transcript, campaign_name)
+        return _derive_analysis_flags(analysis, full_transcript, timeline_data, campaign_name)
 
     if not GROQ_API_KEYS:
         raise RuntimeError("No Groq API keys are configured.")
 
     ai_transcript = _trim_for_token_limit(full_transcript, campaign_name, timeline_data)
     prompt = _analysis_prompt(ai_transcript, campaign_name, timeline_data)
+    estimated_tokens = int(len(prompt) / CHARS_PER_TOKEN) + 450
 
     analysis = _with_key_fallback(
-        lambda c, lbl: _call_structured_analysis(c, prompt, lbl), "ANALYSIS"
+        lambda c, lbl: _call_structured_analysis(c, prompt, lbl), "ANALYSIS",
+        estimated_tokens=estimated_tokens,
     )
 
     # Rules below run on the FULL transcript (not the trimmed AI copy and not the summary).
@@ -2166,9 +2549,10 @@ def get_score_color(score, analysis):
 def apply_row_score_color(worksheet, row_number, score, analysis, special_columns=None):
     """Apply the final score color to the ENTIRE A:L row. Score is authoritative."""
     color = get_score_color(score, analysis)
-    worksheet.format(
+    _sheet_write(
+        worksheet.format,
         f"A{row_number}:L{row_number}",
-        {"backgroundColor": color}
+        {"backgroundColor": color},
     )
 
 
@@ -2372,6 +2756,7 @@ def _default_qc_config():
             "weights": dict(DEFAULT_WEIGHTS),
             "spam": {"yelp_yellow_is_spam": True, "strict_yellow_any": False, "extra_terms": []},
             "voice": {"no_voice_min_words": 3, "min_audio_seconds": 1.0},
+            "api": dict(DEFAULT_API_SETTINGS),
             "government_terms": list(_BUILTIN_GOV_TERMS),
             "private_terms": list(_BUILTIN_PRIVATE_TERMS),
             "summary_style_rules": _BUILTIN_SUMMARY_STYLE,
@@ -2388,10 +2773,13 @@ def _merge_config(saved, defaults):
         return cfg
     cfg["meta"].update(saved.get("meta") or {})
     for key, value in (saved.get("global") or {}).items():
-        if key in ("weights", "spam", "voice") and isinstance(value, dict):
+        if key in ("weights", "spam", "voice", "api") and isinstance(value, dict):
             cfg["global"][key].update(value)
         else:
             cfg["global"][key] = value
+    # Older saved settings still hold the previous (longer) summary style text: use the compact one.
+    if str(cfg["global"].get("summary_style_rules", "")).strip() == _OLD_SUMMARY_STYLE_V2.strip():
+        cfg["global"]["summary_style_rules"] = _BUILTIN_SUMMARY_STYLE
     if isinstance(saved.get("campaigns"), dict) and saved["campaigns"]:
         cfg["campaigns"] = {}
         for name, camp in saved["campaigns"].items():
@@ -2878,6 +3266,20 @@ def _cr_spam_tab(cfg, ver):
         with i2:
             priv = st.text_area("Private / commercial insurance words (one per line)", value="\n".join(g.get("private_terms", [])), height=200, key=f"cr_{ver}_priv")
 
+        st.markdown("#### API & token limits")
+        api = {**DEFAULT_API_SETTINGS, **(g.get("api") or {})}
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            api_token_limit = st.number_input("Daily token limit, all keys (0 = no check)", min_value=0, max_value=50000000, value=int(api["daily_token_limit"]), step=10000, key=f"cr_{ver}_api_limit")
+            api_reserve = st.number_input("Safety reserve (%)", min_value=0, max_value=50, value=int(api["token_reserve_pct"]), step=1, key=f"cr_{ver}_api_reserve")
+        with a2:
+            api_max_tx = st.number_input("Longest transcript sent to AI (tokens, 0 = no cap)", min_value=0, max_value=20000, value=int(api["max_transcript_tokens"]), step=100, key=f"cr_{ver}_api_maxtx")
+            api_min_words = st.number_input("Skip the AI for calls under this many words with no service words (0 = off)", min_value=0, max_value=100, value=int(api["ai_min_words"]), step=1, key=f"cr_{ver}_api_minwords")
+        with a3:
+            api_attempts = st.number_input("Max attempts for a failing row", min_value=1, max_value=10, value=int(api["max_retry_attempts"]), step=1, key=f"cr_{ver}_api_attempts")
+            api_interval = st.number_input("Seconds between Google Sheet writes", min_value=0.0, max_value=10.0, value=float(api["sheet_write_interval"]), step=0.1, key=f"cr_{ver}_api_interval")
+        api_skip_spam = st.checkbox("Finish confirmed spam calls locally (no AI tokens)", value=bool(api["skip_ai_for_spam"]), key=f"cr_{ver}_api_spam")
+
         st.markdown("#### Summary style (all campaigns)")
         style = st.text_area("Summary style rules", value=g.get("summary_style_rules", ""), height=320, key=f"cr_{ver}_style",
                              help="Short-summary rules used for every campaign. Each campaign's own QC note rules are added after these.")
@@ -2886,12 +3288,27 @@ def _cr_spam_tab(cfg, ver):
     if submitted:
         g["spam"].update({"yelp_yellow_is_spam": bool(yelp), "strict_yellow_any": bool(strict_yellow), "extra_terms": _lines(extra)})
         g["voice"].update({"no_voice_min_words": int(min_words), "min_audio_seconds": float(min_secs)})
+        g["api"] = {
+            "daily_token_limit": int(api_token_limit), "token_reserve_pct": int(api_reserve),
+            "max_transcript_tokens": int(api_max_tx), "ai_min_words": int(api_min_words),
+            "skip_ai_for_spam": bool(api_skip_spam), "max_retry_attempts": int(api_attempts),
+            "sheet_write_interval": float(api_interval),
+        }
         g["government_terms"] = _lines(gov)
         g["private_terms"] = _lines(priv)
         g["summary_style_rules"] = style.strip() or _BUILTIN_SUMMARY_STYLE
         g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
         if _commit_qc_config(cfg, "Saved spam / voice / insurance settings"):
             st.rerun()
+
+    st.markdown("#### Today's token counter")
+    usage_status = get_token_budget_status()
+    st.caption(f"Counted today (UTC): {usage_status['used']:,} tokens · {usage_status['calls']} AI calls · "
+               f"{usage_status['cached']:,} cached tokens (cached tokens do not count toward Groq limits).")
+    if st.button("🔄 Reset today's token counter", key=f"cr_reset_usage_{ver}"):
+        reset_usage_today()
+        _flash("success", "Today's token counter was reset.")
+        st.rerun()
 
 
 def _cr_backup_tab(cfg, ver):
@@ -3025,9 +3442,42 @@ def _row_work_state(recording_url, existing_main_topic):
     return "skip"
 
 
+_LAST_SHEET_WRITE = [0.0]
+
+
+def _is_retryable_sheet_error(exc):
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    text = str(exc).lower()
+    return status in (429, 500, 502, 503) or any(
+        k in text for k in ("429", "quota exceeded", "ratelimitexceeded", "rate limit", "[503]", "[500]", "timed out")
+    )
+
+
+def _sheet_write(fn, *args, **kwargs):
+    """Google Sheets call with a minimum gap between writes (stays under 60 writes/min) and
+    automatic back-off + retry on 429/5xx errors."""
+    interval = float(get_api_settings().get("sheet_write_interval") or 0)
+    delays = [3, 6, 12, 24]
+    for attempt in range(len(delays) + 1):
+        wait = interval - (time.time() - _LAST_SHEET_WRITE[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            result = fn(*args, **kwargs)
+            _LAST_SHEET_WRITE[0] = time.time()
+            return result
+        except Exception as exc:
+            _LAST_SHEET_WRITE[0] = time.time()
+            if attempt < len(delays) and _is_retryable_sheet_error(exc):
+                time.sleep(delays[attempt])
+                continue
+            raise
+
+
 def _write_row_cells(worksheet, row_number, g, h, k, l):
     """Write G:H and K:L of one row in a single API call (H = done flag, so it is written with the rest)."""
-    worksheet.batch_update(
+    _sheet_write(
+        worksheet.batch_update,
         [
             {"range": f"G{row_number}:H{row_number}", "values": [[g, h]]},
             {"range": f"K{row_number}:L{row_number}", "values": [[k, l]]},
@@ -3102,6 +3552,9 @@ def make_sync_progress_callback(container):
             log.append(f"Row {event.get('row')}: error - {str(event.get('message', ''))[:90]}")
             set_bar(position / max(total, 1), f"{position} of {total} rows done")
             draw(f"Row {event.get('row')} failed", str(event.get("message", ""))[:160], event.get("columns", {}))
+        elif kind == "limit":
+            log.append(f"Stopped: {str(event.get('message', ''))[:110]}")
+            draw("Stopped - limit reached", str(event.get("message", ""))[:220], {})
         elif kind == "finished":
             if total:
                 set_bar(1.0, f"Finished: {event.get('processed', 0)} of {total} rows processed")
@@ -3112,23 +3565,61 @@ def make_sync_progress_callback(container):
 
 
 def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
-    """Process Ringba recordings from the shared Google Sheet with rate-limiting and timeouts."""
+    """Process Ringba recordings from the shared Google Sheet.
+
+    Sheet layout:
+    D = Campaign
+    G = Long AI Summary
+    H = Main Topic / processing flag
+    I = Recording URL
+    J = Existing carrier / VOIP data (untouched)
+    K = AI QC Report
+    L = Numeric quality score
+
+    While a row is being worked on, G/H/K/L show progress icons (see _SYNC_ICONS).
+    H is written LAST with the real topic, so a row only counts as finished when it is complete.
+
+    Saves API calls and tokens:
+    - rows already done are skipped with no API call; durations are formatted in ONE batch call
+    - no-voice, spam and very short calls are finished locally (no AI tokens)
+    - progress icons are only written for rows that really take time
+    - a failing row is retried only up to 'max_retry_attempts' times, then parked
+    - when a Groq limit or the daily token budget is hit, the run stops cleanly (no error rows)
+    """
     def emit(**kwargs):
         if progress_callback:
             try:
                 progress_callback(kwargs)
             except Exception:
-                pass
+                pass      # a display problem must never stop the processing
 
     try:
         gc = get_google_client()
         sheet = gc.open("Ringba to Sheet QC")
         worksheet = sheet.worksheet("Sheet1")
 
-        rows = worksheet.get_all_values()
+        rows = _sheet_write(worksheet.get_all_values)
+        max_attempts = max(1, int(get_api_settings().get("max_retry_attempts") or 3))
         processed_count = 0
         busy_count = 0
         position = 0
+        stop_message = ""
+
+        # Keep the existing duration formatting behavior, but in ONE batch call.
+        duration_updates = []
+        for index, row in enumerate(rows[1:], start=2):
+            raw_duration = row[5].strip() if len(row) > 5 else ""
+            if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
+                try:
+                    duration_updates.append({"range": f"F{index}", "values": [[format_seconds_to_hms(raw_duration)]]})
+                except Exception:
+                    pass
+        for start in range(0, len(duration_updates), 200):
+            try:
+                _sheet_write(worksheet.batch_update, duration_updates[start:start + 200],
+                             value_input_option="USER_ENTERED")
+            except Exception:
+                pass
 
         total_pending = sum(
             1 for row in rows[1:]
@@ -3141,17 +3632,11 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
 
         for index, row in enumerate(rows[1:], start=2):
             raw_campaign = row[3].strip() if len(row) > 3 else ""
-            raw_duration = row[5].strip() if len(row) > 5 else ""
+            existing_g = row[6].strip() if len(row) > 6 else ""
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
 
-            if raw_duration and ":" not in raw_duration and "[" not in raw_duration:
-                try:
-                    worksheet.update_cell(index, 6, format_seconds_to_hms(raw_duration))
-                    time.sleep(0.3)
-                except Exception:
-                    pass
-
+            # Trigger: recording exists + H is empty (or holds an old, dead progress marker).
             work_state = _row_work_state(recording_url, existing_main_topic)
             if work_state == "busy":
                 busy_count += 1
@@ -3159,9 +3644,15 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             if work_state != "process":
                 continue
 
+            previous_attempts = 0
+            attempt_match = re.search(r"attempt (\d+)/", existing_g)
+            if attempt_match:
+                previous_attempts = int(attempt_match.group(1))
+
             position += 1
             marker = f"🔄 Processing since {_progress_stamp()}"
             campaign_to_use = "General Customer Inquiry"
+            marker_written = False
             row_finished = False
 
             try:
@@ -3169,45 +3660,41 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 if not campaign_to_use:
                     campaign_to_use = "General Customer Inquiry"
 
-                # ---- Step 1: download + transcribe with safety timeout ----
+                # ---- Step 1: download + transcribe ----
                 emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
-                     label="Downloading and transcribing the recording",
+                     label="Downloading the recording",
                      columns={"G": "working", "H": "working", "K": "waiting", "L": "waiting"})
-                _write_row_cells(worksheet, index, "🔄 Transcribing audio…", marker, "⏳ Waiting", "⏳")
+                load_audio_url(recording_url)
 
-                # Safe download with timeout constraint to prevent hanging
-                url = recording_url.strip()
-                filename = url.split("/")[-1].split("?")[0] or "web_audio.mp3"
-                ext = Path(filename).suffix.lower()
-                safe_name = f"{uuid.uuid4().hex}{ext if ext in {'.mp3', '.wav'} else '.mp3'}"
-                path = UPLOAD_DIR / safe_name
-
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    with open(path, "wb") as out_file:
-                        out_file.write(response.read())
-
-                sound = AudioSegment.from_file(path)
-                duration_sec = len(sound) / 1000.0
-
-                st.session_state.source_name = filename
-                st.session_state.file_path = str(path)
-                st.session_state.duration_sec = duration_sec
-
+                # Very short audio is not sent to Whisper: it becomes "No Voice" (score 30).
                 timeline_data, raw_text_segments = [], []
-                if duration_sec >= MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION:
+                if (st.session_state.get("duration_sec") or 0) >= MIN_AUDIO_SECONDS_FOR_TRANSCRIPTION:
+                    emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                         label="Transcribing the audio",
+                         columns={"G": "working", "H": "working", "K": "waiting", "L": "waiting"})
+                    _write_row_cells(worksheet, index, "🔄 Transcribing audio…", marker, "⏳ Waiting", "⏳")
+                    marker_written = True
                     try:
                         timeline_data, raw_text_segments = transcribe_groq_whisper(st.session_state.file_path)
+                    except GroqLimitReached:
+                        raise
                     except Exception as whisper_exc:
                         if not _is_short_audio_error(whisper_exc):
                             raise
                 full_transcript_str = " ".join(raw_text_segments).strip()
 
-                # ---- Step 2: AI summary + analysis ----
-                emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
-                     label="Writing the summary and checking the call",
-                     columns={"G": "working", "H": "working", "K": "working", "L": "waiting"})
-                _write_row_cells(worksheet, index, "🔄 Writing summary…", marker, "🔄 Checking call…", "⏳")
+                # ---- Step 2: AI summary + analysis (skipped for no-voice / spam / very short calls) ----
+                mode, _info = plan_call_analysis(full_transcript_str, campaign_to_use)
+                if mode == "ai":
+                    emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                         label="Writing the summary and checking the call",
+                         columns={"G": "working", "H": "working", "K": "working", "L": "waiting"})
+                    if marker_written:
+                        _write_row_cells(worksheet, index, "🔄 Writing summary…", marker, "🔄 Checking call…", "⏳")
+                else:
+                    emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
+                         label=f"Finishing locally ({mode.replace('_', ' ')}, no AI tokens used)",
+                         columns={"G": "working", "H": "working", "K": "working", "L": "working"})
 
                 analysis = generate_call_analysis_groq(
                     full_transcript_str,
@@ -3222,42 +3709,65 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 analysis["quality_score"] = score
                 qc_report = build_qc_report(analysis)
 
-                # ---- Step 3: save results ----
+                # ---- Step 3: save everything (H = main topic is the "done" flag) ----
                 emit(event="row", row=index, position=position, total=total_pending, campaign=campaign_to_use,
                      label="Saving results to the sheet",
                      columns={"G": "working", "H": "working", "K": "working", "L": "working"})
                 _write_row_cells(worksheet, index, detailed_summary, main_topic, qc_report, score)
 
-                apply_row_score_color(worksheet, index, score, analysis)
+                apply_row_score_color(
+                    worksheet,
+                    index,
+                    score,
+                    analysis,
+                )
 
                 row_finished = True
                 processed_count += 1
                 emit(event="row_done", row=index, position=position, total=total_pending, campaign=campaign_to_use,
                      call_type=analysis.get("call_type", ""), score=score,
                      columns={"G": "done", "H": "done", "K": "done", "L": "done"})
-                
-                # Rate-limit cushion: 2.5 second pause between rows to protect Groq quota
-                time.sleep(2.5)
+                time.sleep(0.3)
+
+            except GroqLimitReached as limit_exc:
+                # Quota / budget used up: stop cleanly. The row is NOT marked as an error
+                # (the finally block removes the progress icons so it is picked up next time).
+                stop_message = str(limit_exc)
+                emit(event="limit", row=index, position=position, total=total_pending, message=stop_message)
+                break
 
             except Exception as e:
-                row_finished = True
-                error_text = f"⚠️ Processing error: {str(e)}"
+                row_finished = True      # handled here
+                attempts = previous_attempts + 1
+                error_text = f"⚠️ Processing error (attempt {attempts}/{max_attempts}): {str(e)}"
+                # H stays empty so the row is retried, until it has failed 'max_attempts' times.
+                h_value = ""
+                if attempts >= max_attempts:
+                    h_value = f"⚠️ Failed after {attempts} attempts - clear this cell to retry"
                 try:
-                    _write_row_cells(worksheet, index, error_text, "", error_text, "")
+                    _write_row_cells(worksheet, index, error_text, h_value, error_text, "")
                 except Exception:
                     pass
                 emit(event="row_error", row=index, position=position, total=total_pending,
                      campaign=campaign_to_use, message=str(e),
                      columns={"G": "error", "H": "error", "K": "error", "L": "error"})
-                time.sleep(1.5)
             finally:
-                if not row_finished:
+                # If the run was stopped half-way (limit reached, or the page reran), remove the
+                # progress icons so the row is picked up again on the next sync.
+                if not row_finished and marker_written:
                     try:
                         _write_row_cells(worksheet, index, "", "", "", "")
                     except Exception:
                         pass
 
-        message = f"Successfully processed {processed_count} new recordings!"
+        status = get_token_budget_status()
+        usage_note = f" Tokens used today: {status['used']:,}" + (f" of {status['limit']:,}." if status["limit"] > 0 else ".")
+        if stop_message:
+            message = f"Stopped early: {stop_message} Processed {processed_count} recording(s) first.{usage_note}"
+            emit(event="finished", total=total_pending, processed=processed_count, message=message)
+            return False, message
+
+        message = f"Successfully processed {processed_count} new recordings!" + usage_note
         if busy_count:
             message += f" {busy_count} row(s) are being processed by another run and were skipped."
         emit(event="finished", total=total_pending, processed=processed_count, message=message)
@@ -3503,6 +4013,8 @@ with st.sidebar:
                 st.success(message)
             else:
                 st.error(message)
+
+    render_api_usage_meter()
 
     render_html("""
         <div class="sidebar-divider"></div>
