@@ -1325,24 +1325,12 @@ _YELLOW_DIRECTORY_RE = re.compile(
 _ANY_YELLOW_RE = re.compile(r"\byellow\b", re.IGNORECASE)
 _FIXED_SPAM_PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s().-]*)?877[\s().-]*556[\s().-]*9255(?!\d)", re.IGNORECASE)
 
-# Strong robot / solicitation patterns for Rehab campaign only.
-_REHAB_STRONG_SPAM_RES = [
-    (
-        re.compile(
-            r"\bautomated (?:message|call|voice|system)\b"
-            r"|\bthis is a recorded message\b"
-            r"|\bpre-?recorded (?:message|call)\b",
-            re.I
-        ),
-        "Automated / recorded message"
-    ),
-    (
-        re.compile(
-            r"\bpress (?:the )?(?:number |key )?"
-            r"(?:zero|one|two|three|four|five|six|seven|eight|nine|[0-9]|star|pound)\b",
-            re.I
-        ),
-        "Press-a-key instruction"),
+# Strong robot / solicitation patterns: one hit is enough.
+_STRONG_SPAM_RES = [
+    (re.compile(r"\bautomated (?:message|call|voice|system)\b|\bthis is a recorded message\b|\bpre-?recorded (?:message|call)\b", re.I),
+     "Automated / recorded message"),
+    (re.compile(r"\bpress (?:the )?(?:number |key )?(?:zero|one|two|three|four|five|six|seven|eight|nine|[0-9]|star|pound)\b", re.I),
+     "Press-a-key instruction"),
     (re.compile(r"\bgoogle\s+(?:my\s+)?(?:business|listing|maps?|profile)\b.{0,120}?\b(?:verify|verification|claim|update|rank\w*|first page|suspend\w*|remov\w*|expire\w*)\b", re.I | re.S),
      "Google listing solicitation"),
 ]
@@ -1396,7 +1384,7 @@ def apply_deterministic_spam_rules(analysis, full_transcript):
     """Strict spam rules applied to the FULL transcript after the AI analysis.
 
     - Any Yelp / Yellow Pages mention = SPAM (confidence 99).
-    - Robot patterns only for Rehab campaign (automated message, press-a-key, Google listing scripts) = SPAM.
+    - Robot patterns (automated message, press-a-key, Google listing scripts) = SPAM.
     - 3+ different solicitation phrases = SPAM.
     """
     confidence, reason, label = detect_spam_signals(full_transcript)
@@ -1745,7 +1733,7 @@ def _trim_for_token_limit(transcript, campaign_name, timeline_data=None):
 
 def build_spam_analysis(full_transcript, campaign_name, confidence, reason, label):
     """Confirmed spam (Yelp, Yellow Pages, robot scripts...) is finished locally: zero AI tokens."""
-    reason_clean = re.sub(r"\s*\(.*?\)", "", str(reason or "")).strip().rstrip(".")
+    reason_clean = re.sub(r"\s*.*?", "", str(reason or "")).strip().rstrip(".")
     opening = " ".join(str(full_transcript or "").split()[:22])
     if label in ("Yelp", "Yellow Pages"):
         topic = f"Spam call mentioning {label}"
@@ -4070,12 +4058,6 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
-    if selected_campaign.strip().lower().startswith("rehab"):
-        patterns_to_check = _REHAB_STRONG_SPAM_RES
-    else:
-        patterns_to_check = []
-        
-
     render_html("""
         <div class="sidebar-divider"></div>
         <div class="sidebar-label">Google Sheets Automation</div>
@@ -4425,3 +4407,4 @@ with right_col:
                     </div>
                 </div>
             """)
+
