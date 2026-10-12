@@ -1384,7 +1384,7 @@ def apply_deterministic_spam_rules(analysis, full_transcript):
     """Strict spam rules applied to the FULL transcript after the AI analysis.
 
     - Any Yelp / Yellow Pages mention = SPAM (confidence 99).
-    - Robot patterns (automated message, press-a-key, Google listing scripts) = SPAM.
+    - Robot patterns only for Rehab campaign (automated message, press-a-key, Google listing scripts) = SPAM.
     - 3+ different solicitation phrases = SPAM.
     """
     confidence, reason, label = detect_spam_signals(full_transcript)
