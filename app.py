@@ -4069,10 +4069,12 @@ with st.sidebar:
         index=0,
         label_visibility="collapsed",
     )
+    
     if selected_campaign == "Rehab":
     patterns_to_check = _REHAB_STRONG_SPAM_RES
     else:
-    patterns_to_check = []
+    patterns_to_check = []),
+    ]
 
     render_html("""
         <div class="sidebar-divider"></div>
