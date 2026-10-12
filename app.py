@@ -95,6 +95,12 @@ def get_campaign_category(raw_campaign_text):
         if name.strip().lower() == text:
             return name
 
+    # Existing saved campaign rules may not yet list "detox" as a name keyword.
+    # Detox campaigns belong to the Rehab & Addiction Treatment QC family.
+    rehab_family = "Rehab & Addiction Treatment"
+    if rehab_family in campaigns and re.search(r"\bdetox\w*\b", text):
+        return rehab_family
+
     # Then the name keywords, lowest "match priority" first.
     ordered = sorted(campaigns.items(), key=lambda item: item[1].get("match_priority", 100))
     for name, camp in ordered:
@@ -932,7 +938,7 @@ def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
         else "Mentioning Yelp or Yellow Pages is not automatically spam."
     )
     insurance_rule = ""
-    if campaign_flag(campaign_name, "block_government_insurance"):
+    if _campaign_blocks_government_insurance(campaign_name):
         insurance_rule = (
             "\n- Medicaid/Medicare/state/government/marketplace/public insurance = NON-QUALIFIED. "
             "Private/commercial insurance (including through the caller's or a family member's employer; PPO, HMO, EPO, POS) "
@@ -1484,7 +1490,14 @@ def _parse_match_flag(value):
 def get_campaign_family(campaign_name):
     """Return the known QC campaign family for a campaign name, or None."""
     family = get_campaign_category(campaign_name)
-    return family if family in CAMPAIGN_QC_QUESTIONS else None
+    if family in CAMPAIGN_QC_QUESTIONS:
+        return family
+    # An exact custom campaign name can bypass get_campaign_category's keyword mapping.
+    if re.search(r"\bdetox\w*\b", str(campaign_name or ""), re.IGNORECASE):
+        rehab_family = "Rehab & Addiction Treatment"
+        if rehab_family in CAMPAIGN_QC_QUESTIONS:
+            return rehab_family
+    return None
 
 
 def _match_known_family(text):
@@ -1599,7 +1612,7 @@ def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_d
 
     # ---- 3. Rehab: government / state insurance is never qualified ----
     if (
-        campaign_flag(family, "block_government_insurance")
+        _campaign_blocks_government_insurance(campaign_name, family)
         and call_type == "QUALIFIED"
         and get_rehab_insurance_status(analysis) == "YELLOW"
     ):
@@ -2401,6 +2414,15 @@ def campaign_flag(campaign_key, flag, default=False):
     return bool(camp.get(flag, default)) if camp else default
 
 
+def _campaign_blocks_government_insurance(campaign_key, campaign_family=None):
+    """Apply the government-insurance rule if enabled on the selected campaign or its family."""
+    family = campaign_family or get_campaign_family(campaign_key)
+    return (
+        campaign_flag(campaign_key, "block_government_insurance")
+        or campaign_flag(family, "block_government_insurance")
+    )
+
+
 def get_effective_weights(campaign_key):
     """Global score numbers, replaced by the campaign's own values where it has overrides."""
     weights = dict(DEFAULT_WEIGHTS)
@@ -2535,7 +2557,7 @@ def _score_breakdown(analysis):
         caps.append((W("appointment_max"), "no appointment/booking"))
 
     # Campaign rule: government / state insurance is never fully qualified.
-    if campaign_flag(campaign_key, "block_government_insurance") \
+    if _campaign_blocks_government_insurance(campaign_key) \
             and get_rehab_insurance_status(analysis) == "YELLOW":
         caps.append((W("government_cap"), "government insurance"))
 
@@ -2690,7 +2712,7 @@ _GENERIC_FOCUS = (
 _BUILTIN_CAMPAIGN_DETAILS = {
     "Rehab & Addiction Treatment": {
         "match_priority": 10,
-        "name_keywords": ["rehab", "addiction", "mental health", "substance", "treatment"],
+        "name_keywords": ["rehab", "detox", "addiction", "mental health", "substance", "treatment"],
         "focus": (
             "Focus on treatment/service requested, caller reason, insurance, location, "
             "qualification, and outcome. Medicaid/Medicare/state/government/public insurance "
