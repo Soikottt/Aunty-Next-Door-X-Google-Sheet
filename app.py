@@ -1289,7 +1289,7 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=900,
+        max_tokens=800,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={"type": "json_object"}
@@ -1665,8 +1665,8 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None, campai
     )
     return analysis
 
-TPM_TARGET = 7400
-ANALYSIS_MAX_OUT = 900      # same as max_tokens in _call_structured_analysis
+TPM_TARGET = 7000
+ANALYSIS_MAX_OUT = 800      # same as max_tokens in _call_structured_analysis
 CHARS_PER_TOKEN = 3.5       # conservative estimate, no extra library needed
 
 
@@ -1809,7 +1809,7 @@ def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=750,
+        max_tokens=650,
         reasoning_effort="low",
         reasoning_format="hidden",
         response_format={"type": "json_object"}
