@@ -1317,6 +1317,7 @@ _YELLOW_DIRECTORY_RE = re.compile(
     re.IGNORECASE,
 )
 _ANY_YELLOW_RE = re.compile(r"\byellow\b", re.IGNORECASE)
+_FIXED_SPAM_PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s().-]*)?877[\s().-]*556[\s().-]*9255(?!\d)", re.IGNORECASE)
 
 # Strong robot / solicitation patterns: one hit is enough.
 _STRONG_SPAM_RES = [
@@ -1348,6 +1349,9 @@ def detect_spam_signals(full_transcript):
     text = str(full_transcript or "")
     if not text.strip():
         return 0, "", ""
+
+    if _FIXED_SPAM_PHONE_RE.search(text):
+        return 99, "Blocked phone number 877-556-9255 detected in transcript", "Blocked phone number"
 
     if SPAM_YELP_YELLOW_ENABLED and _YELP_RE.search(text):
         return 99, "Yelp mentioned on the call (strict network spam rule)", "Yelp"
@@ -1406,6 +1410,10 @@ _SILENCE_HALLUCINATION_HINTS = (
     "thanks for watching", "thank you for watching", "please subscribe",
     "like and subscribe", "subtitles by", "amara org",
 )
+_AGENT_TREATMENT_PROMPT_RE = re.compile(
+    r"\bare you seeking treatment for yourself or somebody else\b", re.IGNORECASE
+)
+_AGENT_FOLLOWUP_PROMPT_RE = re.compile(r"\bare you there\b", re.IGNORECASE)
 
 ALLOWED_CALL_TYPES = {
     "QUALIFIED", "NON-QUALIFIED", "WRONG NUMBER", "SPAM / ROBOT",
@@ -1416,15 +1424,36 @@ ALLOWED_QUAL_STATUSES = {"QUALIFIED", "NON-QUALIFIED", "NOT CLEAR"}
 
 def is_no_voice_transcript(text):
     """True when the recording produced no usable text (empty, 1-2 words,
-    or a typical Whisper silence hallucination)."""
+    a typical Whisper silence hallucination, or only the repeated agent prompt)."""
     cleaned = re.sub(r"[^a-z0-9' ]+", " ", str(text or "").lower())
     words = cleaned.split()
     if not words:
         return True
     normalized = " ".join(words)
+    prompt_remainder = _agent_prompt_remainder(normalized)
+    if prompt_remainder is not None:
+        return not prompt_remainder
     if len(words) <= 8 and any(hint in normalized for hint in _SILENCE_HALLUCINATION_HINTS):
         return True
     return len(words) < NO_VOICE_MIN_WORDS
+
+
+def _agent_prompt_remainder(normalized_text):
+    """Return text left after removing the repeated agent prompt, or None if it is absent.
+
+    An empty remainder means the recording contains only the agent's prompt and no caller
+    response. Any remaining words count as transcribed speech and should be summarized.
+    """
+    normalized = " ".join(str(normalized_text or "").lower().split())
+    if not (
+        _AGENT_TREATMENT_PROMPT_RE.search(normalized)
+        and _AGENT_FOLLOWUP_PROMPT_RE.search(normalized)
+    ):
+        return None
+    remainder = _AGENT_TREATMENT_PROMPT_RE.sub(" ", normalized)
+    remainder = _AGENT_FOLLOWUP_PROMPT_RE.sub(" ", remainder)
+    remainder = re.sub(r"\badmission\b", " ", remainder)
+    return " ".join(remainder.split())
 
 
 def _is_short_audio_error(exc):
@@ -1626,9 +1655,11 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None, campai
 
     # Keep the summary short and free of filler / "not mentioned" sentences.
     analysis["long_summary"] = clean_summary_text(analysis["long_summary"]) or (
-        "No summary could be generated from the transcript."
+        NO_VOICE_SUMMARY if analysis["no_voice"] else "Call details were not clear enough to summarize."
     )
-    analysis["main_topic"] = clean_main_topic(analysis["main_topic"])
+    analysis["main_topic"] = clean_main_topic(analysis["main_topic"]) or (
+        NO_VOICE_TOPIC if analysis["no_voice"] else "No clear caller topic identified."
+    )
 
     meaningful_reason = bool(analysis["caller_intent"] or analysis["why_called"] or analysis["service_requested"])
     analysis["relevant_intent"] = meaningful_reason and call_type not in {
@@ -1747,13 +1778,13 @@ def plan_call_analysis(full_transcript, campaign_name):
         return "no_voice", {}
 
     settings = get_api_settings()
-    if settings.get("skip_ai_for_spam", True):
-        confidence, reason, label = detect_spam_signals(full_transcript)
-        if confidence >= 90:
-            return "spam", {"confidence": confidence, "reason": reason, "label": label}
+    confidence, reason, label = detect_spam_signals(full_transcript)
+    if confidence >= 90 and (settings.get("skip_ai_for_spam", True) or label == "Blocked phone number"):
+        return "spam", {"confidence": confidence, "reason": reason, "label": label}
 
     min_words = int(settings.get("ai_min_words") or 0)
-    if min_words > 0:
+    prompt_remainder = _agent_prompt_remainder(full_transcript)
+    if min_words > 0 and prompt_remainder is None:
         words = len(re.findall(r"[A-Za-z0-9']+", str(full_transcript or "")))
         if words < min_words:
             family = get_campaign_family(campaign_name)
@@ -3428,17 +3459,22 @@ def _progress_marker_age_minutes(text):
     return (datetime.now() - started).total_seconds() / 60.0
 
 
-def _row_work_state(recording_url, existing_main_topic):
-    """'process' = needs work, 'busy' = another run is working on it, 'skip' = nothing to do."""
+def _row_work_state(recording_url, existing_summary, existing_main_topic):
+    """Process rows missing either output; skip only after Summary and Main topic are both filled."""
     if not recording_url or not recording_url.startswith("http"):
         return "skip"
-    if not existing_main_topic:
-        return "process"
     if _is_progress_marker(existing_main_topic):
         age = _progress_marker_age_minutes(existing_main_topic)
         if age is not None and age < PROCESSING_STALE_MINUTES:
             return "busy"
         return "process"      # stale or unreadable marker: the earlier run died, do it again
+    if _is_progress_marker(existing_summary):
+        age = _progress_marker_age_minutes(existing_summary)
+        if age is not None and age < PROCESSING_STALE_MINUTES:
+            return "busy"
+        return "process"
+    if not existing_summary or not existing_main_topic:
+        return "process"
     return "skip"
 
 
@@ -3625,6 +3661,7 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             1 for row in rows[1:]
             if _row_work_state(
                 row[8].strip() if len(row) > 8 else "",
+                row[6].strip() if len(row) > 6 else "",
                 row[7].strip() if len(row) > 7 else "",
             ) == "process"
         )
@@ -3636,8 +3673,8 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
 
-            # Trigger: recording exists + H is empty (or holds an old, dead progress marker).
-            work_state = _row_work_state(recording_url, existing_main_topic)
+            # Trigger: recording exists + Summary or Main topic is missing (or progress is stale).
+            work_state = _row_work_state(recording_url, existing_g, existing_main_topic)
             if work_state == "busy":
                 busy_count += 1
                 continue
