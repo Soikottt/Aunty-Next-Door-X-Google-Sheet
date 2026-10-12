@@ -4070,10 +4070,10 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     
-    if selected_campaign == "Rehab":
+    if selected_campaign.strip().lower().startswith("rehab"):
     patterns_to_check = _REHAB_STRONG_SPAM_RES
     else:
-    patterns_to_check = []),
+    patterns_to_check = []
     ]
 
     render_html("""
