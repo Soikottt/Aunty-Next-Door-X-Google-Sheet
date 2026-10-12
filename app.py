@@ -1325,12 +1325,24 @@ _YELLOW_DIRECTORY_RE = re.compile(
 _ANY_YELLOW_RE = re.compile(r"\byellow\b", re.IGNORECASE)
 _FIXED_SPAM_PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s().-]*)?877[\s().-]*556[\s().-]*9255(?!\d)", re.IGNORECASE)
 
-# Strong robot / solicitation patterns: one hit is enough.
-_STRONG_SPAM_RES = [
-    (re.compile(r"\bautomated (?:message|call|voice|system)\b|\bthis is a recorded message\b|\bpre-?recorded (?:message|call)\b", re.I),
-     "Automated / recorded message"),
-    (re.compile(r"\bpress (?:the )?(?:number |key )?(?:zero|one|two|three|four|five|six|seven|eight|nine|[0-9]|star|pound)\b", re.I),
-     "Press-a-key instruction"),
+# Strong robot / solicitation patterns for Rehab campaign only.
+_REHAB_STRONG_SPAM_RES = [
+    (
+        re.compile(
+            r"\bautomated (?:message|call|voice|system)\b"
+            r"|\bthis is a recorded message\b"
+            r"|\bpre-?recorded (?:message|call)\b",
+            re.I
+        ),
+        "Automated / recorded message"
+    ),
+    (
+        re.compile(
+            r"\bpress (?:the )?(?:number |key )?"
+            r"(?:zero|one|two|three|four|five|six|seven|eight|nine|[0-9]|star|pound)\b",
+            re.I
+        ),
+        "Press-a-key instruction"),
     (re.compile(r"\bgoogle\s+(?:my\s+)?(?:business|listing|maps?|profile)\b.{0,120}?\b(?:verify|verification|claim|update|rank\w*|first page|suspend\w*|remov\w*|expire\w*)\b", re.I | re.S),
      "Google listing solicitation"),
 ]
@@ -4057,6 +4069,10 @@ with st.sidebar:
         index=0,
         label_visibility="collapsed",
     )
+    if selected_campaign == "Rehab":
+    patterns_to_check = _REHAB_STRONG_SPAM_RES
+    else:
+    patterns_to_check = []
 
     render_html("""
         <div class="sidebar-divider"></div>
