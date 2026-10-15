@@ -843,7 +843,7 @@ def build_summary_instructions(campaign_name):
     family = get_campaign_category(campaign_name) if campaign_name else campaign_name
     qc_questions = compact_rules_text(get_qc_questions(family))
     return (
-        SUMMARY_STYLE_RULES.rstrip()
+        (str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES).rstrip()
         + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
         + qc_questions
         + "\n"
@@ -932,11 +932,28 @@ def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
 
     service_categories = ", ".join(CAMPAIGN_QC_QUESTIONS.keys())
     summary_instructions = build_summary_instructions(campaign_name)
+    spam_rt = _campaign_spam_runtime(campaign_name)
     yelp_rule = (
         "Any mention of Yelp or Yellow Pages, in any context = spam_robot true, spam_confidence 99, call_type SPAM / ROBOT."
-        if SPAM_YELP_YELLOW_ENABLED
+        if (spam_rt and spam_rt["yelp_yellow"])
         else "Mentioning Yelp or Yellow Pages is not automatically spam."
     )
+    if spam_rt is None:
+        # Spam rules are OFF for this campaign: the AI is not told about spam at all.
+        call_type_values = "QUALIFIED | NON-QUALIFIED | WRONG NUMBER | INFORMATION ONLY | SILENT / NO RESPONSE | OTHER"
+        spam_rules_text = ""
+    else:
+        call_type_values = "QUALIFIED | NON-QUALIFIED | WRONG NUMBER | SPAM / ROBOT | INFORMATION ONLY | SILENT / NO RESPONSE | OTHER"
+        if spam_rt["ai_semantic"]:
+            spam_rules_text = (
+                "- Detect spam semantically: scripted/repeated language, press-0/press-9 prompts, automated marketing, "
+                "fake verification, SEO/Google listing solicitations, insurance/debt robots. " + yelp_rule + "\n"
+                "- A normal irrelevant or non-qualified caller is not automatically spam."
+            )
+        elif spam_rt["yelp_yellow"]:
+            spam_rules_text = "- Do not judge spam yourself. Only this spam rule applies: " + yelp_rule
+        else:
+            spam_rules_text = "- Do not flag spam: spam_robot false, spam_confidence 0."
     insurance_rule = ""
     if _campaign_blocks_government_insurance(campaign_name):
         insurance_rule = (
@@ -950,7 +967,7 @@ def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
 KEYS: long_summary, main_topic, call_type, qualification_status, caller_intent, why_called, service_requested, insurance, location, outcome, spam_robot, spam_confidence, qc_issue, spam_reason, qualification_reason, call_type_reason, detected_service_category, matches_campaign, appointment_set
 
 VALUES:
-- call_type: QUALIFIED | NON-QUALIFIED | WRONG NUMBER | SPAM / ROBOT | INFORMATION ONLY | SILENT / NO RESPONSE | OTHER
+- call_type: {call_type_values}
 - qualification_status: QUALIFIED | NON-QUALIFIED | NOT CLEAR
 - spam_robot true/false. spam_confidence 0-100. Unknown strings = "".
 - detected_service_category: the service the CALLER asked for, from the caller's own words (not the campaign). One of: {service_categories}, OTHER, UNCLEAR.
@@ -962,8 +979,7 @@ RULES:
 - call_type_reason: one short sentence (5-15 words). qualification_reason: brief. qc_issue: only a real, supported issue, else "".
 - Use QUALIFIED or NON-QUALIFIED ONLY when the caller wants this campaign's service. Information-only, unclear or off-campaign callers: INFORMATION ONLY, WRONG NUMBER or OTHER. A different service than the campaign: matches_campaign=false and call_type=WRONG NUMBER (say what they wanted).
 - Silent/no-response: do not invent intent. Spam/robot: say what it promoted.
-- Detect spam semantically: scripted/repeated language, press-0/press-9 prompts, automated marketing, fake verification, SEO/Google listing solicitations, insurance/debt robots. {yelp_rule}
-- A normal irrelevant or non-qualified caller is not automatically spam.{insurance_rule}
+{spam_rules_text}{insurance_rule}
 
 CAMPAIGN: {campaign_name}
 CAMPAIGN FOCUS: {campaign_guidance}
@@ -1350,44 +1366,138 @@ _MEDIUM_SPAM_PATTERNS = {
 _MEDIUM_SPAM_RES = [(re.compile(p, re.I), label) for label, p in _MEDIUM_SPAM_PATTERNS.items()]
 
 
-def detect_spam_signals(full_transcript):
-    """Return (confidence 0-100, reason, label). 0 means no deterministic spam signal."""
+# ------------------------------------------------------------
+# PER-CAMPAIGN SPAM RULES
+# Every spam rule in this section only runs for campaigns that have "Spam rules" switched ON
+# (Campaign Rules -> pick a campaign -> Spam rules). Built-in default: Rehab only.
+# Every other campaign gets NO spam detection (local rules or AI) unless you switch it on.
+# ------------------------------------------------------------
+_CAMPAIGN_SPAM_RT = {}   # campaign name -> compiled spam settings (filled by apply_qc_config)
+
+DEFAULT_CAMPAIGN_SPAM = {
+    "enabled": False,               # master switch for this campaign
+    "yelp_yellow": True,            # any Yelp / Yellow Pages mention = spam
+    "strict_yellow_any": False,     # even the single word "yellow" = spam (needs yelp_yellow ON)
+    "robot_patterns": True,         # automated message / press-a-key / Google listing scripts
+    "solicitation": True,           # several different solicitation phrases = spam
+    "solicitation_threshold": 3,    # how many different phrases
+    "ai_semantic": True,            # let the AI also judge spam from the conversation
+    "blocked_phones": [],           # phone numbers that always mean spam
+    "extra_terms": [],              # words that always mean spam
+}
+
+
+def _phone_to_regex(entry):
+    """'877-556-9255' -> regex that also matches 8775569255, (877) 556 9255, +1 877..."""
+    digits = re.sub(r"\D", "", str(entry or ""))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) < 7:
+        return None
+    sep = r"[\s().-]*"
+    if len(digits) == 10:
+        body = sep.join([digits[:3], digits[3:6], digits[6:]])
+        return r"(?<!\d)(?:\+?1" + sep + r")?" + body + r"(?!\d)"
+    return r"(?<!\d)" + sep.join(digits) + r"(?!\d)"
+
+
+def _build_campaign_spam_runtime(spam):
+    s = dict(DEFAULT_CAMPAIGN_SPAM)
+    s.update(spam or {})
+    try:
+        threshold = max(1, int(s.get("solicitation_threshold") or 3))
+    except (TypeError, ValueError):
+        threshold = 3
+    phone_res = []
+    for entry in s.get("blocked_phones") or []:
+        pattern = _phone_to_regex(entry)
+        if pattern:
+            phone_res.append((str(entry).strip(), re.compile(pattern, re.IGNORECASE)))
+    return {
+        "enabled": bool(s.get("enabled")),
+        "yelp_yellow": bool(s.get("yelp_yellow")),
+        "strict_yellow_any": bool(s.get("strict_yellow_any")),
+        "robot_patterns": bool(s.get("robot_patterns")),
+        "solicitation": bool(s.get("solicitation")),
+        "solicitation_threshold": threshold,
+        "ai_semantic": bool(s.get("ai_semantic")),
+        "phone_res": phone_res,
+        "extra_res": [re.compile(p, re.IGNORECASE) for p in _valid_patterns(s.get("extra_terms"))],
+    }
+
+
+def _campaign_spam_runtime(campaign_name):
+    """Compiled spam settings for the campaign, or None when spam rules are OFF for it."""
+    if not campaign_name:
+        return None
+    key = get_campaign_category(campaign_name)
+    rt = _CAMPAIGN_SPAM_RT.get(key)
+    return rt if rt and rt.get("enabled") else None
+
+
+def detect_spam_signals(full_transcript, campaign_name=None):
+    """Return (confidence 0-100, reason, label). 0 means no deterministic spam signal.
+    Always 0 for campaigns that do not have spam rules switched on."""
     text = str(full_transcript or "")
     if not text.strip():
         return 0, "", ""
 
-    if _FIXED_SPAM_PHONE_RE.search(text):
-        return 99, "Blocked phone number 877-556-9255 detected in transcript", "Blocked phone number"
+    rt = _campaign_spam_runtime(campaign_name)
+    if rt is None:
+        return 0, "", ""
 
-    if SPAM_YELP_YELLOW_ENABLED and _YELP_RE.search(text):
+    for entry, rx in rt["phone_res"]:
+        if rx.search(text):
+            return 99, f"Blocked phone number {entry} detected in transcript", "Blocked phone number"
+
+    if rt["yelp_yellow"] and _YELP_RE.search(text):
         return 99, "Yelp mentioned on the call (strict network spam rule)", "Yelp"
-    if SPAM_YELP_YELLOW_ENABLED and (_YELLOW_DIRECTORY_RE.search(text) or (STRICT_YELLOW_ANY and _ANY_YELLOW_RE.search(text))):
+    if rt["yelp_yellow"] and (_YELLOW_DIRECTORY_RE.search(text) or (rt["strict_yellow_any"] and _ANY_YELLOW_RE.search(text))):
         return 99, "Yellow Pages mentioned on the call (strict network spam rule)", "Yellow Pages"
 
-    for rx in EXTRA_SPAM_RES:
+    for rx in rt["extra_res"]:
         hit = rx.search(text)
         if hit:
             return 99, f"Blocked spam word '{hit.group(0)}' mentioned on the call", "Blocked word"
 
-    for rx, label in _STRONG_SPAM_RES:
-        if rx.search(text):
-            return 92, f"{label} detected in transcript", label
+    if rt["robot_patterns"]:
+        for rx, label in _STRONG_SPAM_RES:
+            if rx.search(text):
+                return 92, f"{label} detected in transcript", label
 
-    hits = [label for rx, label in _MEDIUM_SPAM_RES if rx.search(text)]
-    if len(hits) >= 3:
-        return 90, "Multiple solicitation phrases: " + ", ".join(hits[:4]), "Solicitation"
+    if rt["solicitation"]:
+        hits = [label for rx, label in _MEDIUM_SPAM_RES if rx.search(text)]
+        if len(hits) >= rt["solicitation_threshold"]:
+            return 90, "Multiple solicitation phrases: " + ", ".join(hits[:4]), "Solicitation"
 
     return 0, "", ""
 
 
-def apply_deterministic_spam_rules(analysis, full_transcript):
+def _enforce_campaign_spam_policy(analysis, campaign_name):
+    """The AI's own spam verdict only counts where the campaign's spam rules allow it
+    (campaign spam rules ON + 'AI can judge spam' ON). Otherwise it is cleared."""
+    rt = _campaign_spam_runtime(campaign_name)
+    if rt is not None and rt.get("ai_semantic"):
+        return analysis
+    call_type = str(analysis.get("call_type", "") or "").strip().upper()
+    if _to_bool(analysis.get("spam_robot")) or call_type == "SPAM / ROBOT":
+        analysis["spam_robot"] = False
+        analysis["spam_confidence"] = 0
+        analysis["spam_reason"] = ""
+        if call_type == "SPAM / ROBOT":
+            analysis["call_type"] = "OTHER"
+    return analysis
+
+
+def apply_deterministic_spam_rules(analysis, full_transcript, campaign_name=None):
     """Strict spam rules applied to the FULL transcript after the AI analysis.
+    Only runs for campaigns with spam rules switched on (see Campaign Rules).
 
     - Any Yelp / Yellow Pages mention = SPAM (confidence 99).
     - Robot patterns (automated message, press-a-key, Google listing scripts) = SPAM.
     - 3+ different solicitation phrases = SPAM.
     """
-    confidence, reason, label = detect_spam_signals(full_transcript)
+    confidence, reason, label = detect_spam_signals(full_transcript, campaign_name)
     if not confidence:
         return analysis
 
@@ -1574,7 +1684,7 @@ def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_d
 
     # ---- 1. Campaign / service mismatch -> WRONG NUMBER ----
     mismatch = False
-    if not spam and call_type != "SILENT / NO RESPONSE":
+    if not spam and call_type != "SILENT / NO RESPONSE" and campaign_setting(campaign_name, "mismatch_rule_enabled", True):
         if verdict == "other":
             mismatch = True
         elif verdict == "campaign":
@@ -1791,7 +1901,7 @@ def plan_call_analysis(full_transcript, campaign_name):
         return "no_voice", {}
 
     settings = get_api_settings()
-    confidence, reason, label = detect_spam_signals(full_transcript)
+    confidence, reason, label = detect_spam_signals(full_transcript, campaign_name)
     if confidence >= 90 and (settings.get("skip_ai_for_spam", True) or label == "Blocked phone number"):
         return "spam", {"confidence": confidence, "reason": reason, "label": label}
 
@@ -1834,7 +1944,8 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
     )
 
     # Rules below run on the FULL transcript (not the trimmed AI copy and not the summary).
-    analysis = apply_deterministic_spam_rules(analysis, full_transcript)
+    analysis = _enforce_campaign_spam_policy(analysis, campaign_name)
+    analysis = apply_deterministic_spam_rules(analysis, full_transcript, campaign_name)
     analysis = apply_campaign_rules(analysis, campaign_name, full_transcript, timeline_data)
     analysis["campaign_category"] = campaign_name
 
@@ -1874,7 +1985,7 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
     summary_instructions = build_summary_instructions(campaign_family)
 
     spam_hint = ""
-    spam_confidence, spam_reason, _ = detect_spam_signals(full_transcript)
+    spam_confidence, spam_reason, _ = detect_spam_signals(full_transcript, campaign_name)
     if spam_confidence:
         spam_hint = (
             f"\nNOTE: This is a spam / solicitation call ({spam_reason}). "
@@ -2390,12 +2501,12 @@ SCORE_WEIGHT_FIELDS = [
     ("appointment_max",       "Qualified without appointment/booking: highest",  95, 100, "Caps", True),
     ("government_cap",        "Government insurance: highest score",             60, 100, "Caps", True),
 
-    ("no_voice_score",        "No voice / no text in recording (fixed)",         30, 49, "Hard rules (all campaigns, max 49)", False),
-    ("silent_score",          "Silent / no response call type (fixed)",          30, 49, "Hard rules (all campaigns, max 49)", False),
-    ("spam_confident_score",  "Confirmed spam, confidence 90+ (fixed)",           5, 49, "Hard rules (all campaigns, max 49)", False),
-    ("spam_max_score",        "Other spam: highest score",                       25, 49, "Hard rules (all campaigns, max 49)", False),
-    ("wrong_number_max",      "Wrong number / campaign mismatch: highest score", 30, 49, "Hard rules (all campaigns, max 49)", False),
-    ("other_type_max",        "Any call type except Qualified / Non-qualified",  49, 49, "Hard rules (all campaigns, max 49)", False),
+    ("no_voice_score",        "No voice / no text in recording (fixed)",         30, 49, "Hard rules (max 49)", True),
+    ("silent_score",          "Silent / no response call type (fixed)",          30, 49, "Hard rules (max 49)", True),
+    ("spam_confident_score",  "Confirmed spam, confidence 90+ (fixed)",           5, 49, "Hard rules (max 49)", True),
+    ("spam_max_score",        "Other spam: highest score",                       25, 49, "Hard rules (max 49)", True),
+    ("wrong_number_max",      "Wrong number / campaign mismatch: highest score", 30, 49, "Hard rules (max 49)", True),
+    ("other_type_max",        "Any call type except Qualified / Non-qualified",  49, 49, "Hard rules (max 49)", True),
 ]
 DEFAULT_WEIGHTS = {f[0]: f[2] for f in SCORE_WEIGHT_FIELDS}
 
@@ -2412,6 +2523,14 @@ def campaign_flag(campaign_key, flag, default=False):
     """Per-campaign on/off rule (for example block_government_insurance)."""
     camp = get_campaign_cfg(campaign_key)
     return bool(camp.get(flag, default)) if camp else default
+
+
+def campaign_setting(campaign_name, key, default=None):
+    """Read one per-campaign setting. Accepts the Ringba name or the QC campaign name."""
+    if not campaign_name:
+        return default
+    camp = get_campaign_cfg(get_campaign_category(campaign_name))
+    return camp.get(key, default) if camp else default
 
 
 def _campaign_blocks_government_insurance(campaign_key, campaign_family=None):
@@ -2791,7 +2910,24 @@ def _blank_campaign():
         "block_government_insurance": False,
         "appointment_cap_enabled": True,
         "score_overrides": {},
+        "spam": copy.deepcopy(DEFAULT_CAMPAIGN_SPAM),
+        "mismatch_rule_enabled": True,
+        "summary_style": "",
     }
+
+
+def _migrate_campaign_spam(name, legacy):
+    """Starting spam settings for a campaign that has none saved yet.
+    Spam rules start ON only for Rehab campaigns; the old global spam settings carry over to them."""
+    spam = copy.deepcopy(DEFAULT_CAMPAIGN_SPAM)
+    legacy = legacy or {}
+    spam["yelp_yellow"] = bool(legacy.get("yelp_yellow_is_spam", True))
+    spam["strict_yellow_any"] = bool(legacy.get("strict_yellow_any", False))
+    if "rehab" in str(name or "").lower():
+        spam["enabled"] = True
+        spam["blocked_phones"] = ["877-556-9255"]
+        spam["extra_terms"] = list(legacy.get("extra_terms") or [])
+    return spam
 
 
 def _default_qc_config():
@@ -2802,6 +2938,7 @@ def _default_qc_config():
         camp["qc_note_rules"] = rules
         if not camp["name_keywords"]:
             camp["name_keywords"] = [name.lower()]
+        camp["spam"] = _migrate_campaign_spam(name, {})
         campaigns[name] = camp
     return {
         "meta": {"version": 2, "updated_at": "", "updated_by": ""},
@@ -2839,6 +2976,8 @@ def _merge_config(saved, defaults):
             merged = _blank_campaign()
             merged["qc_note_rules"] = cfg["global"].get("default_qc_questions", _BUILTIN_DEFAULT_QC)
             merged.update(camp or {})
+            if "spam" not in (camp or {}):
+                merged["spam"] = _migrate_campaign_spam(name, cfg["global"].get("spam"))
             cfg["campaigns"][str(name).strip()] = merged
     return cfg
 
@@ -2921,8 +3060,10 @@ def apply_qc_config(cfg):
     FAMILY_KEYWORDS.clear()
     _FAMILY_KEY_RES.clear()
     _QUAL_INFO_RES.clear()
+    _CAMPAIGN_SPAM_RT.clear()
     for name, camp in cfg["campaigns"].items():
         CAMPAIGN_QC_QUESTIONS[name] = camp.get("qc_note_rules") or DEFAULT_QC_QUESTIONS
+        _CAMPAIGN_SPAM_RT[name] = _build_campaign_spam_runtime(camp.get("spam"))
         patterns = _valid_patterns(camp.get("service_keywords"))
         FAMILY_KEYWORDS[name] = patterns
         _FAMILY_KEY_RES[name] = [re.compile(p, re.IGNORECASE) for p in patterns]
@@ -2960,6 +3101,17 @@ def validate_qc_config(cfg):
                     re.compile(pattern)
                 except re.error as exc:
                     errors.append(f"'{name}' {field}: invalid pattern '{entry}' ({exc})")
+        camp_spam = camp.get("spam") or {}
+        for entry in camp_spam.get("extra_terms") or []:
+            pattern = _keyword_to_regex(entry)
+            if pattern:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    errors.append(f"'{name}' extra spam term '{entry}' is invalid ({exc})")
+        for entry in camp_spam.get("blocked_phones") or []:
+            if not _phone_to_regex(entry):
+                errors.append(f"'{name}' blocked phone '{entry}' needs at least 7 digits.")
     limits = {f[0]: f[3] for f in SCORE_WEIGHT_FIELDS}
     for key, value in (cfg["global"].get("weights") or {}).items():
         if key in limits and not (0 <= float(value) <= limits[key]):
@@ -3158,6 +3310,33 @@ def _cr_campaign_editor(cfg, name, ver):
                 "Qualified calls without an appointment/booking cannot get the top score",
                 value=bool(camp.get("appointment_cap_enabled", True)), key=f"cr_{ver}_{kp}_appt")
 
+        st.markdown("#### 🚫 Spam rules for this campaign")
+        st.caption("Spam rules only run for campaigns where the switch below is ON. "
+                   "When it is OFF, nothing is marked as spam on this campaign (local rules and AI).")
+        sp = {**DEFAULT_CAMPAIGN_SPAM, **(camp.get("spam") or {})}
+        sp_enabled = st.checkbox("Turn spam rules ON for this campaign", value=bool(sp["enabled"]), key=f"cr_{ver}_{kp}_sp_en")
+        sp1, sp2 = st.columns(2)
+        with sp1:
+            sp_yelp = st.checkbox("Any mention of Yelp or Yellow Pages = spam", value=bool(sp["yelp_yellow"]), key=f"cr_{ver}_{kp}_sp_yelp")
+            sp_yellow = st.checkbox("Even the single word \"yellow\" = spam (needs the Yelp / Yellow Pages rule ON)", value=bool(sp["strict_yellow_any"]), key=f"cr_{ver}_{kp}_sp_yellow")
+            sp_robot = st.checkbox("Robot / automated message patterns = spam (automated message, press a key, Google listing scripts)", value=bool(sp["robot_patterns"]), key=f"cr_{ver}_{kp}_sp_robot")
+            sp_solic = st.checkbox("Several different solicitation phrases in one call = spam (SEO, Google listing, advertising, warranty...)", value=bool(sp["solicitation"]), key=f"cr_{ver}_{kp}_sp_solic")
+            sp_thresh = st.number_input("How many different solicitation phrases make it spam", min_value=1, max_value=9, value=int(sp.get("solicitation_threshold") or 3), step=1, key=f"cr_{ver}_{kp}_sp_thresh")
+            sp_ai = st.checkbox("Also let the AI judge spam from the conversation (OFF = only your rules here decide)", value=bool(sp["ai_semantic"]), key=f"cr_{ver}_{kp}_sp_ai")
+        with sp2:
+            sp_phones = st.text_area("Blocked phone numbers - always spam (one per line)", value="\n".join(sp.get("blocked_phones") or []), height=110, key=f"cr_{ver}_{kp}_sp_phones",
+                                     help="Any format works: 877-556-9255, (877) 556 9255, 8775569255.")
+            sp_extra = st.text_area("Extra words that always mark a call as spam (one per line)", value="\n".join(sp.get("extra_terms") or []), height=110, key=f"cr_{ver}_{kp}_sp_extra",
+                                    help="End a word with * to match any ending. Start a line with regex: for a raw pattern.")
+
+        st.markdown("#### 📞 Call rules for this campaign")
+        mismatch_on = st.checkbox("Caller wants a different service than this campaign = Wrong Number (score under 50)",
+                                  value=bool(camp.get("mismatch_rule_enabled", True)), key=f"cr_{ver}_{kp}_mismatch")
+        style_override = st.text_area(
+            "Summary style for this campaign (leave empty to use the global summary style)",
+            value=camp.get("summary_style", ""), height=160, key=f"cr_{ver}_{kp}_style",
+            help="Replaces the global summary style for this campaign only. The QC note rules above are still added after it.")
+
         st.markdown("#### Score settings for this campaign")
         st.caption("Pre-filled with the current values. Only numbers you change are saved as this campaign's own; "
                    "the rest keep following the global Scoring tab.")
@@ -3174,6 +3353,14 @@ def _cr_campaign_editor(cfg, name, ver):
         camp["qual_keywords"] = _lines(qual_kw)
         camp["block_government_insurance"] = bool(block_gov)
         camp["appointment_cap_enabled"] = bool(appt_cap)
+        camp["spam"] = {
+            "enabled": bool(sp_enabled), "yelp_yellow": bool(sp_yelp), "strict_yellow_any": bool(sp_yellow),
+            "robot_patterns": bool(sp_robot), "solicitation": bool(sp_solic),
+            "solicitation_threshold": int(sp_thresh), "ai_semantic": bool(sp_ai),
+            "blocked_phones": _lines(sp_phones), "extra_terms": _lines(sp_extra),
+        }
+        camp["mismatch_rule_enabled"] = bool(mismatch_on)
+        camp["summary_style"] = style_override.strip()
         camp["score_overrides"] = {
             k: int(v) for k, v in values.items() if int(v) != int(global_weights.get(k, DEFAULT_WEIGHTS[k]))
         }
@@ -3300,10 +3487,8 @@ def _cr_scoring_tab(cfg, ver):
 def _cr_spam_tab(cfg, ver):
     g = cfg["global"]
     with st.form(f"cr_spam_{ver}"):
-        st.markdown("#### Spam rules")
-        yelp = st.checkbox("Any mention of Yelp or Yellow Pages = spam", value=bool(g["spam"].get("yelp_yellow_is_spam", True)), key=f"cr_{ver}_yelp")
-        strict_yellow = st.checkbox("Even the single word \"yellow\" = spam", value=bool(g["spam"].get("strict_yellow_any", False)), key=f"cr_{ver}_yellow")
-        extra = st.text_area("Extra words that always mark a call as spam (one per line)", value="\n".join(g["spam"].get("extra_terms", [])), height=110, key=f"cr_{ver}_extra")
+        st.info("Spam rules are now set per campaign: Campaigns tab -> pick a campaign -> Spam rules. "
+                "They are ON for Rehab only until you switch them on for another campaign.")
 
         st.markdown("#### No voice")
         v1, v2 = st.columns(2)
@@ -3339,7 +3524,6 @@ def _cr_spam_tab(cfg, ver):
         default_qc = st.text_area("QC note rules for campaigns with no rules of their own", value=g.get("default_qc_questions", ""), height=200, key=f"cr_{ver}_defqc")
         submitted = st.form_submit_button("💾 Save", type="primary")
     if submitted:
-        g["spam"].update({"yelp_yellow_is_spam": bool(yelp), "strict_yellow_any": bool(strict_yellow), "extra_terms": _lines(extra)})
         g["voice"].update({"no_voice_min_words": int(min_words), "min_audio_seconds": float(min_secs)})
         g["api"] = {
             "daily_token_limit": int(api_token_limit), "token_reserve_pct": int(api_reserve),
@@ -4407,4 +4591,3 @@ with right_col:
                     </div>
                 </div>
             """)
-
