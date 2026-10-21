@@ -842,11 +842,20 @@ def build_summary_instructions(campaign_name):
     """Style rules + the campaign-specific QC note rules (these decide what goes in the summary)."""
     family = get_campaign_category(campaign_name) if campaign_name else campaign_name
     qc_questions = compact_rules_text(get_qc_questions(family))
+    topic_rules = (
+        str(campaign_setting(family, "main_topic_rules", "") or "").strip()
+        or str((QC_CONFIG.get("global") or {}).get("main_topic_rules", "") or "").strip()
+    )
+    topic_block = (
+        "\nMAIN TOPIC RULES (follow these for main_topic; they override any main_topic line above):\n"
+        + compact_rules_text(topic_rules) + "\n"
+    ) if topic_rules else ""
     return (
         (str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES).rstrip()
         + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
         + qc_questions
         + "\n"
+        + topic_block
     )
 
 
@@ -1384,6 +1393,7 @@ DEFAULT_CAMPAIGN_SPAM = {
     "ai_semantic": True,            # let the AI also judge spam from the conversation
     "blocked_phones": [],           # phone numbers that always mean spam
     "extra_terms": [],              # words that always mean spam
+    "custom_rules": [],             # your own named rules: [{"on", "name", "words", "match": any|all}]
 }
 
 
@@ -1401,6 +1411,14 @@ def _phone_to_regex(entry):
     return r"(?<!\d)" + sep.join(digits) + r"(?!\d)"
 
 
+def _split_rule_words(text):
+    """'a, b; c' -> ['a', 'b', 'c'].  A cell that starts with regex: is kept as ONE raw pattern."""
+    text = str(text or "").strip()
+    if text.lower().startswith("regex:"):
+        return [text]
+    return [w.strip() for w in re.split(r"[,;\n]+", text) if w.strip()]
+
+
 def _build_campaign_spam_runtime(spam):
     s = dict(DEFAULT_CAMPAIGN_SPAM)
     s.update(spam or {})
@@ -1413,6 +1431,15 @@ def _build_campaign_spam_runtime(spam):
         pattern = _phone_to_regex(entry)
         if pattern:
             phone_res.append((str(entry).strip(), re.compile(pattern, re.IGNORECASE)))
+    custom_res = []
+    for rule in s.get("custom_rules") or []:
+        if not isinstance(rule, dict) or not rule.get("on", True):
+            continue
+        patterns = _valid_patterns(_split_rule_words(rule.get("words")))
+        if patterns:
+            rule_name = str(rule.get("name") or "").strip() or "Custom spam rule"
+            need_all = str(rule.get("match", "any")).strip().lower() == "all"
+            custom_res.append((rule_name, need_all, [re.compile(p, re.IGNORECASE) for p in patterns]))
     return {
         "enabled": bool(s.get("enabled")),
         "yelp_yellow": bool(s.get("yelp_yellow")),
@@ -1423,6 +1450,7 @@ def _build_campaign_spam_runtime(spam):
         "ai_semantic": bool(s.get("ai_semantic")),
         "phone_res": phone_res,
         "extra_res": [re.compile(p, re.IGNORECASE) for p in _valid_patterns(s.get("extra_terms"))],
+        "custom_res": custom_res,
     }
 
 
@@ -1459,6 +1487,12 @@ def detect_spam_signals(full_transcript, campaign_name=None):
         hit = rx.search(text)
         if hit:
             return 99, f"Blocked spam word '{hit.group(0)}' mentioned on the call", "Blocked word"
+
+    for rule_name, need_all, rxs in rt["custom_res"]:
+        hits = [rx.search(text) for rx in rxs]
+        if (all(hits) if need_all else any(hits)):
+            first = next(h for h in hits if h)
+            return 99, f"Spam rule '{rule_name}' matched ('{first.group(0)}')", rule_name
 
     if rt["robot_patterns"]:
         for rx, label in _STRONG_SPAM_RES:
@@ -3112,6 +3146,20 @@ def validate_qc_config(cfg):
         for entry in camp_spam.get("blocked_phones") or []:
             if not _phone_to_regex(entry):
                 errors.append(f"'{name}' blocked phone '{entry}' needs at least 7 digits.")
+        for rule in camp_spam.get("custom_rules") or []:
+            if not isinstance(rule, dict):
+                continue
+            rule_label = str(rule.get("name") or "unnamed rule")
+            words = _split_rule_words(rule.get("words"))
+            if not words:
+                errors.append(f"'{name}' spam rule '{rule_label}' has no words.")
+            for word in words:
+                pattern = _keyword_to_regex(word)
+                if pattern:
+                    try:
+                        re.compile(pattern)
+                    except re.error as exc:
+                        errors.append(f"'{name}' spam rule '{rule_label}': invalid pattern '{word}' ({exc})")
     limits = {f[0]: f[3] for f in SCORE_WEIGHT_FIELDS}
     for key, value in (cfg["global"].get("weights") or {}).items():
         if key in limits and not (0 <= float(value) <= limits[key]):
@@ -3257,6 +3305,62 @@ def _weight_inputs(cfg, ver, key_prefix, values, only_overridable=False, camp_na
     return result
 
 
+def _qc_items(camp):
+    """The campaign's QC questions as separate rows [{'text', 'on'}]."""
+    def _norm(value):
+        return "\n".join(line.strip() for line in str(value or "").splitlines() if line.strip())
+
+    saved = camp.get("qc_questions")
+    if isinstance(saved, list) and saved:
+        items = [{"text": str(x.get("text", "")).strip(), "on": bool(x.get("on", True))}
+                 for x in saved if isinstance(x, dict) and str(x.get("text", "")).strip()]
+        # Use the saved rows only while they still match the saved rules text (e.g. not edited by hand elsewhere).
+        if _norm("\n".join(i["text"] for i in items if i["on"])) == _norm(camp.get("qc_note_rules")):
+            return items
+    return [{"text": line.strip(), "on": True} for line in str(camp.get("qc_note_rules", "")).splitlines() if line.strip()]
+
+
+_SPAM_RULE_COLS = ("On", "Rule name", "Words (comma separated)", "Match")
+
+
+def _spam_rules_frame(rules):
+    import pandas as pd
+    rows = [{
+        "On": bool(r.get("on", True)),
+        "Rule name": str(r.get("name", "")),
+        "Words (comma separated)": str(r.get("words", "")),
+        "Match": "All words" if str(r.get("match", "any")).lower() == "all" else "Any word",
+    } for r in (rules or []) if isinstance(r, dict)]
+    if not rows:
+        return pd.DataFrame({
+            "On": pd.Series([], dtype="bool"), "Rule name": pd.Series([], dtype="object"),
+            "Words (comma separated)": pd.Series([], dtype="object"), "Match": pd.Series([], dtype="object"),
+        })
+    return pd.DataFrame(rows, columns=list(_SPAM_RULE_COLS))
+
+
+def _spam_rules_from_frame(frame):
+    import pandas as pd
+
+    def _text(value):
+        return "" if value is None or pd.isna(value) else str(value).strip()
+
+    rules = []
+    for rec in frame.to_dict("records"):
+        words = _text(rec.get("Words (comma separated)"))
+        if not words:
+            continue   # rows without words are dropped
+        on_value = rec.get("On")
+        on = True if on_value is None or pd.isna(on_value) else bool(on_value)
+        rules.append({
+            "on": on,
+            "name": _text(rec.get("Rule name")) or f"Custom rule {len(rules) + 1}",
+            "words": words,
+            "match": "all" if _text(rec.get("Match")).lower().startswith("all") else "any",
+        })
+    return rules
+
+
 def _cr_campaign_editor(cfg, name, ver):
     camp = cfg["campaigns"][name]
     kp = re.sub(r"\W+", "_", name)
@@ -3280,10 +3384,32 @@ def _cr_campaign_editor(cfg, name, ver):
                 "Campaign focus (1-2 sentences for the AI analysis)",
                 value=camp.get("focus", ""), height=150, key=f"cr_{ver}_{kp}_focus")
 
-        qc_rules = st.text_area(
-            "QC note rules - what the summary must include and avoid for this campaign",
-            value=camp.get("qc_note_rules", ""), height=420, key=f"cr_{ver}_{kp}_qc",
-            help="These rules decide what goes into the call summary for this campaign.")
+        st.markdown("#### ❓ Campaign questions / QC note rules (one by one)")
+        st.caption("Each row is one rule that decides what goes into the summary for this campaign. "
+                   "Edit any row, set Status to Off to pause it or Delete to remove it, change Order to move it, "
+                   "and add new ones in the box at the bottom. Click Save campaign to apply.")
+        q_items = _qc_items(camp)
+        q_rows = []
+        qh1, qh2, qh3 = st.columns([0.8, 1.4, 8])
+        qh1.caption("Order")
+        qh2.caption("Status")
+        qh3.caption("Rule")
+        for i, item in enumerate(q_items):
+            qa, qb, qc_col = st.columns([0.8, 1.4, 8])
+            with qa:
+                q_pos = st.number_input("Order", min_value=1, max_value=999, value=i + 1, step=1,
+                                        key=f"cr_{ver}_{kp}_qpos{i}", label_visibility="collapsed")
+            with qb:
+                q_state = st.selectbox("Status", ["On", "Off", "Delete"], index=0 if item["on"] else 1,
+                                       key=f"cr_{ver}_{kp}_qstate{i}", label_visibility="collapsed")
+            with qc_col:
+                q_text = st.text_area(f"Rule {i + 1}", value=item["text"],
+                                      height=max(68, min(240, 34 * (len(item["text"]) // 95 + 1) + 34)),
+                                      key=f"cr_{ver}_{kp}_qtext{i}", label_visibility="collapsed")
+            q_rows.append((int(q_pos), i, q_state, q_text))
+        new_q = st.text_area("➕ Add new rules / questions (one per line)", value="", height=100,
+                             key=f"cr_{ver}_{kp}_qnew",
+                             placeholder="Example: Always include the caller's budget if the caller said it.")
 
         c3, c4 = st.columns(2)
         with c3:
@@ -3329,6 +3455,20 @@ def _cr_campaign_editor(cfg, name, ver):
             sp_extra = st.text_area("Extra words that always mark a call as spam (one per line)", value="\n".join(sp.get("extra_terms") or []), height=110, key=f"cr_{ver}_{kp}_sp_extra",
                                     help="End a word with * to match any ending. Start a line with regex: for a raw pattern.")
 
+        st.markdown("**Your own spam rules (one by one)**")
+        st.caption("Each row is one rule: a call is spam when ANY (or ALL) of the words/phrases appear in the transcript. "
+                   "Use the + at the bottom of the table to add a rule, tick a row and press Delete to remove it. "
+                   "Separate words with commas. End a word with * for any ending (call*). Start a cell with regex: for a raw pattern.")
+        sp_rules_frame = st.data_editor(
+            _spam_rules_frame(sp.get("custom_rules")), num_rows="dynamic", hide_index=True,
+            key=f"cr_{ver}_{kp}_sp_rules",
+            column_config={
+                "On": st.column_config.CheckboxColumn("On"),
+                "Rule name": st.column_config.TextColumn("Rule name", width="medium"),
+                "Words (comma separated)": st.column_config.TextColumn("Words (comma separated)", width="large"),
+                "Match": st.column_config.SelectboxColumn("Match", options=["Any word", "All words"]),
+            })
+
         st.markdown("#### 📞 Call rules for this campaign")
         mismatch_on = st.checkbox("Caller wants a different service than this campaign = Wrong Number (score under 50)",
                                   value=bool(camp.get("mismatch_rule_enabled", True)), key=f"cr_{ver}_{kp}_mismatch")
@@ -3336,6 +3476,12 @@ def _cr_campaign_editor(cfg, name, ver):
             "Summary style for this campaign (leave empty to use the global summary style)",
             value=camp.get("summary_style", ""), height=160, key=f"cr_{ver}_{kp}_style",
             help="Replaces the global summary style for this campaign only. The QC note rules above are still added after it.")
+
+        main_topic_in = st.text_area(
+            "Main topic rules for this campaign (leave empty to use the global main topic rules)",
+            value=camp.get("main_topic_rules", ""), height=110, key=f"cr_{ver}_{kp}_maintopic",
+            help="How the Main topic (sheet column H) must be written for this campaign, "
+                 "for example: Name the service and the caller's need in 6-12 words.")
 
         st.markdown("#### Score settings for this campaign")
         st.caption("Pre-filled with the current values. Only numbers you change are saved as this campaign's own; "
@@ -3348,7 +3494,14 @@ def _cr_campaign_editor(cfg, name, ver):
         camp["name_keywords"] = _lines(name_kw)
         camp["match_priority"] = int(priority)
         camp["focus"] = focus.strip()
-        camp["qc_note_rules"] = qc_rules.strip()
+        q_new_items = [
+            {"text": q_text_value.strip(), "on": q_state_value != "Off"}
+            for _pos, _idx, q_state_value, q_text_value in sorted(q_rows, key=lambda r: (r[0], r[1]))
+            if q_state_value != "Delete" and q_text_value.strip()
+        ]
+        q_new_items += [{"text": line, "on": True} for line in _lines(new_q)]
+        camp["qc_questions"] = q_new_items
+        camp["qc_note_rules"] = "\n".join(item["text"] for item in q_new_items if item["on"])
         camp["service_keywords"] = _lines(service_kw)
         camp["qual_keywords"] = _lines(qual_kw)
         camp["block_government_insurance"] = bool(block_gov)
@@ -3358,9 +3511,11 @@ def _cr_campaign_editor(cfg, name, ver):
             "robot_patterns": bool(sp_robot), "solicitation": bool(sp_solic),
             "solicitation_threshold": int(sp_thresh), "ai_semantic": bool(sp_ai),
             "blocked_phones": _lines(sp_phones), "extra_terms": _lines(sp_extra),
+            "custom_rules": _spam_rules_from_frame(sp_rules_frame),
         }
         camp["mismatch_rule_enabled"] = bool(mismatch_on)
         camp["summary_style"] = style_override.strip()
+        camp["main_topic_rules"] = main_topic_in.strip()
         camp["score_overrides"] = {
             k: int(v) for k, v in values.items() if int(v) != int(global_weights.get(k, DEFAULT_WEIGHTS[k]))
         }
@@ -3522,6 +3677,11 @@ def _cr_spam_tab(cfg, ver):
         style = st.text_area("Summary style rules", value=g.get("summary_style_rules", ""), height=320, key=f"cr_{ver}_style",
                              help="Short-summary rules used for every campaign. Each campaign's own QC note rules are added after these.")
         default_qc = st.text_area("QC note rules for campaigns with no rules of their own", value=g.get("default_qc_questions", ""), height=200, key=f"cr_{ver}_defqc")
+        main_topic_global = st.text_area(
+            "Main topic rules (all campaigns)", value=g.get("main_topic_rules", ""), height=110,
+            key=f"cr_{ver}_maintopic_global",
+            help="How the Main topic (sheet column H) must be written. Leave empty to keep the main_topic line in the summary style above. "
+                 "A campaign's own main topic rules win over this.")
         submitted = st.form_submit_button("💾 Save", type="primary")
     if submitted:
         g["voice"].update({"no_voice_min_words": int(min_words), "min_audio_seconds": float(min_secs)})
@@ -3535,6 +3695,7 @@ def _cr_spam_tab(cfg, ver):
         g["private_terms"] = _lines(priv)
         g["summary_style_rules"] = style.strip() or _BUILTIN_SUMMARY_STYLE
         g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
+        g["main_topic_rules"] = main_topic_global.strip()
         if _commit_qc_config(cfg, "Saved spam / voice / insurance settings"):
             st.rerun()
 
