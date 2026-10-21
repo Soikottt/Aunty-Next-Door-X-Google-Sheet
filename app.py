@@ -934,6 +934,43 @@ def clean_main_topic(text, max_words=25):
 
 
 
+# ------------------------------------------------------------
+# WHO ENDED THE CALL (sheet column J "Hangup By") -> added to the end of every summary.
+# Added after the summary is written, so it uses no AI tokens. Editable in Campaign Rules.
+# ------------------------------------------------------------
+DEFAULT_HANGUP_SETTINGS = {
+    "enabled": True,
+    "caller_sentence": "The caller ended the call.",
+    "agent_sentence": "The agent ended the call.",
+}
+
+
+def hangup_sentence(hangup_by):
+    """Sentence for the Hangup By value, or '' when it is empty/unknown or the feature is switched off."""
+    value = " ".join(str(hangup_by or "").split())
+    if not value or value.lower() in {"-", "n/a", "na", "none", "unknown", "null"}:
+        return ""
+    settings = {**DEFAULT_HANGUP_SETTINGS, **((QC_CONFIG.get("global") or {}).get("hangup") or {})}
+    if not settings.get("enabled", True):
+        return ""
+    low = value.lower()
+    if re.search(r"\b(caller|customer|consumer|inbound|publisher|lead)\b", low):
+        return str(settings.get("caller_sentence") or DEFAULT_HANGUP_SETTINGS["caller_sentence"]).strip()
+    if re.search(r"\b(agent|target|buyer|rep|representative|operator|advertiser|outbound)\b", low):
+        return str(settings.get("agent_sentence") or DEFAULT_HANGUP_SETTINGS["agent_sentence"]).strip()
+    return f"The call was ended by {value}."
+
+
+def add_hangup_to_summary(summary, hangup_by):
+    text = str(summary or "").strip()
+    sentence = hangup_sentence(hangup_by)
+    if not text or not sentence or sentence.lower() in text.lower():
+        return text
+    if text[-1] not in ".!?":
+        text += "."
+    return f"{text} {sentence}"
+
+
 def _analysis_prompt(full_transcript, campaign_name, timeline_data=None):
     """Compact analysis prompt. Everything fixed comes FIRST and the transcript comes LAST, so Groq's
     automatic prompt caching can reuse the fixed part (cached tokens do not count toward your limits)."""
@@ -3677,6 +3714,15 @@ def _cr_spam_tab(cfg, ver):
         style = st.text_area("Summary style rules", value=g.get("summary_style_rules", ""), height=320, key=f"cr_{ver}_style",
                              help="Short-summary rules used for every campaign. Each campaign's own QC note rules are added after these.")
         default_qc = st.text_area("QC note rules for campaigns with no rules of their own", value=g.get("default_qc_questions", ""), height=200, key=f"cr_{ver}_defqc")
+        st.markdown('#### Who ended the call (sheet column J "Hangup By")')
+        hang = {**DEFAULT_HANGUP_SETTINGS, **(g.get("hangup") or {})}
+        hang_on = st.checkbox('Add "who ended the call" to the end of every summary (read from column J, uses no AI tokens)',
+                              value=bool(hang["enabled"]), key=f"cr_{ver}_hang_on")
+        hg1, hg2 = st.columns(2)
+        with hg1:
+            hang_caller = st.text_input("Sentence when the caller hung up", value=hang["caller_sentence"], key=f"cr_{ver}_hang_caller")
+        with hg2:
+            hang_agent = st.text_input("Sentence when the agent hung up", value=hang["agent_sentence"], key=f"cr_{ver}_hang_agent")
         main_topic_global = st.text_area(
             "Main topic rules (all campaigns)", value=g.get("main_topic_rules", ""), height=110,
             key=f"cr_{ver}_maintopic_global",
@@ -3696,6 +3742,11 @@ def _cr_spam_tab(cfg, ver):
         g["summary_style_rules"] = style.strip() or _BUILTIN_SUMMARY_STYLE
         g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
         g["main_topic_rules"] = main_topic_global.strip()
+        g["hangup"] = {
+            "enabled": bool(hang_on),
+            "caller_sentence": hang_caller.strip() or DEFAULT_HANGUP_SETTINGS["caller_sentence"],
+            "agent_sentence": hang_agent.strip() or DEFAULT_HANGUP_SETTINGS["agent_sentence"],
+        }
         if _commit_qc_config(cfg, "Saved spam / voice / insurance settings"):
             st.rerun()
 
@@ -4039,6 +4090,7 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             existing_g = row[6].strip() if len(row) > 6 else ""
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
+            hangup_by = row[9].strip() if len(row) > 9 else ""   # column J = "Hangup By"
 
             # Trigger: recording exists + Summary or Main topic is missing (or progress is stale).
             work_state = _row_work_state(recording_url, existing_g, existing_main_topic)
@@ -4108,7 +4160,7 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                 analysis["campaign_category"] = campaign_to_use
 
                 main_topic = analysis["main_topic"]
-                detailed_summary = analysis["long_summary"]
+                detailed_summary = add_hangup_to_summary(analysis["long_summary"], hangup_by)
                 score = calculate_call_quality_score(analysis)
                 analysis["quality_score"] = score
                 qc_report = build_qc_report(analysis)
