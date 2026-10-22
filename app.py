@@ -1025,11 +1025,14 @@ RULES:
 - call_type_reason: one short sentence (5-15 words). qualification_reason: brief. qc_issue: only a real, supported issue, else "".
 - Use QUALIFIED or NON-QUALIFIED ONLY when the caller wants this campaign's service. Information-only, unclear or off-campaign callers: INFORMATION ONLY, WRONG NUMBER or OTHER. A different service than the campaign: matches_campaign=false and call_type=WRONG NUMBER (say what they wanted).
 - Silent/no-response: do not invent intent. Spam/robot: say what it promoted.
+- long_summary and main_topic: write them exactly as a dedicated summary writer would, following the SUMMARY STYLE below. The other fields and the campaign focus must not change how they are written.
 {spam_rules_text}{insurance_rule}
 
 CAMPAIGN: {campaign_name}
-CAMPAIGN FOCUS: {campaign_guidance}
+CAMPAIGN FOCUS (for call_type and qualification only): {campaign_guidance}
 {summary_instructions}
+Read the whole transcript before writing. Use only facts clearly supported by the transcript.
+
 TRANSCRIPT:
 {full_transcript}
 """
