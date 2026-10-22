@@ -850,12 +850,18 @@ def build_summary_instructions(campaign_name):
         "\nMAIN TOPIC RULES (follow these for main_topic; they override any main_topic line above):\n"
         + compact_rules_text(topic_rules) + "\n"
     ) if topic_rules else ""
+    roles_block = (
+        "\nSPEAKER ROLES: Work out from the conversation who is the caller and who is the agent "
+        "(the caller states the need; the agent greets, asks questions and offers help). "
+        "Never mix up what the caller said with what the agent said.\n"
+    ) if (QC_CONFIG.get("global") or {}).get("speaker_roles", True) else ""
     return (
         (str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES).rstrip()
         + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
         + qc_questions
         + "\n"
         + topic_block
+        + roles_block
     )
 
 
@@ -882,11 +888,19 @@ _BANNED_SUMMARY_RE = re.compile(
     r"(?:mentioned|provided|stated|specified|discussed|given|disclosed|details?|information)\b"
     r"|\bunknown\b|\bno clear (?:resolution|outcome|details?)\b|\bno confirmed appointment\b"
     r"|\bno referral\b|\bnot clear\b|\bthe transcript\b|\bas an ai\b|\bqc questions?\b"
+    r"|\bno (?:appointment|treatment)\b[^.!?]{0,40}\b(?:decision|made|booked|scheduled|set)\b"
     r"|\b(?:said|says|greeted|greeting)\s+(?:hello|hi|hey|good (?:morning|afternoon|evening))\b"
     r"|\bthanked (?:the )?(?:caller|agent)\b",
     re.IGNORECASE,
 )
 _PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b")
+
+
+def _custom_banned_hit(sentence):
+    """True when the sentence contains one of the phrases you banned in Campaign Rules (all campaigns)."""
+    phrases = (QC_CONFIG.get("global") or {}).get("banned_summary_phrases") or []
+    low = str(sentence or "").lower()
+    return any(str(p or "").strip().lower() in low for p in phrases if str(p or "").strip())
 
 
 def clean_summary_text(text, max_sentences=4, max_chars=700):
@@ -903,7 +917,7 @@ def clean_summary_text(text, max_sentences=4, max_chars=700):
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw) if s.strip()]
     kept, seen = [], set()
     for sentence in sentences:
-        if _BANNED_SUMMARY_RE.search(sentence):
+        if _BANNED_SUMMARY_RE.search(sentence) or _custom_banned_hit(sentence):
             continue
         key = re.sub(r"[^a-z0-9]+", " ", sentence.lower()).strip()
         if key in seen:
@@ -3726,6 +3740,12 @@ def _cr_spam_tab(cfg, ver):
             hang_caller = st.text_input("Sentence when the caller hung up", value=hang["caller_sentence"], key=f"cr_{ver}_hang_caller")
         with hg2:
             hang_agent = st.text_input("Sentence when the agent hung up", value=hang["agent_sentence"], key=f"cr_{ver}_hang_agent")
+        roles_on = st.checkbox("Summary AI works out who is the caller and who is the agent from the conversation (same AI call, a few extra tokens)",
+                               value=bool(g.get("speaker_roles", True)), key=f"cr_{ver}_roles_on")
+        banned_in = st.text_area("Never write these in any summary (one phrase per line)",
+                                 value="\n".join(g.get("banned_summary_phrases") or []), height=90,
+                                 key=f"cr_{ver}_banned_phrases",
+                                 help="Any summary sentence containing one of these phrases is removed. Applies to every campaign.")
         main_topic_global = st.text_area(
             "Main topic rules (all campaigns)", value=g.get("main_topic_rules", ""), height=110,
             key=f"cr_{ver}_maintopic_global",
@@ -3745,6 +3765,8 @@ def _cr_spam_tab(cfg, ver):
         g["summary_style_rules"] = style.strip() or _BUILTIN_SUMMARY_STYLE
         g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
         g["main_topic_rules"] = main_topic_global.strip()
+        g["speaker_roles"] = bool(roles_on)
+        g["banned_summary_phrases"] = _lines(banned_in)
         g["hangup"] = {
             "enabled": bool(hang_on),
             "caller_sentence": hang_caller.strip() or DEFAULT_HANGUP_SETTINGS["caller_sentence"],
