@@ -856,9 +856,10 @@ def build_summary_instructions(campaign_name):
         low, high = length
         count = f"exactly {high}" if low == high else f"{low}-{high}"
         length_block = (
-            f"\nSUMMARY LENGTH (overrides any length rule above): this call lasted {seconds // 60}:{seconds % 60:02d}. "
-            f"Write {count} short sentences (about {low * 17}-{high * 20} words). Cover every important detail the caller "
-            "and the agent gave. Do not make it shorter than this, even if another rule says to keep it short.\n"
+            f"\nREQUIRED SUMMARY LENGTH (final; replaces every other length, 'short' or 'concise' rule above): "
+            f"this call lasted {seconds // 60}:{seconds % 60:02d}. Write {count} short sentences "
+            f"(about {low * 17}-{high * 20} words). Cover every important detail the caller and the agent gave. "
+            "Do not write fewer sentences than this.\n"
         )
     else:
         length_block = ""
@@ -874,7 +875,7 @@ def build_summary_instructions(campaign_name):
     return (
         _style_for_length((str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES), length).rstrip()
         + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
-        + qc_questions
+        + _style_for_length(qc_questions, length)
         + "\n"
         + topic_block
         + roles_block
@@ -984,13 +985,27 @@ def _summary_caps():
 
 
 def _style_for_length(style, length):
-    """When a duration-based length is active, remove the fixed sentence/word counts from the style text
-    so the AI gets ONE length instruction instead of two that disagree."""
+    """When a duration-based length is active, remove the fixed 'short / concise / max N sentences' wording
+    from the style and QC rules text (in the prompt only, your saved rules are not changed), so the AI gets
+    ONE length instruction instead of several that disagree."""
     if not length:
         return style
-    style = re.sub(r"\b\d+\s*-\s*\d+\s+short sentences", "short sentences", style)
-    style = re.sub(r"\s*\(\s*about\s+\d+\s*-\s*\d+\s+words\s*\)", "", style)
-    return style
+    text = str(style or "")
+    patterns = [
+        (r"\bKeep the summary (?:short and )?concise\.?\s*", ""),
+        (r"\bCombine related (?:information|facts) into one sentence when possible\.?\s*", ""),
+        (r"\bPrefer \d+ short sentences over one long sentence\.?\s*", ""),
+        (r"\bNever more than \d+ sentences\.?\s*", ""),
+        (r"\b\d+\s*(?:-|to)\s*\d+\s+short sentences", "short sentences"),
+        (r"\s*\(\s*about\s+\d+\s*-\s*\d+\s+words\s*\)", ""),
+        (r"\bONE short plain-text paragraph", "ONE plain-text paragraph"),
+        (r"\bWrite a short, natural", "Write a natural"),
+        (r"\bKeep the final summary very short,", "Keep the final summary"),
+        (r"\bWrite ONE short paragraph only", "Write ONE paragraph only"),
+    ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
 
 
 def _max_out_tokens(base):
