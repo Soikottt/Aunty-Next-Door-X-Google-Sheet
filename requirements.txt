@@ -6,3 +6,4 @@ groq
 gspread
 requests
 python-dotenv
+openai
