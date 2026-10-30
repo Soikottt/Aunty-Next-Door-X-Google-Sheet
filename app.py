@@ -1017,7 +1017,13 @@ def _style_for_length(style, length):
 
 
 def _max_out_tokens(base):
-    """Room for the longer summaries (a cap only - tokens are only spent when the AI writes them)."""
+    """Room for the longer summaries (a cap only - tokens are only spent when the AI writes them).
+    An extra AI can set its own max_tokens in secrets (useful for 'thinking' models)."""
+    provider = _active_provider("llm")
+    if provider != "Groq":
+        custom = int((get_ai_providers().get(provider) or {}).get("max_tokens") or 0)
+        if custom:
+            base = custom
     length = get_summary_length()
     return base + (max(0, length[1] - 4) * 60 if length else 0)
 
@@ -1431,6 +1437,7 @@ model    = "deepseek-chat"
 api_key  = "sk-or-..."
 base_url = "https://openrouter.ai/api/v1"
 model    = "openai/gpt-4o-mini"   # any model name from openrouter.ai/models
+# max_tokens = 3000             # optional: raise it for "thinking" models
 
 [AI_PROVIDERS.Mistral]
 api_key  = "..."
@@ -1456,8 +1463,12 @@ def get_ai_providers():
             base_url = str(cfg.get("base_url") or "").strip()
             model = str(cfg.get("model") or "").strip()
             if keys and base_url and model:
+                try:
+                    max_tokens = int(cfg.get("max_tokens") or 0)
+                except (TypeError, ValueError):
+                    max_tokens = 0
                 providers[name] = {"keys": keys, "base_url": base_url, "model": model,
-                                   "stt_model": str(cfg.get("stt_model") or "").strip()}
+                                   "stt_model": str(cfg.get("stt_model") or "").strip(), "max_tokens": max_tokens}
     except Exception:
         pass
     return providers
@@ -1648,6 +1659,30 @@ def render_api_usage_meter():
             st.caption("Keys at their limit: " + ", ".join(blocked))
 
 
+def _finish_llm_json(response):
+    """JSON answer from the chat call. Groq: unchanged. Extra AIs: an empty, cut-off or summary-less answer
+    raises a clear error (the row is retried) instead of writing 'not clear enough to summarize' to the sheet."""
+    content = response.choices[0].message.content or "{}"
+    provider = _active_provider("llm")
+    if provider == "Groq":
+        return _parse_json_object(content)
+    reason = getattr(response.choices[0], "finish_reason", "")
+    if not content.strip() or content.strip() == "{}":
+        print(f"[{provider}] empty answer, finish_reason={reason}")
+        raise ValueError(f"{provider} returned an empty answer (finish_reason: {reason}). "
+                         "Use a model that is not a 'thinking' model, or add max_tokens to its secrets block.")
+    result = _parse_json_object(content)
+    if isinstance(result, dict):
+        if len(result) == 1 and isinstance(next(iter(result.values())), dict):
+            result = next(iter(result.values()))
+        result = {str(k).strip().lower().replace(" ", "_"): v for k, v in result.items()}
+    if not str(result.get("long_summary") or "").strip():
+        print(f"[{provider}] answer without long_summary, finish_reason={reason}: {content[:300]}")
+        raise ValueError(f"{provider} answer had no long_summary (finish_reason: {reason}). "
+                         "Try another model for this AI.")
+    return result
+
+
 def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
     response = client.chat.completions.create(
         model=_llm_model(),
@@ -1664,8 +1699,7 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
         response_format={"type": "json_object"}
     )
     _log_groq_token_usage(response, label)
-    content = response.choices[0].message.content or "{}"
-    return _parse_json_object(content)
+    return _finish_llm_json(response)
 
 
 # ------------------------------------------------------------
@@ -2341,7 +2375,7 @@ def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
         response_format={"type": "json_object"}
     )
     _log_groq_token_usage(response, label)
-    return _parse_json_object(response.choices[0].message.content or "{}")
+    return _finish_llm_json(response)
 
 
 def generate_fast_summary_groq(full_transcript, campaign_name):
