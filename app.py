@@ -857,8 +857,8 @@ def build_summary_instructions(campaign_name):
         count = f"exactly {high}" if low == high else f"{low}-{high}"
         length_block = (
             f"\nSUMMARY LENGTH (overrides any length rule above): this call lasted {seconds // 60}:{seconds % 60:02d}. "
-            f"Write {count} short sentences. Cover every important detail the caller and the agent gave; "
-            "do not stop early on a long call.\n"
+            f"Write {count} short sentences (about {low * 17}-{high * 20} words). Cover every important detail the caller "
+            "and the agent gave. Do not make it shorter than this, even if another rule says to keep it short.\n"
         )
     else:
         length_block = ""
@@ -872,7 +872,7 @@ def build_summary_instructions(campaign_name):
         "Never mix up what the caller said with what the agent said.\n"
     ) if (QC_CONFIG.get("global") or {}).get("speaker_roles", True) else ""
     return (
-        (str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES).rstrip()
+        _style_for_length((str(campaign_setting(family, "summary_style", "") or "").strip() or SUMMARY_STYLE_RULES), length).rstrip()
         + "\n\nCAMPAIGN QC NOTE RULES (decide what belongs in the summary; never mention them):\n"
         + qc_questions
         + "\n"
@@ -981,6 +981,16 @@ def _summary_caps():
     if not length:
         return 4, 700
     return max(4, length[1]), max(700, length[1] * 200)
+
+
+def _style_for_length(style, length):
+    """When a duration-based length is active, remove the fixed sentence/word counts from the style text
+    so the AI gets ONE length instruction instead of two that disagree."""
+    if not length:
+        return style
+    style = re.sub(r"\b\d+\s*-\s*\d+\s+short sentences", "short sentences", style)
+    style = re.sub(r"\s*\(\s*about\s+\d+\s*-\s*\d+\s+words\s*\)", "", style)
+    return style
 
 
 def _max_out_tokens(base):
@@ -1182,6 +1192,7 @@ DEFAULT_API_SETTINGS = {
     "sheet_write_interval": 1.2,    # seconds between Google Sheet writes (keeps you under the 60/min limit)
     "llm_provider": "Groq",         # AI used for summaries + call analysis (name only; Groq or a name from secrets)
     "stt_provider": "Groq",         # AI used for transcription
+    "fallback_to_groq": False,      # use Groq when the chosen AI is at its limit on every key
 }
 
 USAGE_PATH = Path("api_usage.json")
@@ -1420,8 +1431,13 @@ def get_ai_providers():
     return providers
 
 
+_FORCE_GROQ = {"on": False}   # switched on only while the Groq fallback runs
+
+
 def _active_provider(kind):
     """Provider chosen in Campaign Rules for 'llm' (summary/analysis) or 'stt' (transcription)."""
+    if _FORCE_GROQ["on"]:
+        return "Groq"
     settings = get_api_settings()
     name = str(settings.get("stt_provider" if kind == "stt" else "llm_provider") or "Groq")
     if name == "Groq":
@@ -1502,7 +1518,18 @@ def _with_key_fallback(call_fn, label, estimated_tokens=0, kind="llm", keys=None
     """
     provider = _active_provider("stt" if kind == "stt" else "llm")
     if provider != "Groq":
-        return _with_provider_fallback(provider, call_fn, label, kind, timeout)
+        try:
+            return _with_provider_fallback(provider, call_fn, label, kind, timeout)
+        except GroqLimitReached:
+            # Optional (Campaign Rules -> Which AI to use): run this one request on Groq instead of stopping.
+            if not (get_api_settings().get("fallback_to_groq") and (keys or GROQ_API_KEYS)):
+                raise
+            print(f"[{provider}] limit reached - using Groq for this request")
+            _FORCE_GROQ["on"] = True
+            try:
+                return _with_key_fallback(call_fn, label, estimated_tokens, kind, keys, timeout)
+            finally:
+                _FORCE_GROQ["on"] = False
 
     key_list = list(keys if keys is not None else GROQ_API_KEYS)
     if not key_list:
@@ -3964,6 +3991,10 @@ def _cr_spam_tab(cfg, ver):
             api_stt = st.selectbox("AI for transcription", stt_options,
                                    index=stt_options.index(api["stt_provider"]) if api["stt_provider"] in stt_options else 0,
                                    key=f"cr_{ver}_api_stt")
+        api_fallback = st.checkbox("Use Groq if the chosen AI is at its limit", value=bool(api["fallback_to_groq"]),
+                                   key=f"cr_{ver}_api_fallback",
+                                   help="When every key of the chosen AI is at its limit, the request runs on Groq instead of stopping. "
+                                        "Only counts when the chosen AI is not Groq.")
         st.caption("Only names are shown. Keys stay in Streamlit secrets and are never displayed. "
                    "The daily token limit above counts Groq only.")
         with st.expander("➕ How to add another AI (Streamlit secrets)"):
@@ -4015,7 +4046,7 @@ def _cr_spam_tab(cfg, ver):
             "max_transcript_tokens": int(api_max_tx), "ai_min_words": int(api_min_words),
             "skip_ai_for_spam": bool(api_skip_spam), "max_retry_attempts": int(api_attempts),
             "sheet_write_interval": float(api_interval),
-            "llm_provider": api_llm, "stt_provider": api_stt,
+            "llm_provider": api_llm, "stt_provider": api_stt, "fallback_to_groq": bool(api_fallback),
         }
         g["government_terms"] = _lines(gov)
         g["private_terms"] = _lines(priv)
