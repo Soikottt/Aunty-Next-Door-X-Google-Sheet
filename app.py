@@ -855,12 +855,13 @@ def build_summary_instructions(campaign_name):
         seconds = int(_CALL_CTX["duration"] or 0)
         low, high = length
         count = f"exactly {high}" if low == high else f"{low}-{high}"
-        length_block = (
-            f"\nREQUIRED SUMMARY LENGTH (final; replaces every other length, 'short' or 'concise' rule above): "
-            f"this call lasted {seconds // 60}:{seconds % 60:02d}. Write {count} short sentences "
-            f"(about {low * 17}-{high * 20} words). Cover every important detail the caller and the agent gave. "
-            "Do not write fewer sentences than this.\n"
-        )
+        rule_text = str(((QC_CONFIG.get("global") or {}).get("summary_length") or {}).get("rule_text") or "").strip() \
+            or DEFAULT_LENGTH_RULE_TEXT
+        length_block = "\n" + (
+            rule_text.replace("{duration}", f"{seconds // 60}:{seconds % 60:02d}")
+            .replace("{sentences}", count)
+            .replace("{words}", f"{low * 17}-{high * 20}")
+        ) + "\n"
     else:
         length_block = ""
     plain_block = (
@@ -954,6 +955,13 @@ DEFAULT_SUMMARY_LENGTH = {
         {"upto_sec": 0, "min_sentences": 6, "max_sentences": 8},
     ],
 }
+
+
+DEFAULT_LENGTH_RULE_TEXT = (
+    "REQUIRED SUMMARY LENGTH (final; replaces every other length, 'short' or 'concise' rule above): "
+    "this call lasted {duration}. Write {sentences} short sentences (about {words} words). "
+    "Cover every important detail the caller and the agent gave. Do not write fewer sentences than this."
+)
 
 
 def get_summary_length(duration_sec=None):
@@ -1419,6 +1427,16 @@ model    = "gemini-2.0-flash"
 api_keys = ["sk-key-one", "sk-key-two"]   # use api_keys for more than one key
 base_url = "https://api.deepseek.com"
 model    = "deepseek-chat"
+
+[AI_PROVIDERS.OpenRouter]
+api_key  = "sk-or-..."
+base_url = "https://openrouter.ai/api/v1"
+model    = "openai/gpt-4o-mini"   # any model name from openrouter.ai/models
+
+[AI_PROVIDERS.Mistral]
+api_key  = "..."
+base_url = "https://api.mistral.ai/v1"
+model    = "mistral-small-latest"
 """
 
 
@@ -4046,6 +4064,11 @@ def _cr_spam_tab(cfg, ver):
             _pd.DataFrame(sl_saved["tiers"], columns=["upto_sec", "min_sentences", "max_sentences"]).rename(columns={
                 "upto_sec": "Up to (seconds, 0 = longer)", "min_sentences": "Min sentences", "max_sentences": "Max sentences"}),
             num_rows="dynamic", hide_index=True, key=f"cr_{ver}_sl_tiers")
+        sl_rule_text = st.text_area(
+            "Length instruction sent to the AI", value=sl_saved.get("rule_text") or DEFAULT_LENGTH_RULE_TEXT, height=130,
+            key=f"cr_{ver}_sl_rule_text",
+            help="Wording of the length rule. {duration}, {sentences} and {words} are filled in for each call. "
+                 "Clear the box and save to go back to the default wording.")
         plain_on = st.checkbox("Write summaries in plain, simple English", value=bool(g.get("plain_english", True)),
                                key=f"cr_{ver}_plain_on")
         main_topic_global = st.text_area(
@@ -4080,7 +4103,8 @@ def _cr_spam_tab(cfg, ver):
                 continue
             if _hi >= 1:
                 _tiers.append({"upto_sec": max(0, _upto), "min_sentences": max(1, min(_lo, _hi)), "max_sentences": _hi})
-        g["summary_length"] = {"enabled": bool(sl_on), "tiers": _tiers or DEFAULT_SUMMARY_LENGTH["tiers"]}
+        g["summary_length"] = {"enabled": bool(sl_on), "tiers": _tiers or DEFAULT_SUMMARY_LENGTH["tiers"],
+                               "rule_text": sl_rule_text.strip() if sl_rule_text.strip() != DEFAULT_LENGTH_RULE_TEXT else ""}
         g["banned_summary_phrases"] = _lines(banned_in)
         g["hangup"] = {
             "enabled": bool(hang_on),
