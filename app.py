@@ -763,7 +763,7 @@ def format_time(seconds):
 
 def transcribe_groq_whisper(audio_file_path):
     stt_keys = list(GROQ_API_KEYS) or ([GROQ_API_KEY] if GROQ_API_KEY else [])
-    if not stt_keys:
+    if not stt_keys and _active_provider("stt") == "Groq":
         raise RuntimeError("Groq API key not found. Configure Aunty_NEXT_DOOR_API_PRIMARY.")
 
     with open(audio_file_path, "rb") as file:
@@ -773,7 +773,7 @@ def transcribe_groq_whisper(audio_file_path):
     def _transcribe(client, label):
         return client.audio.transcriptions.create(
             file=(file_name, audio_bytes),
-            model="whisper-large-v3-turbo",
+            model=_stt_model(),
             response_format="verbose_json",
             language="en",
         )
@@ -850,6 +850,22 @@ def build_summary_instructions(campaign_name):
         "\nMAIN TOPIC RULES (follow these for main_topic; they override any main_topic line above):\n"
         + compact_rules_text(topic_rules) + "\n"
     ) if topic_rules else ""
+    length = get_summary_length()
+    if length:
+        seconds = int(_CALL_CTX["duration"] or 0)
+        low, high = length
+        count = f"exactly {high}" if low == high else f"{low}-{high}"
+        length_block = (
+            f"\nSUMMARY LENGTH (overrides any length rule above): this call lasted {seconds // 60}:{seconds % 60:02d}. "
+            f"Write {count} short sentences. Cover every important detail the caller and the agent gave; "
+            "do not stop early on a long call.\n"
+        )
+    else:
+        length_block = ""
+    plain_block = (
+        "\nPLAIN ENGLISH: Write in simple everyday English. Short sentences, common words, no jargon or fancy words "
+        "(say \"asked about\", not \"inquired regarding\").\n"
+    ) if (QC_CONFIG.get("global") or {}).get("plain_english", True) else ""
     roles_block = (
         "\nSPEAKER ROLES: Work out from the conversation who is the caller and who is the agent "
         "(the caller states the need; the agent greets, asks questions and offers help). "
@@ -862,6 +878,8 @@ def build_summary_instructions(campaign_name):
         + "\n"
         + topic_block
         + roles_block
+        + length_block
+        + plain_block
     )
 
 
@@ -896,6 +914,81 @@ _BANNED_SUMMARY_RE = re.compile(
 _PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?\(?\b\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b")
 
 
+# ------------------------------------------------------------
+# SUMMARY LENGTH BY CALL DURATION (sheet column F) - editable in Campaign Rules
+# ------------------------------------------------------------
+_CALL_CTX = {"duration": None}   # set right before each summary is written
+
+
+def set_call_duration(seconds):
+    try:
+        _CALL_CTX["duration"] = float(seconds) if seconds else None
+    except (TypeError, ValueError):
+        _CALL_CTX["duration"] = None
+
+
+def _duration_text_to_seconds(text):
+    """'0:03:25' / '3:25' / '205' -> seconds (None when empty or unreadable)."""
+    value = str(text or "").strip()
+    if not value:
+        return None
+    try:
+        if ":" in value:
+            total = 0.0
+            for part in value.split(":"):
+                total = total * 60 + float(part)
+            return total
+        return float(value)
+    except ValueError:
+        return None
+
+
+DEFAULT_SUMMARY_LENGTH = {
+    "enabled": True,
+    "tiers": [   # upto_sec 0 = longer than every tier above
+        {"upto_sec": 30, "min_sentences": 1, "max_sentences": 2},
+        {"upto_sec": 60, "min_sentences": 2, "max_sentences": 3},
+        {"upto_sec": 120, "min_sentences": 3, "max_sentences": 3},
+        {"upto_sec": 300, "min_sentences": 4, "max_sentences": 5},
+        {"upto_sec": 0, "min_sentences": 6, "max_sentences": 8},
+    ],
+}
+
+
+def get_summary_length(duration_sec=None):
+    """(min_sentences, max_sentences) for this call, or None when the feature is off / duration unknown."""
+    seconds = _CALL_CTX["duration"] if duration_sec is None else duration_sec
+    saved = (QC_CONFIG.get("global") or {}).get("summary_length") or {}
+    if not saved.get("enabled", DEFAULT_SUMMARY_LENGTH["enabled"]) or not seconds:
+        return None
+    tiers = saved.get("tiers") or DEFAULT_SUMMARY_LENGTH["tiers"]
+    try:
+        tiers = sorted(tiers, key=lambda x: (int(x.get("upto_sec") or 0) == 0, int(x.get("upto_sec") or 0)))
+        for tier in tiers:
+            upto = int(tier.get("upto_sec") or 0)
+            if upto == 0 or seconds <= upto:
+                low = max(1, int(tier.get("min_sentences") or 1))
+                high = max(low, int(tier.get("max_sentences") or low))
+                return low, high
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _summary_caps():
+    """(max_sentences, max_chars) used by clean_summary_text; the old 4 / 700 when length-by-duration is not active."""
+    length = get_summary_length()
+    if not length:
+        return 4, 700
+    return max(4, length[1]), max(700, length[1] * 200)
+
+
+def _max_out_tokens(base):
+    """Room for the longer summaries (a cap only - tokens are only spent when the AI writes them)."""
+    length = get_summary_length()
+    return base + (max(0, length[1] - 4) * 60 if length else 0)
+
+
 def _custom_banned_hit(sentence):
     """True when the sentence contains one of the phrases you banned in Campaign Rules (all campaigns)."""
     phrases = (QC_CONFIG.get("global") or {}).get("banned_summary_phrases") or []
@@ -903,9 +996,13 @@ def _custom_banned_hit(sentence):
     return any(str(p or "").strip().lower() in low for p in phrases if str(p or "").strip())
 
 
-def clean_summary_text(text, max_sentences=4, max_chars=700):
+def clean_summary_text(text, max_sentences=None, max_chars=None):
     """Final safety net: strip markdown, filler/'not mentioned' sentences, phone numbers,
-    duplicate sentences, and cap the length."""
+    duplicate sentences, and cap the length (the cap follows the call duration, see Campaign Rules)."""
+    if max_sentences is None or max_chars is None:
+        cap_sentences, cap_chars = _summary_caps()
+        max_sentences = cap_sentences if max_sentences is None else max_sentences
+        max_chars = cap_chars if max_chars is None else max_chars
     raw = str(text or "")
     raw = re.sub(r"[*`#>]+", "", raw)
     raw = re.sub(r"^\s*(?:[-\u2022]|\d+[.)])\s+", "", raw, flags=re.MULTILINE)
@@ -1083,6 +1180,8 @@ DEFAULT_API_SETTINGS = {
     "skip_ai_for_spam": True,       # confirmed spam (Yelp etc.) is finished locally, zero tokens
     "max_retry_attempts": 3,        # a row that keeps failing is parked after this many tries
     "sheet_write_interval": 1.2,    # seconds between Google Sheet writes (keeps you under the 60/min limit)
+    "llm_provider": "Groq",         # AI used for summaries + call analysis (name only; Groq or a name from secrets)
+    "stt_provider": "Groq",         # AI used for transcription
 }
 
 USAGE_PATH = Path("api_usage.json")
@@ -1271,6 +1370,128 @@ def _groq_client(key, timeout=None):
     return Groq(api_key=key, timeout=timeout or GROQ_TIMEOUT_SEC, max_retries=0)
 
 
+# ------------------------------------------------------------
+# EXTRA AI PROVIDERS (OpenAI, Gemini, DeepSeek, OpenRouter, Mistral... anything OpenAI-compatible)
+# Add them in Streamlit secrets as [AI_PROVIDERS.<Name>]; the <Name> is what you see and choose in
+# Campaign Rules. Keys are read from secrets only and are never shown in the app.
+# ------------------------------------------------------------
+AI_PROVIDERS_SECRETS_EXAMPLE = """# Streamlit secrets (TOML). Your existing Groq secrets stay exactly as they are.
+# Add one block per extra AI. The part after AI_PROVIDERS. is the name you will see in the app.
+
+[AI_PROVIDERS.OpenAI]
+api_key  = "sk-..."
+base_url = "https://api.openai.com/v1"
+model    = "gpt-4o-mini"        # summaries + analysis
+stt_model = "whisper-1"         # optional: only if you want this AI for transcription too
+
+[AI_PROVIDERS.Gemini]
+api_key  = "AIza..."
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+model    = "gemini-2.0-flash"
+
+[AI_PROVIDERS.DeepSeek]
+api_keys = ["sk-key-one", "sk-key-two"]   # use api_keys for more than one key
+base_url = "https://api.deepseek.com"
+model    = "deepseek-chat"
+"""
+
+
+def get_ai_providers():
+    """{name: {keys, base_url, model, stt_model}} from secrets. Only names are ever shown to the user."""
+    providers = {}
+    try:
+        table = st.secrets.get("AI_PROVIDERS", {}) or {}
+        for name, cfg in dict(table).items():
+            name = str(name).strip()
+            if not name or name.lower() == "groq":
+                continue
+            cfg = dict(cfg or {})
+            keys = cfg.get("api_keys") or cfg.get("api_key") or ""
+            if isinstance(keys, str):
+                keys = [keys]
+            keys = [str(k).strip() for k in keys if str(k).strip()]
+            base_url = str(cfg.get("base_url") or "").strip()
+            model = str(cfg.get("model") or "").strip()
+            if keys and base_url and model:
+                providers[name] = {"keys": keys, "base_url": base_url, "model": model,
+                                   "stt_model": str(cfg.get("stt_model") or "").strip()}
+    except Exception:
+        pass
+    return providers
+
+
+def _active_provider(kind):
+    """Provider chosen in Campaign Rules for 'llm' (summary/analysis) or 'stt' (transcription)."""
+    settings = get_api_settings()
+    name = str(settings.get("stt_provider" if kind == "stt" else "llm_provider") or "Groq")
+    if name == "Groq":
+        return "Groq"
+    cfg = get_ai_providers().get(name)
+    if not cfg or (kind == "stt" and not cfg.get("stt_model")):
+        return "Groq"          # chosen provider is no longer in secrets -> safe fallback
+    return name
+
+
+def _llm_model():
+    provider = _active_provider("llm")
+    return GROQ_SUMMARY_MODEL if provider == "Groq" else get_ai_providers()[provider]["model"]
+
+
+def _llm_extra_params():
+    """Groq-only reasoning options; other providers get none."""
+    if _active_provider("llm") == "Groq":
+        return {"reasoning_effort": "low", "reasoning_format": "hidden"}
+    return {}
+
+
+def _stt_model():
+    provider = _active_provider("stt")
+    return "whisper-large-v3-turbo" if provider == "Groq" else get_ai_providers()[provider]["stt_model"]
+
+
+def _provider_client(provider, key, timeout=None):
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("The 'openai' package is missing. Add a line  openai  to requirements.txt and reboot the app.")
+    cfg = get_ai_providers()[provider]
+    return OpenAI(api_key=key, base_url=cfg["base_url"], timeout=timeout or GROQ_TIMEOUT_SEC, max_retries=0)
+
+
+def _with_provider_fallback(provider, call_fn, label, kind, timeout=None):
+    """Same safe behaviour as the Groq version, for an extra provider: tries each of its keys,
+    waits once on a per-minute limit, never loops, stops cleanly when every key is limited."""
+    cfg = get_ai_providers().get(provider)
+    if not cfg:
+        raise RuntimeError(f"AI '{provider}' is not configured in Streamlit secrets.")
+    errors, limit_hits, longest_wait = [], 0, None
+    for i, key in enumerate(cfg["keys"], start=1):
+        for attempt in range(2):
+            try:
+                return call_fn(_provider_client(provider, key, timeout), f"[{provider}] {label} KEY {i}")
+            except Exception as exc:
+                error_kind, wait = _classify_groq_error(exc)
+                errors.append(f"Key {i}: {exc}")
+                if error_kind == "too_large":
+                    raise RuntimeError(f"Request too large for {provider} (413): {exc}")
+                if error_kind == "bad_output":
+                    raise RuntimeError(f"AI returned an unreadable answer: {exc}")
+                if error_kind == "minute_limit" and attempt == 0 and (wait is None or wait <= MAX_RATE_WAIT_SEC):
+                    time.sleep((wait or 5.0) + 0.5)
+                    continue
+                if error_kind in ("minute_limit", "daily_limit"):
+                    limit_hits += 1
+                    longest_wait = max(longest_wait or 0, wait or 0) or None
+                    break
+                if error_kind == "transient" and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+    if limit_hits and limit_hits == len(cfg["keys"]):
+        raise GroqLimitReached(f"{provider} limit reached on every key: " + " | ".join(errors)[:300], retry_after=longest_wait)
+    raise RuntimeError(f"All {provider} keys failed. " + " | ".join(errors)[:400])
+
+
 def _with_key_fallback(call_fn, label, estimated_tokens=0, kind="llm", keys=None, timeout=None):
     """Run call_fn(client, label) on the first Groq key that still has quota.
 
@@ -1279,6 +1500,10 @@ def _with_key_fallback(call_fn, label, estimated_tokens=0, kind="llm", keys=None
     - waits a few seconds and retries ONCE on a per-minute limit
     - raises GroqLimitReached when every key is limited, so the caller stops instead of looping
     """
+    provider = _active_provider("stt" if kind == "stt" else "llm")
+    if provider != "Groq":
+        return _with_provider_fallback(provider, call_fn, label, kind, timeout)
+
     key_list = list(keys if keys is not None else GROQ_API_KEYS)
     if not key_list:
         raise RuntimeError("No Groq API keys are configured.")
@@ -1330,7 +1555,8 @@ def _log_groq_token_usage(response, label="GROQ"):
     if details:
         cached = details.get("cached_tokens", 0) if isinstance(details, dict) else getattr(details, "cached_tokens", 0)
     total = getattr(usage, "total_tokens", 0) or 0
-    record_llm_usage(_key_index_from_label(label), total, cached or 0)
+    if not str(label).startswith("["):    # other AIs are not counted against the Groq daily budget
+        record_llm_usage(_key_index_from_label(label), total, cached or 0)
     print("========== GROQ TOKEN USAGE ==========")
     print(f"Request:      {label}")
     print(f"Input tokens:  {getattr(usage, 'prompt_tokens', 0)} (cached: {cached or 0})")
@@ -1365,7 +1591,7 @@ def render_api_usage_meter():
 
 def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
     response = client.chat.completions.create(
-        model=GROQ_SUMMARY_MODEL,
+        model=_llm_model(),
         messages=[
             {
                 "role": "system",
@@ -1374,9 +1600,8 @@ def _call_structured_analysis(client, prompt, label="GROQ ANALYSIS"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=800,
-        reasoning_effort="low",
-        reasoning_format="hidden",
+        max_tokens=_max_out_tokens(800),
+        **_llm_extra_params(),
         response_format={"type": "json_object"}
     )
     _log_groq_token_usage(response, label)
@@ -2019,7 +2244,7 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
         analysis = build_short_call_analysis(full_transcript, campaign_name)
         return _derive_analysis_flags(analysis, full_transcript, timeline_data, campaign_name)
 
-    if not GROQ_API_KEYS:
+    if not GROQ_API_KEYS and _active_provider("llm") == "Groq":
         raise RuntimeError("No Groq API keys are configured.")
 
     ai_transcript = _trim_for_token_limit(full_transcript, campaign_name, timeline_data)
@@ -2043,7 +2268,7 @@ def generate_call_analysis_groq(full_transcript, campaign_name, timeline_data=No
 def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
     """Small manual summary request using JSON mode without a JSON schema."""
     response = client.chat.completions.create(
-        model=GROQ_SUMMARY_MODEL,
+        model=_llm_model(),
         messages=[
             {
                 "role": "system",
@@ -2052,9 +2277,8 @@ def _call_fast_summary(client, prompt, label="GROQ FAST SUMMARY"):
             {"role": "user", "content": prompt}
         ],
         temperature=0.1,
-        max_tokens=650,
-        reasoning_effort="low",
-        reasoning_format="hidden",
+        max_tokens=_max_out_tokens(650),
+        **_llm_extra_params(),
         response_format={"type": "json_object"}
     )
     _log_groq_token_usage(response, label)
@@ -2066,7 +2290,7 @@ def generate_fast_summary_groq(full_transcript, campaign_name):
     if is_no_voice_transcript(full_transcript):
         return NO_VOICE_TOPIC, NO_VOICE_SUMMARY
 
-    if not GROQ_API_KEYS:
+    if not GROQ_API_KEYS and _active_provider("llm") == "Groq":
         raise RuntimeError("No Groq API keys are configured.")
 
     campaign_family = get_campaign_category(campaign_name)
@@ -3727,6 +3951,26 @@ def _cr_spam_tab(cfg, ver):
             api_interval = st.number_input("Seconds between Google Sheet writes", min_value=0.0, max_value=10.0, value=float(api["sheet_write_interval"]), step=0.1, key=f"cr_{ver}_api_interval")
         api_skip_spam = st.checkbox("Finish confirmed spam calls locally (no AI tokens)", value=bool(api["skip_ai_for_spam"]), key=f"cr_{ver}_api_spam")
 
+        st.markdown("#### Which AI to use")
+        ai_providers = get_ai_providers()
+        llm_options = ["Groq"] + sorted(ai_providers)
+        stt_options = ["Groq"] + sorted(n for n, c in ai_providers.items() if c.get("stt_model"))
+        pr1, pr2 = st.columns(2)
+        with pr1:
+            api_llm = st.selectbox("AI for summaries and call analysis", llm_options,
+                                   index=llm_options.index(api["llm_provider"]) if api["llm_provider"] in llm_options else 0,
+                                   key=f"cr_{ver}_api_llm")
+        with pr2:
+            api_stt = st.selectbox("AI for transcription", stt_options,
+                                   index=stt_options.index(api["stt_provider"]) if api["stt_provider"] in stt_options else 0,
+                                   key=f"cr_{ver}_api_stt")
+        st.caption("Only names are shown. Keys stay in Streamlit secrets and are never displayed. "
+                   "The daily token limit above counts Groq only.")
+        with st.expander("➕ How to add another AI (Streamlit secrets)"):
+            st.code(AI_PROVIDERS_SECRETS_EXAMPLE, language="toml")
+            st.caption("Add the block to your Streamlit secrets, add a line  openai  to requirements.txt (once), "
+                       "reboot the app, then pick the new name above and press Save.")
+
         st.markdown("#### Summary style (all campaigns)")
         style = st.text_area("Summary style rules", value=g.get("summary_style_rules", ""), height=320, key=f"cr_{ver}_style",
                              help="Short-summary rules used for every campaign. Each campaign's own QC note rules are added after these.")
@@ -3746,6 +3990,18 @@ def _cr_spam_tab(cfg, ver):
                                  value="\n".join(g.get("banned_summary_phrases") or []), height=90,
                                  key=f"cr_{ver}_banned_phrases",
                                  help="Any summary sentence containing one of these phrases is removed. Applies to every campaign.")
+        st.markdown("#### Summary length by call duration (sheet column F)")
+        sl_saved = {**DEFAULT_SUMMARY_LENGTH, **(g.get("summary_length") or {})}
+        sl_on = st.checkbox("Make the summary longer for longer calls", value=bool(sl_saved["enabled"]), key=f"cr_{ver}_sl_on")
+        st.caption("Each row: calls up to this many seconds get this many sentences. Use 0 seconds on the last row for "
+                   "everything longer. Add or delete rows with the table controls.")
+        import pandas as _pd
+        sl_frame = st.data_editor(
+            _pd.DataFrame(sl_saved["tiers"], columns=["upto_sec", "min_sentences", "max_sentences"]).rename(columns={
+                "upto_sec": "Up to (seconds, 0 = longer)", "min_sentences": "Min sentences", "max_sentences": "Max sentences"}),
+            num_rows="dynamic", hide_index=True, key=f"cr_{ver}_sl_tiers")
+        plain_on = st.checkbox("Write summaries in plain, simple English", value=bool(g.get("plain_english", True)),
+                               key=f"cr_{ver}_plain_on")
         main_topic_global = st.text_area(
             "Main topic rules (all campaigns)", value=g.get("main_topic_rules", ""), height=110,
             key=f"cr_{ver}_maintopic_global",
@@ -3759,6 +4015,7 @@ def _cr_spam_tab(cfg, ver):
             "max_transcript_tokens": int(api_max_tx), "ai_min_words": int(api_min_words),
             "skip_ai_for_spam": bool(api_skip_spam), "max_retry_attempts": int(api_attempts),
             "sheet_write_interval": float(api_interval),
+            "llm_provider": api_llm, "stt_provider": api_stt,
         }
         g["government_terms"] = _lines(gov)
         g["private_terms"] = _lines(priv)
@@ -3766,6 +4023,18 @@ def _cr_spam_tab(cfg, ver):
         g["default_qc_questions"] = default_qc.strip() or _BUILTIN_DEFAULT_QC
         g["main_topic_rules"] = main_topic_global.strip()
         g["speaker_roles"] = bool(roles_on)
+        g["plain_english"] = bool(plain_on)
+        _tiers = []
+        for _rec in sl_frame.to_dict("records"):
+            try:
+                _upto = int(_rec.get("Up to (seconds, 0 = longer)") or 0)
+                _hi = int(_rec.get("Max sentences"))
+                _lo = int(_rec.get("Min sentences") or _hi)
+            except (TypeError, ValueError):
+                continue
+            if _hi >= 1:
+                _tiers.append({"upto_sec": max(0, _upto), "min_sentences": max(1, min(_lo, _hi)), "max_sentences": _hi})
+        g["summary_length"] = {"enabled": bool(sl_on), "tiers": _tiers or DEFAULT_SUMMARY_LENGTH["tiers"]}
         g["banned_summary_phrases"] = _lines(banned_in)
         g["hangup"] = {
             "enabled": bool(hang_on),
@@ -4116,6 +4385,7 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
             existing_main_topic = row[7].strip() if len(row) > 7 else ""
             recording_url = row[8].strip() if len(row) > 8 else ""
             hangup_by = row[9].strip() if len(row) > 9 else ""   # column J = "Hangup By"
+            duration_text = row[5].strip() if len(row) > 5 else ""   # column F = call duration
 
             # Trigger: recording exists + Summary or Main topic is missing (or progress is stale).
             work_state = _row_work_state(recording_url, existing_g, existing_main_topic)
@@ -4177,6 +4447,7 @@ def sync_google_sheet_batch(default_campaign_name="", progress_callback=None):
                          label=f"Finishing locally ({mode.replace('_', ' ')}, no AI tokens used)",
                          columns={"G": "working", "H": "working", "K": "working", "L": "working"})
 
+                set_call_duration(_duration_text_to_seconds(duration_text) or st.session_state.get("duration_sec"))
                 analysis = generate_call_analysis_groq(
                     full_transcript_str,
                     campaign_to_use,
@@ -4718,6 +4989,7 @@ with left_col:
             progress_bar.progress(65, text="Generating AI summary...")
 
             full_transcript_str = " ".join(raw_text_segments)
+            set_call_duration(st.session_state.get("duration_sec"))
             short_topic, detailed_summary = generate_fast_summary_groq(
                 full_transcript_str,
                 selected_campaign,
