@@ -1415,8 +1415,7 @@ AI_PROVIDERS_SECRETS_EXAMPLE = """# Streamlit secrets (TOML). Your existing Groq
 [AI_PROVIDERS.OpenAI]
 api_key  = "sk-..."
 base_url = "https://api.openai.com/v1"
-model    = "gpt-4o-mini"        # summaries + analysis
-stt_model = "whisper-1"         # optional: only if you want this AI for transcription too
+model    = "gpt-4o-mini"
 
 [AI_PROVIDERS.Gemini]
 api_key  = "AIza..."
@@ -1469,8 +1468,8 @@ _FORCE_GROQ = {"on": False}   # switched on only while the Groq fallback runs
 
 def _active_provider(kind):
     """Provider chosen in Campaign Rules for 'llm' (summary/analysis) or 'stt' (transcription)."""
-    if _FORCE_GROQ["on"]:
-        return "Groq"
+    if _FORCE_GROQ["on"] or kind == "stt":
+        return "Groq"      # transcription always uses Groq Whisper
     settings = get_api_settings()
     name = str(settings.get("stt_provider" if kind == "stt" else "llm_provider") or "Groq")
     if name == "Groq":
@@ -4014,16 +4013,10 @@ def _cr_spam_tab(cfg, ver):
         st.markdown("#### Which AI to use")
         ai_providers = get_ai_providers()
         llm_options = ["Groq"] + sorted(ai_providers)
-        stt_options = ["Groq"] + sorted(n for n, c in ai_providers.items() if c.get("stt_model"))
-        pr1, pr2 = st.columns(2)
-        with pr1:
-            api_llm = st.selectbox("AI for summaries and call analysis", llm_options,
-                                   index=llm_options.index(api["llm_provider"]) if api["llm_provider"] in llm_options else 0,
-                                   key=f"cr_{ver}_api_llm")
-        with pr2:
-            api_stt = st.selectbox("AI for transcription", stt_options,
-                                   index=stt_options.index(api["stt_provider"]) if api["stt_provider"] in stt_options else 0,
-                                   key=f"cr_{ver}_api_stt")
+        api_llm = st.selectbox("AI for summaries and call analysis", llm_options,
+                               index=llm_options.index(api["llm_provider"]) if api["llm_provider"] in llm_options else 0,
+                               key=f"cr_{ver}_api_llm")
+        st.caption("Transcription always uses Groq Whisper.")
         api_fallback = st.checkbox("Use Groq if the chosen AI is at its limit", value=bool(api["fallback_to_groq"]),
                                    key=f"cr_{ver}_api_fallback",
                                    help="When every key of the chosen AI is at its limit, the request runs on Groq instead of stopping. "
@@ -4084,7 +4077,7 @@ def _cr_spam_tab(cfg, ver):
             "max_transcript_tokens": int(api_max_tx), "ai_min_words": int(api_min_words),
             "skip_ai_for_spam": bool(api_skip_spam), "max_retry_attempts": int(api_attempts),
             "sheet_write_interval": float(api_interval),
-            "llm_provider": api_llm, "stt_provider": api_stt, "fallback_to_groq": bool(api_fallback),
+            "llm_provider": api_llm, "stt_provider": "Groq", "fallback_to_groq": bool(api_fallback),
         }
         g["government_terms"] = _lines(gov)
         g["private_terms"] = _lines(priv)
