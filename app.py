@@ -857,11 +857,13 @@ def build_summary_instructions(campaign_name):
         count = f"exactly {high}" if low == high else f"{low}-{high}"
         rule_text = str(((QC_CONFIG.get("global") or {}).get("summary_length") or {}).get("rule_text") or "").strip() \
             or DEFAULT_LENGTH_RULE_TEXT
+        if "{sentences}" not in rule_text:
+            rule_text = rule_text.rstrip(" .:") + ": this call lasted {duration}. Write {sentences} short sentences (about {words} words)."
         length_block = "\n" + (
             rule_text.replace("{duration}", f"{seconds // 60}:{seconds % 60:02d}")
             .replace("{sentences}", count)
             .replace("{words}", f"{low * 17}-{high * 20}")
-        ) + "\n"
+        ).replace("exactly 1 short sentences", "exactly 1 short sentence") + "\n"
     else:
         length_block = ""
     plain_block = (
@@ -973,12 +975,16 @@ def get_summary_length(duration_sec=None):
     tiers = saved.get("tiers") or DEFAULT_SUMMARY_LENGTH["tiers"]
     try:
         tiers = sorted(tiers, key=lambda x: (int(x.get("upto_sec") or 0) == 0, int(x.get("upto_sec") or 0)))
+        chosen = tiers[-1] if tiers else None      # longer than every row -> the last row applies
         for tier in tiers:
             upto = int(tier.get("upto_sec") or 0)
             if upto == 0 or seconds <= upto:
-                low = max(1, int(tier.get("min_sentences") or 1))
-                high = max(low, int(tier.get("max_sentences") or low))
-                return low, high
+                chosen = tier
+                break
+        if chosen:
+            low = max(1, int(chosen.get("min_sentences") or 1))
+            high = max(low, int(chosen.get("max_sentences") or low))
+            return low, high
     except (TypeError, ValueError):
         pass
     return None
@@ -989,7 +995,7 @@ def _summary_caps():
     length = get_summary_length()
     if not length:
         return 4, 700
-    return max(4, length[1]), max(700, length[1] * 200)
+    return length[1], max(260, length[1] * 220)
 
 
 def _style_for_length(style, length):
@@ -4096,6 +4102,9 @@ def _cr_spam_tab(cfg, ver):
             key=f"cr_{ver}_sl_rule_text",
             help="Wording of the length rule. {duration}, {sentences} and {words} are filled in for each call. "
                  "Clear the box and save to go back to the default wording.")
+        if "{sentences}" not in sl_rule_text:
+            st.warning("This box has no {sentences} placeholder, so the app adds the sentence count automatically. "
+                       "Clear the box and save to go back to the default wording.")
         plain_on = st.checkbox("Write summaries in plain, simple English", value=bool(g.get("plain_english", True)),
                                key=f"cr_{ver}_plain_on")
         main_topic_global = st.text_area(
