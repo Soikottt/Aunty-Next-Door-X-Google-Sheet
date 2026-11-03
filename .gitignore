@@ -5,3 +5,7 @@ __pycache__/
 users.db
 uploads/
 .streamlit/secrets.toml
+qc_config.json
+qc_config.previous.json
+api_usage.json
+model/
