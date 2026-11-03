@@ -1179,7 +1179,7 @@ VALUES:
 RULES:
 - Use only facts in the transcript; never guess. An agent's question is NOT the caller's answer: caller details (insurance, needs, location) must come from the caller.
 - call_type_reason: one short sentence (5-15 words). qualification_reason: brief. qc_issue: only a real, supported issue, else "".
-- Use QUALIFIED or NON-QUALIFIED ONLY when the caller wants this campaign's service. Information-only, unclear or off-campaign callers: INFORMATION ONLY, WRONG NUMBER or OTHER. A different service than the campaign: matches_campaign=false and call_type=WRONG NUMBER (say what they wanted).
+- Use QUALIFIED or NON-QUALIFIED ONLY when the caller wants this campaign's service. Information-only, unclear or off-campaign callers: INFORMATION ONLY, WRONG NUMBER or OTHER. WRONG NUMBER only when the CALLER clearly says they want a different service that this campaign does not offer (say what they wanted) and matches_campaign=false. NOT a wrong number: no voice/silent calls; callers asking about another company, facility or provider for the SAME service as this campaign (for example treatment on a rehab campaign, pest control on a pest campaign); vague or unclear callers; information-only callers. Use INFORMATION ONLY, NON-QUALIFIED or OTHER for those, with matches_campaign true or "unclear".
 - Silent/no-response: do not invent intent. Spam/robot: say what it promoted.
 - long_summary and main_topic: write them exactly as a dedicated summary writer would, following the SUMMARY STYLE below. The other fields and the campaign focus must not change how they are written.
 {spam_rules_text}{insurance_rule}
@@ -1569,11 +1569,12 @@ def _with_key_fallback(call_fn, label, estimated_tokens=0, kind="llm", keys=None
     if provider != "Groq":
         try:
             return _with_provider_fallback(provider, call_fn, label, kind, timeout)
-        except GroqLimitReached:
-            # Optional (Campaign Rules -> Which AI to use): run this one request on Groq instead of stopping.
+        except Exception as provider_error:
+            # Optional (Campaign Rules -> Which AI to use): on a limit OR any other error of the chosen AI,
+            # run this one request on Groq instead of stopping.
             if not (get_api_settings().get("fallback_to_groq") and (keys or GROQ_API_KEYS)):
                 raise
-            print(f"[{provider}] limit reached - using Groq for this request")
+            print(f"[{provider}] failed ({str(provider_error)[:160]}) - using Groq for this request")
             _FORCE_GROQ["on"] = True
             try:
                 return _with_key_fallback(call_fn, label, estimated_tokens, kind, keys, timeout)
@@ -2061,6 +2062,13 @@ def build_no_voice_analysis(campaign_name=""):
     return _derive_analysis_flags(analysis, "", timeline_data=[])
 
 
+# Callers who say they dialed the wrong number by mistake (still a real wrong number).
+_DIALED_WRONG_RE = re.compile(
+    r"\b(?:wrong number|(?:dialed|dialled|called|reached) the wrong|number by mistake|wrong (?:company|place|business))\b",
+    re.IGNORECASE,
+)
+
+
 def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_data=None):
     """Deterministic business rules applied AFTER the AI analysis, using the FULL transcript.
 
@@ -2102,7 +2110,7 @@ def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_d
         elif verdict == "campaign":
             mismatch = False
         elif family and detected:
-            mismatch = detected != family
+            mismatch = detected != family and matches is False   # both the category AND the AI must say "different service"
         else:
             mismatch = matches is False
 
@@ -2123,6 +2131,21 @@ def apply_campaign_rules(analysis, campaign_name, full_transcript="", timeline_d
         return analysis
 
     analysis["campaign_mismatch"] = False
+
+    # A WRONG NUMBER that was not confirmed above (the caller did not clearly ask for a different service)
+    # is not a wrong number: it becomes NON-QUALIFIED, INFORMATION ONLY or OTHER.
+    if (
+        call_type == "WRONG NUMBER"
+        and campaign_setting(campaign_name, "mismatch_rule_enabled", True)
+        and not _DIALED_WRONG_RE.search(str(full_transcript or ""))
+    ):
+        if status == "NON-QUALIFIED":
+            call_type = "NON-QUALIFIED"
+        elif verdict == "campaign" or matches is True or (family and detected == family):
+            call_type = "INFORMATION ONLY"
+        else:
+            call_type = "OTHER"
+        analysis["call_type_reason"] = "Caller did not clearly ask for a different service"
 
     # ---- 2. Keep call_type and qualification_status consistent ----
     if call_type == "QUALIFIED" and status == "NON-QUALIFIED":
@@ -2189,7 +2212,11 @@ def _derive_analysis_flags(analysis, full_transcript, timeline_data=None, campai
         analysis[key] = str(analysis.get(key, "") or "").replace("*", "").strip()
 
     # Keep the summary short and free of filler / "not mentioned" sentences.
-    analysis["long_summary"] = clean_summary_text(analysis["long_summary"]) or (
+    # Spam calls keep their detailed summary (old 4 sentences / 700 characters); the duration length does not apply to them.
+    _spam_caps = {"max_sentences": 4, "max_chars": 700} if (
+        _to_bool(analysis.get("spam_robot")) or str(analysis.get("call_type", "")).strip().upper() == "SPAM / ROBOT"
+    ) else {}
+    analysis["long_summary"] = clean_summary_text(analysis["long_summary"], **_spam_caps) or (
         NO_VOICE_SUMMARY if analysis["no_voice"] else "Call details were not clear enough to summarize."
     )
     analysis["main_topic"] = clean_main_topic(analysis["main_topic"]) or (
@@ -2257,12 +2284,16 @@ def build_spam_analysis(full_transcript, campaign_name, confidence, reason, labe
     """Confirmed spam (Yelp, Yellow Pages, robot scripts...) is finished locally: zero AI tokens."""
     reason_clean = re.sub(r"\s*.*?", "", str(reason or "")).strip().rstrip(".")
     opening = " ".join(str(full_transcript or "").split()[:22])
+    summary_parts = ["Spam / solicitation call."]
+    if reason_clean:
+        summary_parts.append(f"{reason_clean}.")
+    summary_parts.append(f'The recording starts with: "{opening}".')
     if label in ("Yelp", "Yellow Pages"):
         topic = f"Spam call mentioning {label}"
     else:
         topic = f"Spam / solicitation call ({label})" if label else "Spam / solicitation call"
     analysis = {
-        "long_summary": f"Spam / solicitation call. {reason_clean}. The recording starts with: \"{opening}\".",
+        "long_summary": " ".join(summary_parts),
         "main_topic": topic,
         "call_type": "SPAM / ROBOT",
         "qualification_status": "NOT CLEAR",
@@ -2916,7 +2947,8 @@ SCORE_WEIGHT_FIELDS = [
     ("silent_score",          "Silent / no response call type (fixed)",          30, 49, "Hard rules (max 49)", True),
     ("spam_confident_score",  "Confirmed spam, confidence 90+ (fixed)",           5, 49, "Hard rules (max 49)", True),
     ("spam_max_score",        "Other spam: highest score",                       25, 49, "Hard rules (max 49)", True),
-    ("wrong_number_max",      "Wrong number / campaign mismatch: highest score", 30, 49, "Hard rules (max 49)", True),
+    ("wrong_number_score",    "Wrong number: fixed score (low, like confirmed spam)", 5, 49, "Hard rules (max 49)", True),
+    ("wrong_number_max",      "Wrong number: highest score (not used, see fixed score above)", 30, 49, "Hard rules (max 49)", True),
     ("other_type_max",        "Any call type except Qualified / Non-qualified",  49, 49, "Hard rules (max 49)", True),
 ]
 DEFAULT_WEIGHTS = {f[0]: f[2] for f in SCORE_WEIGHT_FIELDS}
@@ -3005,6 +3037,8 @@ def _score_breakdown(analysis):
         return under50(W("no_voice_score")), [f"No voice detected = {under50(W('no_voice_score'))}"]
     if spam and spam_confidence >= 90:
         return under50(W("spam_confident_score")), [f"Confirmed spam/robot = {under50(W('spam_confident_score'))}"]
+    if call_type == "WRONG NUMBER":
+        return under50(W("wrong_number_score")), [f"Wrong number = {under50(W('wrong_number_score'))}"]
     if call_type == "SILENT / NO RESPONSE":
         return under50(W("silent_score")), [f"Silent / no response = {under50(W('silent_score'))}"]
 
@@ -4057,9 +4091,9 @@ def _cr_spam_tab(cfg, ver):
                                index=llm_options.index(api["llm_provider"]) if api["llm_provider"] in llm_options else 0,
                                key=f"cr_{ver}_api_llm")
         st.caption("Transcription always uses Groq Whisper.")
-        api_fallback = st.checkbox("Use Groq if the chosen AI is at its limit", value=bool(api["fallback_to_groq"]),
+        api_fallback = st.checkbox("Use Groq if the chosen AI is at its limit or gives any error", value=bool(api["fallback_to_groq"]),
                                    key=f"cr_{ver}_api_fallback",
-                                   help="When every key of the chosen AI is at its limit, the request runs on Groq instead of stopping. "
+                                   help="When the chosen AI is at its limit on every key, or returns any error, that request runs on Groq instead. "
                                         "Only counts when the chosen AI is not Groq.")
         st.caption("Only names are shown. Keys stay in Streamlit secrets and are never displayed. "
                    "The daily token limit above counts Groq only.")
