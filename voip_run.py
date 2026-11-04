@@ -2,7 +2,7 @@
 One pass of the VOIP / line-type checker for GitHub Actions.
 
 Same logic as cli_checker.py (read the phone number in Column E, write Line Type to M, Carrier to N,
-Fake Number to O, highlight VOIP/Fake rows in pink) but it runs ONCE and exits, instead of looping forever.
+Fake Number to O, highlight VOIP/Fake results in pink, columns M to O only) but it runs ONCE and exits, instead of looping forever.
 GitHub Actions starts it together with the call QC sync.
 
 Needs (GitHub secrets, never in the code)
@@ -26,15 +26,18 @@ from pathlib import Path
 
 def _load_env_secret():
     """GitHub secret VOIP_ENV can hold your whole .env text (KEY=value lines). Loaded BEFORE veriphone is imported."""
+    count = 0
     for line in os.environ.get("VOIP_ENV", "").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        count += 1
+    return count
 
 
-_load_env_secret()
+_ENV_LINES = _load_env_secret()
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -78,7 +81,10 @@ def main():
         return 1
 
     client.max_wait = int(os.getenv("VOIP_MAX_WAIT", "30"))
+    print(f"VOIP_ENV secret: {_ENV_LINES} setting(s) read" if _ENV_LINES else "VOIP_ENV secret: empty or not found", flush=True)
     print(f"Loaded {client.key_count} Veriphone key(s).", flush=True)
+    for number, key in enumerate(client.pool.keys, 1):      # lengths only, so nothing secret is shown in the public log
+        print(f"  key #{number}: {len(key)} characters", flush=True)
 
     gc = gspread.authorize(Credentials.from_service_account_info(info, scopes=SCOPES))
     sheet = gc.open(GOOGLE_SHEET_NAME).sheet1
@@ -110,7 +116,7 @@ def main():
         r = idx + 1
         sheet.update(range_name=f"M{r}:O{r}", values=[[line_type, carrier, fake_number]])   # M, N, O
         if line_type == "VOIP" or fake_number == "Yes":
-            sheet.format(f"A{r}:O{r}", PINK)
+            sheet.format(f"M{r}:O{r}", PINK)
         checked += 1
         voip_found += line_type == "VOIP"
         fake_found += fake_number == "Yes"
