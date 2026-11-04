@@ -1,11 +1,12 @@
+# Never commit keys or private data (the repo is public)
 .env
+credentials.json
 service_account.json
-venv/
-__pycache__/
-users.db
-uploads/
 .streamlit/secrets.toml
 qc_config.json
 qc_config.previous.json
 api_usage.json
+users.db
+uploads/
 model/
+__pycache__/
