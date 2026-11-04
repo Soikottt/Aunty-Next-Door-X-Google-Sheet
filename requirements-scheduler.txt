@@ -1,5 +1,7 @@
 groq
 gspread
+google-auth
 pydub
 requests
 openai
+python-dotenv
