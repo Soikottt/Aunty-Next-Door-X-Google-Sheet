@@ -39,6 +39,15 @@ jobs:
           key: usage-${{ steps.day.outputs.date }}-${{ github.run_id }}
           restore-keys: usage-${{ steps.day.outputs.date }}-
 
+      - name: VOIP / line type check
+        continue-on-error: true        # a VOIP problem never blocks the QC step below
+        timeout-minutes: 10
+        env:
+          STREAMLIT_SECRETS: ${{ secrets.STREAMLIT_SECRETS }}
+          VERIPHONE_API_KEYS: ${{ secrets.VERIPHONE_API_KEYS }}
+          VOIP_ENV: ${{ secrets.VOIP_ENV }}
+        run: python voip_run.py
+
       - name: Run sheet sync and process
         env:
           STREAMLIT_SECRETS: ${{ secrets.STREAMLIT_SECRETS }}
