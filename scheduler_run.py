@@ -99,6 +99,26 @@ def _install_fake_streamlit():
     return fake
 
 
+def _default_http_timeout(seconds=(10, 120)):
+    """Google Sheets (gspread) has no timeout of its own, so one stuck connection could freeze a run for an hour.
+    Give every requests-based call a default timeout (calls that set their own timeout keep it)."""
+    try:
+        import requests
+    except ImportError:
+        return
+    original = requests.sessions.Session.request
+
+    def request(self, method, url, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = seconds
+        return original(self, method, url, **kwargs)
+
+    requests.sessions.Session.request = request
+
+
+_default_http_timeout()
+
+
 # ------------------------------------------------------------------
 # 2. Load the app's functions (everything before the page code)
 # ------------------------------------------------------------------
