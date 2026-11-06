@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20            # a stuck run is stopped after 25 minutes at most
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +23,17 @@ jobs:
           cache-dependency-path: requirements-scheduler.txt
 
       - name: Install ffmpeg (for audio)
-        run: command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+        id: ffmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3       # downloads a ready ffmpeg, no slow apt-get
+        timeout-minutes: 3
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ffmpeg fallback (only if the step above failed)
+        if: steps.ffmpeg.outcome != 'success'
+        timeout-minutes: 4
+        run: command -v ffmpeg >/dev/null || sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Install Python packages
         run: pip install -r requirements-scheduler.txt
@@ -41,7 +51,7 @@ jobs:
 
       - name: VOIP / line type check
         continue-on-error: true        # a VOIP problem never blocks the QC step below
-        timeout-minutes: 10
+        timeout-minutes: 8
         env:
           STREAMLIT_SECRETS: ${{ secrets.STREAMLIT_SECRETS }}
           VERIPHONE_API_KEYS: ${{ secrets.VERIPHONE_API_KEYS }}
@@ -49,6 +59,7 @@ jobs:
         run: python voip_run.py
 
       - name: Run sheet sync and process
+        timeout-minutes: 15            # rows not finished are picked up again by the next run
         env:
           STREAMLIT_SECRETS: ${{ secrets.STREAMLIT_SECRETS }}
           APP_FILE: app.py
